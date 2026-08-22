@@ -103,7 +103,8 @@ func runCmd(args []string) error {
 		maxSANs  = fs.Int("max-sans", 0, "maximum SANs to read from one certificate (0 = all)")
 		noProbe  = fs.Bool("no-probe", false, "record domains without fetching them")
 		probeRPS = fs.Float64("probe-rps", 20, "HTTPS probes per second across all workers")
-		timeout  = fs.Duration("probe-timeout", 10*time.Second, "per-probe timeout")
+		timeout  = fs.Duration("probe-timeout", 10*time.Second, "per-probe timeout, once a connection exists")
+		dialTO   = fs.Duration("dial-timeout", 5*time.Second, "how long to wait for the TCP connect and the TLS handshake")
 		maxBody  = fs.Int64("max-body", 2<<20, "bytes of body to read and hash")
 		verify   = fs.Bool("verify-tls", false, "verify TLS certificates when probing")
 		private  = fs.Bool("allow-private", false, "probe hosts that resolve to loopback, RFC 1918, or other non-public addresses")
@@ -160,6 +161,7 @@ func runCmd(args []string) error {
 		Store: db,
 		Prober: probe.New(probe.Options{
 			Timeout:           *timeout,
+			DialTimeout:       *dialTO,
 			MaxBody:           *maxBody,
 			RequestsPerSecond: *probeRPS,
 			VerifyTLS:         *verify,

@@ -4,12 +4,14 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -581,5 +583,114 @@ func TestRepeatCountsHostsTheRecentSetHasForgotten(t *testing.T) {
 	rec, _ := rig.db.Get("a.test")
 	if rec.SeenCount != 2 {
 		t.Errorf("seen count = %d, want 2", rec.SeenCount)
+	}
+}
+
+// hostRecorder is a TLS server that remembers the Host header of every
+// request, which is the order the probers actually fetched things in.
+func hostRecorder(t *testing.T) (addr string, order func() []string) {
+	t.Helper()
+	var (
+		mu   sync.Mutex
+		seen []string
+	)
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		seen = append(seen, r.Host)
+		mu.Unlock()
+		io.WriteString(w, "ok")
+	}))
+	t.Cleanup(srv.Close)
+	return srv.Listener.Addr().String(), func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]string(nil), seen...)
+	}
+}
+
+// A worker takes a fresh discovery ahead of a backlog that is already full.
+// With one worker the order of requests is the scheduling decision and
+// nothing else.
+func TestFreshDiscoveriesJumpTheBacklog(t *testing.T) {
+	addr, order := hostRecorder(t)
+	db, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	p := &Pipeline{
+		Store: db,
+		Log:   discardLog(),
+		Prober: probe.New(probe.Options{
+			RequestsPerSecond: 1000, Burst: 100,
+			DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, network, addr)
+			},
+		}),
+	}
+
+	backlog := make(chan string, 64)
+	for i := 0; i < 20; i++ {
+		backlog <- fmt.Sprintf("old%02d.test", i)
+	}
+	fresh := make(chan string, 4)
+	fresh <- "brand-new.test"
+	close(fresh)
+	close(backlog)
+
+	p.probeFreshFirst(context.Background(), fresh, backlog)
+
+	got := order()
+	if len(got) != 21 {
+		t.Fatalf("fetched %d hosts, want all 21", len(got))
+	}
+	if got[0] != "brand-new.test" {
+		t.Errorf("fetched %q first, want brand-new.test ahead of the backlog (order: %v)", got[0], got[:5])
+	}
+}
+
+// Both queues drain and the worker returns, whichever closes first.
+func TestProbeFreshFirstDrainsBothQueues(t *testing.T) {
+	addr, order := hostRecorder(t)
+	db, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	p := &Pipeline{
+		Store: db, Log: discardLog(),
+		Prober: probe.New(probe.Options{
+			RequestsPerSecond: 1000, Burst: 100,
+			DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, network, addr)
+			},
+		}),
+	}
+
+	fresh := make(chan string, 2)
+	backlog := make(chan string, 2)
+	fresh <- "a.test"
+	backlog <- "b.test"
+	close(fresh)
+	close(backlog)
+
+	done := make(chan struct{})
+	go func() { defer close(done); p.probeFreshFirst(context.Background(), fresh, backlog) }()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("probeFreshFirst did not return after both queues closed")
+	}
+	if n := len(order()); n != 2 {
+		t.Errorf("fetched %d hosts, want both", n)
+	}
+}
+
+func TestBacklogWorkersAlwaysReservesOne(t *testing.T) {
+	for workers, want := range map[int]int{1: 1, 2: 1, 3: 1, 4: 1, 8: 2, 16: 4, 48: 12} {
+		if got := backlogWorkers(workers); got != want {
+			t.Errorf("backlogWorkers(%d) = %d, want %d", workers, got, want)
+		}
 	}
 }
