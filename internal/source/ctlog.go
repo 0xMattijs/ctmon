@@ -161,17 +161,17 @@ func (c *CTLog) Run(ctx context.Context, out chan<- Cert) error {
 // on a healthy log costs one short pause rather than a permanently long one.
 func (c *CTLog) followForever(ctx context.Context, uri string, out chan<- Cert) {
 	st := &logState{batch: c.batchCeiling(), max: c.batchCeiling()}
-	for attempt := 0; ctx.Err() == nil; {
+	rt := retry{base: 5 * time.Second, max: 10 * time.Minute}
+	for ctx.Err() == nil {
 		start := time.Now()
 		err := c.follow(ctx, uri, out, st)
 		if ctx.Err() != nil {
 			return
 		}
 		ran := time.Since(start)
-		d := backoff(attempt, 5*time.Second, 10*time.Minute)
+		d := rt.after(ran)
 		c.Log.Warn("ct log follow failed", "log", uri, "err", err,
 			"ran", ran.Round(time.Second), "batch", st.batch, "retry_in", d)
-		attempt = nextAttempt(attempt, ran)
 		if sleep(ctx, d) != nil {
 			return
 		}

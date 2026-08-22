@@ -50,6 +50,39 @@ var reservedV4 = []netip.Prefix{
 // broadcastV4 is the limited broadcast address, which has no netip predicate.
 var broadcastV4 = netip.AddrFrom4([4]byte{255, 255, 255, 255})
 
+// IPv6 forms that carry an IPv4 address inside them and reach it.
+var (
+	nat64WellKnown = netip.MustParsePrefix("64:ff9b::/96") // RFC 6052
+	sixToFour      = netip.MustParsePrefix("2002::/16")    // RFC 3056
+	ipv4Compatible = netip.MustParsePrefix("::/96")        // deprecated, RFC 4291
+)
+
+// embeddedV4 returns the IPv4 address carried inside an IPv6 one, and whether
+// there was one.
+//
+// A packet to 64:ff9b::7f00:1 comes out of the translator addressed to
+// 127.0.0.1, and none of the IPv6 predicates see anything wrong with it, so an
+// IPv6-only host behind NAT64 would have no guard at all. 6to4 and the
+// deprecated IPv4-compatible form encode a destination the same way.
+//
+// Blocking these prefixes outright would be wrong: on an IPv6-only network
+// with DNS64, every ordinary IPv4 website arrives as a synthesized address
+// under 64:ff9b::/96. What matters is the address on the far side of the
+// translation, so hand that back and let the usual test decide.
+func embeddedV4(addr netip.Addr) (netip.Addr, bool) {
+	if !addr.Is6() {
+		return netip.Addr{}, false
+	}
+	b := addr.As16()
+	switch {
+	case nat64WellKnown.Contains(addr), ipv4Compatible.Contains(addr):
+		return netip.AddrFrom4([4]byte{b[12], b[13], b[14], b[15]}), true
+	case sixToFour.Contains(addr):
+		return netip.AddrFrom4([4]byte{b[2], b[3], b[4], b[5]}), true
+	}
+	return netip.Addr{}, false
+}
+
 // public reports whether addr is an ordinary address out on the internet, and
 // so something this monitor may fetch.
 func public(addr netip.Addr) bool {
@@ -74,6 +107,11 @@ func public(addr netip.Addr) bool {
 		if p.Contains(addr) {
 			return false
 		}
+	}
+	// Checked last, so :: and ::1 are already refused above rather than
+	// arriving here as an embedded 0.0.0.0 and 0.0.0.1.
+	if v4, ok := embeddedV4(addr); ok {
+		return public(v4)
 	}
 	return true
 }

@@ -44,6 +44,20 @@ func TestPublicAddresses(t *testing.T) {
 		"::":              false,
 		"255.255.255.255": false,
 
+		// IPv6 forms that carry an IPv4 address and reach it. The embedded
+		// address decides, so a DNS64 network can still fetch ordinary
+		// IPv4 sites while a translated 127.0.0.1 stays blocked.
+		"64:ff9b::7f00:1":    false, // NAT64 of 127.0.0.1
+		"64:ff9b::a00:1":     false, // NAT64 of 10.0.0.1
+		"64:ff9b::a9fe:a9fe": false, // NAT64 of 169.254.169.254
+		"64:ff9b::101:101":   true,  // NAT64 of 1.1.1.1, a real site
+		"2002:7f00:1::":      false, // 6to4 of 127.0.0.1
+		"2002:c0a8:101::":    false, // 6to4 of 192.168.1.1
+		"2002:101:101::":     true,  // 6to4 of 1.1.1.1
+		"::127.0.0.1":        false, // IPv4-compatible loopback
+		"::10.0.0.1":         false,
+		"::1.1.1.1":          true,
+
 		// Ranges netip has no predicate for.
 		"0.1.2.3":     false, // "this network"
 		"100.64.0.1":  false, // carrier-grade NAT

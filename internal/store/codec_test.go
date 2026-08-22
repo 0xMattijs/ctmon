@@ -261,3 +261,29 @@ func TestDecodeSurvivesACorruptLength(t *testing.T) {
 		}
 	}
 }
+
+// A length that only looks sane once narrowed to a 32-bit int must still be
+// refused. On a 64-bit build take catches this; the check in string is what
+// catches it on GOARCH=386 or arm.
+func TestDecodeRejectsALengthThatTruncates(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	var raw []byte
+	raw = append(raw, formatVersion, byte(certLiteral)<<certShift)
+	raw = binary.AppendUvarint(raw, 0)
+	raw = binary.AppendUvarint(raw, 0)
+	raw = binary.BigEndian.AppendUint32(raw, 1700000000)
+	raw = binary.AppendUvarint(raw, 0)
+	raw = binary.AppendUvarint(raw, 1)
+	raw = binary.AppendUvarint(raw, 1<<32|5) // narrows to 5 on a 32-bit int
+	raw = append(raw, "hello"...)
+
+	var rec Record
+	if err := s.decode("example.com", raw, &rec); err == nil {
+		t.Errorf("decode accepted a length of %d, reading %q", uint64(1<<32|5), rec.CertName)
+	}
+}

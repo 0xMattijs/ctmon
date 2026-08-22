@@ -69,13 +69,28 @@ func backoff(n int, base, max time.Duration) time.Duration {
 // hour would end up waiting the maximum between every retry, forever.
 const healthyRun = time.Minute
 
-// nextAttempt returns the backoff counter for the next try, given how long the
-// failed run lasted.
-func nextAttempt(attempt int, ran time.Duration) int {
+// retry paces reconnection to a feed that keeps failing. The delay doubles
+// from base to max, and a run that lasted healthyRun puts it back to base.
+//
+// Both feeds share this rather than each writing the loop, because the order
+// of the two steps is easy to get wrong and invisible when you do: reset the
+// counter after reading the delay and the healthy run still pays the long
+// pause it was supposed to have earned its way out of.
+type retry struct {
+	base    time.Duration
+	max     time.Duration
+	attempt int
+}
+
+// after folds one finished run into the counter and returns how long to wait
+// before trying again. ran is how long that run lasted.
+func (r *retry) after(ran time.Duration) time.Duration {
 	if ran >= healthyRun {
-		return 0
+		r.attempt = 0
 	}
-	return attempt + 1
+	d := backoff(r.attempt, r.base, r.max)
+	r.attempt++
+	return d
 }
 
 // sleep waits for d, or until ctx is cancelled.
