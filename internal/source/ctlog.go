@@ -61,11 +61,6 @@ type CTLog struct {
 // timeout, and asking again for the same 256 makes no progress at all.
 const minBatchSize = 8
 
-// healthyRun is how long a follow has to last before its failure counts as a
-// fresh one. Without it the backoff only ever climbs: a log that fails once an
-// hour would end up waiting the maximum between every retry, forever.
-const healthyRun = time.Minute
-
 // logState is what the follow loop learns about one log and keeps across
 // restarts of that loop.
 type logState struct {
@@ -87,15 +82,6 @@ func (s *logState) grow() {
 	if s.batch < s.max {
 		s.batch = min(s.max, s.batch+minBatchSize)
 	}
-}
-
-// nextAttempt returns the backoff counter for the next try, given how long
-// the failed run lasted.
-func nextAttempt(attempt int, ran time.Duration) int {
-	if ran >= healthyRun {
-		return 0
-	}
-	return attempt + 1
 }
 
 // Name implements Source.
@@ -175,17 +161,17 @@ func (c *CTLog) Run(ctx context.Context, out chan<- Cert) error {
 // on a healthy log costs one short pause rather than a permanently long one.
 func (c *CTLog) followForever(ctx context.Context, uri string, out chan<- Cert) {
 	st := &logState{batch: c.batchCeiling(), max: c.batchCeiling()}
-	for attempt := 0; ctx.Err() == nil; {
+	rt := retry{base: 5 * time.Second, max: 10 * time.Minute}
+	for ctx.Err() == nil {
 		start := time.Now()
 		err := c.follow(ctx, uri, out, st)
 		if ctx.Err() != nil {
 			return
 		}
 		ran := time.Since(start)
-		d := backoff(attempt, 5*time.Second, 10*time.Minute)
+		d := rt.after(ran)
 		c.Log.Warn("ct log follow failed", "log", uri, "err", err,
 			"ran", ran.Round(time.Second), "batch", st.batch, "retry_in", d)
-		attempt = nextAttempt(attempt, ran)
 		if sleep(ctx, d) != nil {
 			return
 		}

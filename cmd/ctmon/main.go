@@ -11,9 +11,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net/http"
 	"os"
 	"os/signal"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -104,6 +106,7 @@ func runCmd(args []string) error {
 		timeout  = fs.Duration("probe-timeout", 10*time.Second, "per-probe timeout")
 		maxBody  = fs.Int64("max-body", 2<<20, "bytes of body to read and hash")
 		verify   = fs.Bool("verify-tls", false, "verify TLS certificates when probing")
+		private  = fs.Bool("allow-private", false, "probe hosts that resolve to loopback, RFC 1918, or other non-public addresses")
 		ua       = fs.String("user-agent", "ctmon/1.0 (+domain discovery)", "User-Agent for probes and CT requests")
 		compact  = fs.Duration("compact-every", 24*time.Hour, "rewrite the database into full pages this often (0 disables)")
 		report   = fs.Duration("report", time.Minute, "how often to log counters (0 disables)")
@@ -159,6 +162,7 @@ func runCmd(args []string) error {
 			MaxBody:           *maxBody,
 			RequestsPerSecond: *probeRPS,
 			VerifyTLS:         *verify,
+			AllowPrivate:      *private,
 			UserAgent:         *ua,
 		}),
 		Log:           log,
@@ -586,8 +590,8 @@ func statsCmd(args []string) error {
 		st.Sources, st.Issuers, st.ErrorKind)
 	if len(st.Logs) > 0 {
 		fmt.Printf("\nct log positions:\n")
-		for uri, pos := range st.Logs {
-			fmt.Printf("  %-60s %d\n", uri, pos)
+		for _, uri := range slices.Sorted(maps.Keys(st.Logs)) {
+			fmt.Printf("  %-60s %d\n", uri, st.Logs[uri])
 		}
 	}
 	return nil

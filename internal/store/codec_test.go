@@ -1,6 +1,7 @@
 package store
 
 import (
+	"encoding/binary"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -231,5 +232,58 @@ func TestOpenRejectsLegacyDatabase(t *testing.T) {
 		t.Fatal("Open accepted a legacy database")
 	} else if !strings.Contains(err.Error(), "migrate") {
 		t.Errorf("error does not point at migration: %v", err)
+	}
+}
+
+// A length varint near MaxInt used to overflow the bounds check in take and
+// panic in the slice expression, against reader's promise that a bad record
+// yields an error instead.
+func TestDecodeSurvivesACorruptLength(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	for _, length := range []uint64{1 << 62, 1<<63 - 1, 1 << 63, ^uint64(0)} {
+		var raw []byte
+		raw = append(raw, formatVersion, byte(certLiteral)<<certShift)
+		raw = binary.AppendUvarint(raw, 0)                   // source id
+		raw = binary.AppendUvarint(raw, 0)                   // issuer id
+		raw = binary.BigEndian.AppendUint32(raw, 1700000000) // first seen
+		raw = binary.AppendUvarint(raw, 0)                   // last seen delta
+		raw = binary.AppendUvarint(raw, 1)                   // seen count
+		raw = binary.AppendUvarint(raw, length)              // cert name length
+
+		var rec Record
+		if err := s.decode("example.com", raw, &rec); err == nil {
+			t.Errorf("length %d: decode accepted a truncated record", length)
+		}
+	}
+}
+
+// A length that only looks sane once narrowed to a 32-bit int must still be
+// refused. On a 64-bit build take catches this; the check in string is what
+// catches it on GOARCH=386 or arm.
+func TestDecodeRejectsALengthThatTruncates(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	var raw []byte
+	raw = append(raw, formatVersion, byte(certLiteral)<<certShift)
+	raw = binary.AppendUvarint(raw, 0)
+	raw = binary.AppendUvarint(raw, 0)
+	raw = binary.BigEndian.AppendUint32(raw, 1700000000)
+	raw = binary.AppendUvarint(raw, 0)
+	raw = binary.AppendUvarint(raw, 1)
+	raw = binary.AppendUvarint(raw, 1<<32|5) // narrows to 5 on a 32-bit int
+	raw = append(raw, "hello"...)
+
+	var rec Record
+	if err := s.decode("example.com", raw, &rec); err == nil {
+		t.Errorf("decode accepted a length of %d, reading %q", uint64(1<<32|5), rec.CertName)
 	}
 }

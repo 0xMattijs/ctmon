@@ -444,7 +444,10 @@ func (r *reader) uint32() uint32 {
 }
 
 func (r *reader) take(n int) []byte {
-	if n < 0 || r.i+n > len(r.b) {
+	// n comes from a length varint on disk, so a corrupt record can make it
+	// enormous. Compare against the bytes left rather than r.i+n, which wraps
+	// negative near MaxInt and slips past the check.
+	if n < 0 || n > len(r.b)-r.i {
 		r.fail()
 		return nil
 	}
@@ -453,7 +456,18 @@ func (r *reader) take(n int) []byte {
 	return b
 }
 
-func (r *reader) string() string { return string(r.take(int(r.uvarint()))) }
+// string reads a length-prefixed string. The length is compared as a uint64
+// before it is narrowed: int is 32 bits on a 32-bit build, where converting
+// first would truncate a corrupt 0x1_0000_0005 to a plausible 5 and hand back
+// a wrong record instead of the error take would have raised.
+func (r *reader) string() string {
+	n := r.uvarint()
+	if n > uint64(len(r.b)-r.i) {
+		r.fail()
+		return ""
+	}
+	return string(r.take(int(n)))
+}
 
 // hex reads n raw bytes and renders them as a lowercase hex digest.
 func (r *reader) hex(n int) string {

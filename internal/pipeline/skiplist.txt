@@ -5,6 +5,10 @@
 # under them is depth 1 and structurally identical to a real discovery, so
 # --max-depth cannot tell them apart. Observed in a one-minute live sample;
 # tune to taste.
+#
+# An entry drops the parent itself as well as everything under it, so the
+# vendors' own sites go with their tenants. That is the intent here: none of
+# these are what you are hunting for.
 
 # Application hosting
 workers.dev

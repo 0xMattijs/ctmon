@@ -56,13 +56,17 @@ func (c *Certstream) Run(ctx context.Context, out chan<- Cert) error {
 	if url == "" {
 		url = DefaultCertstreamURL
 	}
-	for attempt := 0; ; attempt++ {
+	rt := retry{base: time.Second, max: 2 * time.Minute}
+	for {
+		start := time.Now()
 		err := c.stream(ctx, url, out)
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		d := backoff(attempt, time.Second, 2*time.Minute)
-		c.Log.Warn("certstream disconnected", "err", err, "retry_in", d)
+		ran := time.Since(start)
+		d := rt.after(ran)
+		c.Log.Warn("certstream disconnected", "err", err,
+			"ran", ran.Round(time.Second), "retry_in", d)
 		if err := sleep(ctx, d); err != nil {
 			return err
 		}

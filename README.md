@@ -341,6 +341,30 @@ not-yet-deployed certificates. Turn it on with `--verify-tls`.
 Failed fetches are recorded, not discarded — `probe_error` says why, which
 separates "does not resolve" from "resolves and refuses".
 
+### Probes stay on the public internet
+
+A hostname that resolves to a private address is not fetched:
+
+```console
+$ ctmon get --db ct.db intranet.example.com
+  "probe_error": "... dial tcp 10.0.0.7:443: refusing to probe a non-public address: 10.0.0.7"
+```
+
+Every name here comes out of a stranger's certificate, and a certificate for a
+name pointing at `127.0.0.1` is trivial to obtain. Without the guard, anyone
+who wants one can make your monitor fetch services on the machine it runs on
+and read the status, size, and body hash back out of your store. `ctmon` blocks
+loopback, RFC 1918, link-local — including the `169.254.169.254` cloud metadata
+endpoint — carrier-grade NAT, multicast, and the unspecified and broadcast
+addresses, in both IPv4 and IPv6.
+
+The check runs on the resolved address just before the connection, not on the
+name beforehand, so it also catches a redirect into your network and a name
+that answers publicly once and privately the next time.
+
+`--allow-private` turns it off, which is what you want when the point is
+monitoring your own infrastructure and the store is not shared.
+
 Tuning knobs: `--probe-rps`, `--workers`, `--probe-timeout`, `--max-body`,
 `--user-agent`. Run with `--no-probe` to collect names only. Every name filter
 runs before probing, so a filtered host is never fetched.

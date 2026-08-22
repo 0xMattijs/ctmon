@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -110,5 +111,59 @@ func TestBackoffGrowsAndCaps(t *testing.T) {
 	}
 	if d := backoff(20, base, max); d != max {
 		t.Errorf("backoff(20) = %v, want the %v cap", d, max)
+	}
+}
+
+// flakyWSServer serves one message per connection and then hangs up, so a
+// client that does not reconnect sees exactly one certificate.
+func flakyWSServer(t *testing.T, msg string) (url string, conns func() int) {
+	t.Helper()
+	var (
+		mu sync.Mutex
+		n  int
+	)
+	up := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := up.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		mu.Lock()
+		n++
+		mu.Unlock()
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(msg))
+		conn.Close()
+	}))
+	t.Cleanup(srv.Close)
+	return "ws" + strings.TrimPrefix(srv.URL, "http"), func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return n
+	}
+}
+
+func TestCertstreamReconnects(t *testing.T) {
+	url, conns := flakyWSServer(t, sampleUpdate)
+
+	cs := &Certstream{
+		URL: url,
+		Log: slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError})),
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	out := make(chan Cert, 8)
+	go cs.Run(ctx, out)
+
+	// Two certificates means two connections: the socket carries one each.
+	for i := 0; i < 2; i++ {
+		select {
+		case <-out:
+		case <-ctx.Done():
+			t.Fatalf("only %d connection(s) before the deadline", conns())
+		}
+	}
+	if got := conns(); got < 2 {
+		t.Errorf("connections = %d, want at least 2", got)
 	}
 }

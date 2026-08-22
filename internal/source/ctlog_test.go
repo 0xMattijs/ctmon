@@ -37,7 +37,7 @@ func (f *fakeLog) serve(t *testing.T) string {
 		defer f.mu.Unlock()
 		json.NewEncoder(w).Encode(map[string]any{
 			"tree_size":           f.treeSize,
-			"timestamp":           1787000000000,
+			"timestamp":           int64(1787000000000),
 			"sha256_root_hash":    base64.StdEncoding.EncodeToString(make([]byte, 32)),
 			"tree_head_signature": base64.StdEncoding.EncodeToString(make([]byte, 4)),
 		})
@@ -246,25 +246,36 @@ func TestMaxLagLeavesFirstSightAlone(t *testing.T) {
 	}
 }
 
-func TestBackoffResetsAfterAHealthyRun(t *testing.T) {
-	cases := []struct {
-		attempt int
-		ran     time.Duration
-		want    int
-	}{
-		{0, time.Second, 1},
-		{3, time.Second, 4},
-		{3, healthyRun, 0},
-		{9, time.Hour, 0},
-	}
-	for _, tc := range cases {
-		if got := nextAttempt(tc.attempt, tc.ran); got != tc.want {
-			t.Errorf("nextAttempt(%d, %s) = %d, want %d", tc.attempt, tc.ran, got, tc.want)
+func TestRetryResetsAfterAHealthyRun(t *testing.T) {
+	rt := retry{base: time.Second, max: 30 * time.Second}
+
+	// A feed that keeps dropping straight away escalates.
+	for _, want := range []time.Duration{1, 2, 4, 8} {
+		if got := rt.after(time.Millisecond); got != want*time.Second {
+			t.Fatalf("delay = %v, want %v", got, want*time.Second)
 		}
 	}
-	// The point of the reset: a failure after a healthy run waits the base
-	// delay again instead of the accumulated one.
-	if got := backoff(nextAttempt(9, time.Hour), 5*time.Second, 10*time.Minute); got != 5*time.Second {
-		t.Errorf("backoff after a healthy run = %s, want 5s", got)
+
+	// A run that lasted pays the short pause itself, not the one the bad
+	// patch before it earned. Computing the delay before resetting the
+	// counter is the mistake this pins down.
+	if got := rt.after(healthyRun); got != time.Second {
+		t.Errorf("delay after a healthy run = %v, want 1s", got)
+	}
+
+	// And escalation resumes from the bottom.
+	if got := rt.after(time.Millisecond); got != 2*time.Second {
+		t.Errorf("delay after the reset = %v, want 2s", got)
+	}
+}
+
+func TestRetryCapsTheDelay(t *testing.T) {
+	rt := retry{base: time.Second, max: 4 * time.Second}
+	var last time.Duration
+	for i := 0; i < 20; i++ {
+		last = rt.after(0)
+	}
+	if last != 4*time.Second {
+		t.Errorf("delay = %v, want the 4s cap", last)
 	}
 }

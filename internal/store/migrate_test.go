@@ -3,6 +3,7 @@ package store
 import (
 	"encoding/binary"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -259,5 +260,66 @@ func TestCompactRefusesExistingTarget(t *testing.T) {
 
 	if _, err := Compact(path, path); err == nil {
 		t.Error("compact overwrote an existing file")
+	}
+}
+
+// A packed database read as JSON yields nothing. Migrate has to say so, rather
+// than report a successful migration of zero records and leave an empty file
+// the command then offers to move over the original.
+func TestMigrateRefusesAPackedDatabase(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "packed.db")
+	dst := filepath.Join(dir, "out.db")
+
+	s, err := Open(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, host := range []string{"a.example.com", "example.org"} {
+		if err := s.Update(host, func(r *Record, existed bool) bool {
+			r.FirstSeen, r.LastSeen, r.SeenCount = time.Now(), time.Now(), 1
+			return true
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s.Close()
+
+	if _, err := Migrate(src, dst); err == nil {
+		t.Fatal("Migrate accepted a packed database")
+	}
+	if _, err := os.Stat(dst); !os.IsNotExist(err) {
+		t.Errorf("refused migration left %s behind", dst)
+	}
+}
+
+// A database whose records are neither packed nor valid JSON must not migrate
+// to an empty store either.
+func TestMigrateRefusesAnUnreadableDatabase(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "junk.db")
+	dst := filepath.Join(dir, "out.db")
+
+	db, err := bolt.Open(src, 0o600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = db.Update(func(tx *bolt.Tx) error {
+		b, err := tx.CreateBucket([]byte("domains"))
+		if err != nil {
+			return err
+		}
+		return b.Put([]byte("com.example"), []byte("not json"))
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	if _, err := Migrate(src, dst); err == nil {
+		t.Fatal("Migrate accepted a database with no readable records")
+	}
+	if _, err := os.Stat(dst); !os.IsNotExist(err) {
+		t.Errorf("refused migration left %s behind", dst)
 	}
 }

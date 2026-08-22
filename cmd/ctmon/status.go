@@ -16,11 +16,12 @@ const defaultWidth = 80
 // record erases the status line, prints, and leaves it redrawn underneath:
 // without that the two would overwrite each other.
 type statusLine struct {
-	mu    sync.Mutex
-	f     *os.File
-	width int
-	text  string
-	shown bool
+	mu      sync.Mutex
+	f       *os.File
+	width   int
+	text    string
+	shown   bool
+	stopped bool
 }
 
 // newStatusLine returns a status line on f, or nil if f is not a terminal.
@@ -36,6 +37,9 @@ func newStatusLine(f *os.File) *statusLine {
 func (s *statusLine) Set(text string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.stopped {
+		return
+	}
 	s.text = text
 	// Cheap enough once a second, and it is how a resize is noticed.
 	if width, ok := terminalWidth(s.f); ok {
@@ -54,12 +58,14 @@ func (s *statusLine) Write(p []byte) (int, error) {
 	return n, err
 }
 
-// Stop erases the line for good.
+// Stop erases the line for good. A Set still in flight from the refresh loop
+// must not draw it again, or the final log record lands above a counter line
+// nothing will ever erase.
 func (s *statusLine) Stop() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.clear()
-	s.text = ""
+	s.text, s.stopped = "", true
 }
 
 // clear and draw assume the caller holds the lock and that the cursor sits at

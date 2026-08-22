@@ -64,6 +64,35 @@ func backoff(n int, base, max time.Duration) time.Duration {
 	return d
 }
 
+// healthyRun is how long a feed has to stay up before its failure counts as a
+// fresh one. Without it the backoff only ever climbs: a feed that drops once an
+// hour would end up waiting the maximum between every retry, forever.
+const healthyRun = time.Minute
+
+// retry paces reconnection to a feed that keeps failing. The delay doubles
+// from base to max, and a run that lasted healthyRun puts it back to base.
+//
+// Both feeds share this rather than each writing the loop, because the order
+// of the two steps is easy to get wrong and invisible when you do: reset the
+// counter after reading the delay and the healthy run still pays the long
+// pause it was supposed to have earned its way out of.
+type retry struct {
+	base    time.Duration
+	max     time.Duration
+	attempt int
+}
+
+// after folds one finished run into the counter and returns how long to wait
+// before trying again. ran is how long that run lasted.
+func (r *retry) after(ran time.Duration) time.Duration {
+	if ran >= healthyRun {
+		r.attempt = 0
+	}
+	d := backoff(r.attempt, r.base, r.max)
+	r.attempt++
+	return d
+}
+
 // sleep waits for d, or until ctx is cancelled.
 func sleep(ctx context.Context, d time.Duration) error {
 	t := time.NewTimer(d)

@@ -9,6 +9,7 @@ package pipeline
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"sync"
 	"sync/atomic"
@@ -264,9 +265,10 @@ func (p *Pipeline) record(ctx context.Context, n nameSeen, probes chan<- string)
 	if !wantProbe {
 		return
 	}
+	// A default case makes this select non-blocking, so watching ctx here
+	// would only make the counter a coin flip during shutdown.
 	select {
 	case probes <- host:
-	case <-ctx.Done():
 	default:
 		p.stats.Deferred.Add(1)
 	}
@@ -361,7 +363,7 @@ func (p *Pipeline) sweep(ctx context.Context, probes chan<- string) {
 		}
 		return nil
 	})
-	if err != nil && err != errStopWalk {
+	if err != nil && !errors.Is(err, errStopWalk) {
 		p.Log.Error("backfill sweep failed", "err", err)
 		return
 	}
