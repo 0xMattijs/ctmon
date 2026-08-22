@@ -303,22 +303,27 @@ interned:   6 sources, 86 issuers, 29 error shapes
 
 ## How the pipeline handles load
 
-CT issues certificates far faster than any polite crawler can fetch pages —
-roughly 400 certificates per second against a default of 20 probes per second.
-The pipeline splits accordingly:
+CT issues certificates far faster than any crawler can fetch pages — roughly
+400 certificates per second, which after filtering is still around 100 new
+hostnames a second. The pipeline splits accordingly:
 
 1. **Recording is cheap and never dropped.** Store writers block rather than
    lose a discovery, so every hostname the feeds produce lands in the database.
-2. **Probing is slow and sheds load.** A bounded worker pool fetches sites. If
-   every worker is busy, the probe is skipped, not queued forever — the record
-   simply stays `"probed": false`.
-3. **The backfill sweep catches up.** Every `--backfill` interval (default one
-   minute) `ctmon` walks the store for hosts still waiting on a probe and
-   queues them at whatever pace the probers manage.
+2. **Probing is slow and sheds load.** A bounded worker pool of `--workers`
+   (default 256) fetches sites. If every worker is busy, the probe is skipped
+   rather than queued in memory forever — the record stays `"probed": false`
+   and its place in the pending queue is what remembers it.
+3. **The backfill sweep catches up.** Every `--backfill` interval (default ten
+   seconds) `ctmon` takes the hosts that have waited longest off the pending
+   queue and hands them to the probers at whatever pace they manage.
 
-So `deferred` in the progress line is not data loss; it is work postponed. Set
-`--reprobe 24h` to also re-fetch known hosts once a day, which is what turns
-the store into a change monitor.
+So `deferred` in the progress line is not data loss; it is work postponed, and
+the postponement is written down: every host that wants a probe goes on the
+pending queue in the same transaction as its record, so a host cannot end up
+wanted-but-forgotten however the run ends. `throttled` is the other
+postponement — a probe held back because its destination address had already
+had its share this second. Set `--reprobe 24h` to also re-fetch known hosts
+once a day, which is what turns the store into a change monitor.
 
 The feeds also repeat themselves — the same certificate arrives from certstream
 and from the log it was written to, and packed certificates re-list the same
@@ -332,14 +337,20 @@ sits at zero until the set has cycled — at live rates, a few minutes in. Lower
 
 ## Probing behavior
 
-Probes fetch `https://<host>/` with a 10-second timeout, follow up to three
-redirects, read at most 2 MiB, and hash exactly the bytes they read. TLS
-verification is **off** by default: the point is to fingerprint whatever the
+Probes resolve the name, fetch `https://<host>/` with a 6-second budget end to
+end, follow up to three redirects, read at most 2 MiB, and hash exactly the
+bytes they read. TLS verification is **off** by default: the point is to fingerprint whatever the
 host serves, and hosts found through CT routinely serve mismatched, expired, or
 not-yet-deployed certificates. Turn it on with `--verify-tls`.
 
 Failed fetches are recorded, not discarded — `probe_error` says why, which
 separates "does not resolve" from "resolves and refuses".
+
+A failure that says nothing about the host is not recorded at all. A resolver
+that times out or returns SERVFAIL has not answered the question, so the probe
+is put off and tried again rather than written down; only `no such host` is
+treated as an answer. Without that distinction a busy resolver writes its own
+bad afternoon into thousands of records as if it were a fact about the hosts.
 
 ### Probes stay on the public internet
 
@@ -365,32 +376,81 @@ that answers publicly once and privately the next time.
 `--allow-private` turns it off, which is what you want when the point is
 monitoring your own infrastructure and the store is not shared.
 
-Tuning knobs: `--probe-rps`, `--workers`, `--probe-timeout`, `--dial-timeout`,
+Tuning knobs: `--workers`, `--probe-rps-per-ip`, `--probe-timeout`,
+`--dial-timeout`, `--tls-timeout`, `--resolvers`, `--resolve-concurrency`,
 `--max-body`, `--user-agent`. Run with `--no-probe` to collect names only.
 Every name filter runs before probing, so a filtered host is never fetched.
 
 ### What probing actually costs
 
-Probes are bound by how long dead hosts hold a worker, not by `--probe-rps`.
-Measured over 88,622 probes on a live store:
+Probing is bound by DNS, then by dead hosts, and hardly at all by the thing
+that used to limit it. The old defaults — 16 workers under a shared 20
+requests-per-second limit — managed **17.7 probes a second, 74% of them
+failing**, against an intake of about 108 new hostnames a second.
 
-| outcome | share |
-|---|---|
-| answered | 64% |
-| connect or handshake timeout | 19% |
-| does not resolve | 12% |
-| refused, reset, EOF, TLS error | 5% |
+Three things were in the way, and only the first was obvious:
 
-At 16 workers that came to 6.7 probes a second against a limit of 20, because
-average latency was 2.4s and the 19% that never answer accounted for about
-40% of all worker time. `--dial-timeout` is the knob for that: it bounds the
-connect and the handshake, which is where those go, and `--probe-timeout` does
-not — that one starts once a connection exists. Dropping it to `2s` reclaims
-most of the 40%; the cost is losing hosts that are real but slow to answer.
+1. **A global rate limit that spared nobody.** Every probe is a different host
+   getting exactly one request, so a limit shared across all of them was not
+   politeness, it was a cap. It is off by default now; `--probe-rps-per-ip`
+   rations by destination address instead, which is the unit a site can
+   actually object to.
+2. **Names resolved by the HTTP client.** A name that does not exist cost a
+   worker the whole dial timeout. Resolving first makes it cost a DNS answer.
+3. **The resolver itself.** This is the one that matters, and it does not
+   appear in any of `ctmon`'s own knobs.
 
-Raising `--workers` is the other half. Goroutines waiting on a socket are
-cheap, so the pool size is close to a free parameter: reaching the default
-20/s limit takes about 48 of them at that latency.
+#### The resolver is the ceiling
+
+Measured against the same 1,000 hostnames drawn from a live store, 8-second
+timeout:
+
+| resolver | lookups/s | no answer |
+|---|---|---|
+| `systemd-resolved` forwarding, concurrency 64 | 46 | 11.5% |
+| `unbound` recursing from the root, concurrency 64 | 49 | 41.4% |
+| `unbound` forwarding to six upstreams, concurrency 64 | 84 | **2.2%** |
+| `unbound` forwarding to six upstreams, concurrency 256 | 90 | **1.7%** |
+
+Two results worth keeping. A local forwarder saturates early: `systemd-resolved`
+tops out near 126 lookups a second and drops 12% of them even at concurrency
+8, so several hundred workers all asking at once turn into recorded failures
+rather than answers. And **recursing from the root is worse than forwarding**
+for this workload — the slow, flaky part is the authoritative servers of the
+junk domains certificate transparency is full of, not the resolver, and a
+forwarder gets those from a cache that is already warm.
+
+So point `--resolvers` at something that can take the load:
+
+```console
+$ ctmon run --db ct.db --resolvers 127.0.0.1:53 --resolve-concurrency 256
+```
+
+`--resolve-concurrency` (default 64) bounds lookups separately from
+`--workers`, because the two are different numbers: workers wait on sockets and
+cost almost nothing, while their lookups land on one process that starts
+failing rather than queueing when too many arrive at once. Leave it near the
+default when using the system resolver; raise it when you have given `ctmon` a
+resolver that can keep up.
+
+An `unbound` configured as a caching forwarder is a good answer. The settings
+that mattered were plenty of outgoing ports, a large message cache, no DNSSEC
+validation — a validating resolver answers SERVFAIL for the many CT names whose
+owners have broken their own — and `forward-addr` lines for several upstreams
+so that no single provider rate-limits the monitor.
+
+#### Timeouts
+
+`--dial-timeout` (2s) bounds the TCP connect, `--tls-timeout` (3s) the TLS
+handshake, and `--probe-timeout` (6s) the whole probe. The handshake gets its
+own, larger budget on purpose: a connect either lands quickly or not at all,
+but a handshake is several round trips to a server that has already answered,
+and a budget tight enough for the connect turns slow-but-real sites into
+failures.
+
+Raising `--workers` is close to free — goroutines waiting on a socket cost
+almost nothing — which is why the default is 256. It is also not the knob that
+will help you once DNS is where the time goes.
 
 ### Fresh names come first
 
@@ -407,6 +467,54 @@ new things.
 A quarter of the pool stays pinned to the backfill queue, so the backlog keeps
 moving even while new names arrive faster than the probers can fetch them —
 which, on live CT, is always.
+
+### The backlog is a queue, not a scan
+
+The backfill sweep used to walk the domain bucket from the top and take the
+first few thousand hosts that still wanted a probe. Records are keyed by
+reversed hostname, so that walk went in TLD-alphabetical order — and because
+new discoveries kept landing in the part of the keyspace it had already passed,
+the walk never got far. Measured on a live store of 2.1M names:
+
+| TLD | share probed |
+|---|---|
+| `.ai`, `.app`, `.at`, `.au`, `.be`, `.biz` | 82-97% |
+| `.br` | 28% |
+| `.com`, `.de`, `.net`, `.org`, `.uk`, `.xyz` | ~3% |
+
+Roughly 110,000 records sat in front of that frontier and 1,950,000 behind it.
+`.com` is 42% of the store, and the 3% it had were the ones the fresh queue
+caught on the way past — the sweep had never reached them and, at the rate new
+`.b`-and-earlier names arrived, never would have. Coverage was not a sample of
+the store. It was an alphabetical prefix of it.
+
+So the store now keeps the backlog explicitly, in a `pending` bucket keyed by
+when each host's probe is due. The sweep takes the hosts that have waited
+longest, whatever they are called. Two things follow from making it a real
+queue:
+
+- **A probe that is put off has a time attached.** A host turned away by its
+  address's budget comes back in `30s`; a re-probe comes back after
+  `--reprobe`. Both are the same mechanism as a first probe, just later.
+- **Nothing is dropped by dying.** Hosts handed to a prober are *leased* rather
+  than deleted: the entry stays, hidden, until `--backfill-lease` (default five
+  minutes) runs out. Finish the probe and it goes; kill the process mid-probe
+  and the host comes back on its own.
+
+A database from before the queue is filled in once, at startup:
+
+```console
+INFO filling the probe queue scanned=1640000 queued=1479642
+INFO probe queue filled from existing records queued=1952082 took=37s
+```
+
+`ctmon stats` reports the depth, and how long the host at the head of the queue
+has been waiting — which is the number that says whether probing is keeping up:
+
+```
+queued:     1952082
+waiting:    3h14m22s (oldest queued probe)
+```
 
 Be deliberate about pointing this at the internet at scale. Every discovered
 name gets one unsolicited HTTPS request from your address.

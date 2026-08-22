@@ -77,44 +77,52 @@ func main() {
 func runCmd(args []string) error {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
 	var (
-		dbPath   = fs.String("db", "ct.db", "path to the bbolt database")
-		sources  = fs.String("source", "both", "certificate feed: certstream, ctlog, or both")
-		csURL    = fs.String("certstream-url", source.DefaultCertstreamURL, "certstream websocket URL")
-		logURIs  = fs.String("logs", "", "comma-separated CT log URLs (default: discover usable logs)")
-		listURL  = fs.String("log-list-url", "", "CT log list URL (default: Google's v3 list)")
-		fromTop  = fs.Bool("from-start", false, "read each new log from index 0 instead of its current tip")
-		batch    = fs.Int("batch", 256, "entries per get-entries request (a ceiling: a log that times out gets asked for less)")
-		maxLag   = fs.Uint64("max-lag", 0, "skip a log to its tree head when it falls this many entries behind (0 = never skip)")
-		poll     = fs.Duration("poll", 30*time.Second, "how long to wait after catching up with a log")
-		logRPS   = fs.Float64("log-rps", 4, "get-entries requests per second, per log")
-		workers  = fs.Int("workers", 16, "concurrent HTTPS probes")
-		writers  = fs.Int("writers", 4, "concurrent store writers")
-		backfill = fs.Duration("backfill", time.Minute, "how often to sweep for hosts still waiting on a probe (0 disables)")
-		bfBatch  = fs.Int("backfill-batch", 5000, "maximum hosts queued per sweep")
-		reprobe  = fs.Duration("reprobe", 0, "re-probe a known host after this long (0 disables)")
-		skipSfx  = fs.String("skip-suffix", "", "extra parent domains to drop, comma-separated, e.g. workers.dev,pages.dev")
-		skipFile = fs.String("skip-suffix-file", "", "file of extra parent domains to drop, one per line (# comments allowed)")
-		defSkip  = fs.Bool("default-skip", true, "apply the built-in hosting-platform blocklist")
-		parCap   = fs.Int("parent-cap", pipeline.DefaultParentCap, "maximum new hosts accepted per registrable domain per window (0 = no cap)")
-		parWin   = fs.Duration("parent-window", pipeline.DefaultParentWindow, "window for --parent-cap")
-		recent   = fs.Int("recent-hosts", pipeline.DefaultRecentHosts, "hostnames the in-memory duplicate filter remembers (0 = default)")
-		maxDepth = fs.Int("max-depth", pipeline.DefaultMaxDepth, "drop hosts nested deeper than this below their registrable domain (0 = no limit)")
-		useSANs  = fs.Bool("sans", true, "read hostnames from subject alternative names, not just the CN")
-		maxSANs  = fs.Int("max-sans", 0, "maximum SANs to read from one certificate (0 = all)")
-		noProbe  = fs.Bool("no-probe", false, "record domains without fetching them")
-		probeRPS = fs.Float64("probe-rps", 20, "HTTPS probes per second across all workers")
-		timeout  = fs.Duration("probe-timeout", 10*time.Second, "per-probe timeout, once a connection exists")
-		dialTO   = fs.Duration("dial-timeout", 5*time.Second, "how long to wait for the TCP connect and the TLS handshake")
-		maxBody  = fs.Int64("max-body", 2<<20, "bytes of body to read and hash")
-		verify   = fs.Bool("verify-tls", false, "verify TLS certificates when probing")
-		private  = fs.Bool("allow-private", false, "probe hosts that resolve to loopback, RFC 1918, or other non-public addresses")
-		ua       = fs.String("user-agent", "ctmon/1.0 (+domain discovery)", "User-Agent for probes and CT requests")
-		compact  = fs.Duration("compact-every", 24*time.Hour, "rewrite the database into full pages this often (0 disables)")
-		snapPath = fs.String("snapshot", "", "where SIGUSR1 writes a readable copy of the database (default: <db>.snap)")
-		report   = fs.Duration("report", time.Minute, "how often to log counters (0 disables)")
-		status   = fs.Bool("status", true, "on a terminal, redraw the counters in place instead of logging a line per report interval")
-		domains  = fs.Bool("domains", false, "log every new domain, one line each")
-		verbose  = fs.Bool("v", false, "debug logging")
+		dbPath    = fs.String("db", "ct.db", "path to the bbolt database")
+		sources   = fs.String("source", "both", "certificate feed: certstream, ctlog, or both")
+		csURL     = fs.String("certstream-url", source.DefaultCertstreamURL, "certstream websocket URL")
+		logURIs   = fs.String("logs", "", "comma-separated CT log URLs (default: discover usable logs)")
+		listURL   = fs.String("log-list-url", "", "CT log list URL (default: Google's v3 list)")
+		fromTop   = fs.Bool("from-start", false, "read each new log from index 0 instead of its current tip")
+		batch     = fs.Int("batch", 256, "entries per get-entries request (a ceiling: a log that times out gets asked for less)")
+		maxLag    = fs.Uint64("max-lag", 0, "skip a log to its tree head when it falls this many entries behind (0 = never skip)")
+		poll      = fs.Duration("poll", 30*time.Second, "how long to wait after catching up with a log")
+		logRPS    = fs.Float64("log-rps", 4, "get-entries requests per second, per log")
+		workers   = fs.Int("workers", pipeline.DefaultWorkers, "concurrent HTTPS probes")
+		writers   = fs.Int("writers", 4, "concurrent store writers")
+		backfill  = fs.Duration("backfill", 10*time.Second, "how often to take hosts off the pending queue (0 disables)")
+		bfBatch   = fs.Int("backfill-batch", 5000, "maximum hosts leased per sweep")
+		bfLease   = fs.Duration("backfill-lease", pipeline.DefaultBackfillLease, "how long a host handed to a prober stays off the pending queue")
+		reprobe   = fs.Duration("reprobe", 0, "re-probe a known host after this long (0 disables)")
+		skipSfx   = fs.String("skip-suffix", "", "extra parent domains to drop, comma-separated, e.g. workers.dev,pages.dev")
+		skipFile  = fs.String("skip-suffix-file", "", "file of extra parent domains to drop, one per line (# comments allowed)")
+		defSkip   = fs.Bool("default-skip", true, "apply the built-in hosting-platform blocklist")
+		parCap    = fs.Int("parent-cap", pipeline.DefaultParentCap, "maximum new hosts accepted per registrable domain per window (0 = no cap)")
+		parWin    = fs.Duration("parent-window", pipeline.DefaultParentWindow, "window for --parent-cap")
+		recent    = fs.Int("recent-hosts", pipeline.DefaultRecentHosts, "hostnames the in-memory duplicate filter remembers (0 = default)")
+		maxDepth  = fs.Int("max-depth", pipeline.DefaultMaxDepth, "drop hosts nested deeper than this below their registrable domain (0 = no limit)")
+		useSANs   = fs.Bool("sans", true, "read hostnames from subject alternative names, not just the CN")
+		maxSANs   = fs.Int("max-sans", 0, "maximum SANs to read from one certificate (0 = all)")
+		noProbe   = fs.Bool("no-probe", false, "record domains without fetching them")
+		probeRPS  = fs.Float64("probe-rps", 0, "overall ceiling on HTTPS probes per second (0 = no overall limit)")
+		ipRPS     = fs.Float64("probe-rps-per-ip", 32, "HTTPS probes per second to one destination address")
+		timeout   = fs.Duration("probe-timeout", 6*time.Second, "per-probe timeout, end to end")
+		dialTO    = fs.Duration("dial-timeout", 2*time.Second, "how long to wait for the TCP connect")
+		tlsTO     = fs.Duration("tls-timeout", 3*time.Second, "how long to wait for the TLS handshake")
+		resolves  = fs.String("resolvers", "", "nameservers to probe with, comma-separated host:port (default: the system's)")
+		dnsTO     = fs.Duration("resolve-timeout", 2*time.Second, "how long to wait for a DNS answer")
+		dnsTTL    = fs.Duration("dns-ttl", 5*time.Minute, "how long to cache a name that resolved")
+		dnsNegTTL = fs.Duration("dns-negative-ttl", 15*time.Minute, "how long to cache a name that did not resolve")
+		dnsConc   = fs.Int("resolve-concurrency", 64, "how many DNS lookups may run at once")
+		maxBody   = fs.Int64("max-body", 2<<20, "bytes of body to read and hash")
+		verify    = fs.Bool("verify-tls", false, "verify TLS certificates when probing")
+		private   = fs.Bool("allow-private", false, "probe hosts that resolve to loopback, RFC 1918, or other non-public addresses")
+		ua        = fs.String("user-agent", "ctmon/1.0 (+domain discovery)", "User-Agent for probes and CT requests")
+		compact   = fs.Duration("compact-every", 24*time.Hour, "rewrite the database into full pages this often (0 disables)")
+		snapPath  = fs.String("snapshot", "", "where SIGUSR1 writes a readable copy of the database (default: <db>.snap)")
+		report    = fs.Duration("report", time.Minute, "how often to log counters (0 disables)")
+		status    = fs.Bool("status", true, "on a terminal, redraw the counters in place instead of logging a line per report interval")
+		domains   = fs.Bool("domains", false, "log every new domain, one line each")
+		verbose   = fs.Bool("v", false, "debug logging")
 	)
 	fs.Parse(args)
 
@@ -162,8 +170,15 @@ func runCmd(args []string) error {
 		Prober: probe.New(probe.Options{
 			Timeout:           *timeout,
 			DialTimeout:       *dialTO,
+			TLSTimeout:        *tlsTO,
 			MaxBody:           *maxBody,
 			RequestsPerSecond: *probeRPS,
+			PerIPRPS:          *ipRPS,
+			Resolvers:         splitList(*resolves),
+			ResolveTimeout:    *dnsTO,
+			MaxLookups:        *dnsConc,
+			DNSTTL:            *dnsTTL,
+			DNSNegativeTTL:    *dnsNegTTL,
 			VerifyTLS:         *verify,
 			AllowPrivate:      *private,
 			UserAgent:         *ua,
@@ -180,9 +195,16 @@ func runCmd(args []string) error {
 		Reprobe:       *reprobe,
 		Backfill:      *backfill,
 		BackfillBatch: *bfBatch,
+		BackfillLease: *bfLease,
 		NoProbe:       *noProbe,
 		LogDomains:    *domains,
 		RecentHosts:   *recent,
+	}
+
+	if !*noProbe {
+		if err := seedPending(db, pipe, log); err != nil {
+			return err
+		}
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -427,6 +449,7 @@ func statsFields(p *pipeline.Pipeline) []any {
 		"probe_failed", s.Failed.Load(),
 		"changed", s.Changed.Load(),
 		"deferred", s.Deferred.Load(),
+		"throttled", s.Throttled.Load(),
 		"backfilled", s.Backfilled.Load(),
 	}
 }
@@ -624,6 +647,10 @@ func statsCmd(args []string) error {
 	fmt.Printf("wildcards:  %d\n", st.Wildcards)
 	fmt.Printf("errors:     %d\n", st.Errors)
 	fmt.Printf("changed:    %d\n", st.Changed)
+	fmt.Printf("queued:     %d\n", st.Pending)
+	if !st.Oldest.IsZero() {
+		fmt.Printf("waiting:    %s (oldest queued probe)\n", waited(st.Oldest))
+	}
 	fmt.Printf("\nfile size:  %s\n", humanBytes(st.Bytes))
 	if st.Domains > 0 {
 		fmt.Printf("per record: %d B\n", st.Bytes/int64(st.Domains))
@@ -637,4 +664,59 @@ func statsCmd(args []string) error {
 		}
 	}
 	return nil
+}
+
+// splitList reads a comma-separated flag into its entries, dropping the empty
+// ones a trailing comma leaves behind.
+func splitList(raw string) []string {
+	var out []string
+	for _, s := range strings.Split(raw, ",") {
+		if s = strings.TrimSpace(s); s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// seedPending fills the pending queue from a database written before the queue
+// existed. It runs once per database and walks every record, which on a large
+// store takes a while and is worth saying so.
+func seedPending(db *store.Store, pipe *pipeline.Pipeline, log *slog.Logger) error {
+	start := time.Now()
+	var last time.Time
+	queued, ran, err := db.SeedPending(
+		func(r *store.Record) (time.Time, bool) {
+			if r.Probed {
+				return time.Time{}, false
+			}
+			// Due when it was found, so the backlog comes out oldest first.
+			return r.FirstSeen, true
+		},
+		func(scanned, queued int) {
+			if time.Since(last) < 5*time.Second {
+				return
+			}
+			last = time.Now()
+			log.Info("filling the probe queue", "scanned", scanned, "queued", queued)
+		},
+	)
+	if err != nil {
+		return err
+	}
+	if ran && queued > 0 {
+		log.Info("probe queue filled from existing records",
+			"queued", queued, "took", time.Since(start).Round(time.Second))
+	}
+	return nil
+}
+
+// waited renders how long the oldest queued probe has been due. A backlog is
+// normal; one whose oldest entry keeps getting older is probing that cannot
+// keep up.
+func waited(due time.Time) string {
+	d := time.Since(due)
+	if d < 0 {
+		return "not due yet"
+	}
+	return d.Round(time.Second).String()
 }

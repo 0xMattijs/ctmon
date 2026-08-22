@@ -9,7 +9,6 @@ package pipeline
 
 import (
 	"context"
-	"errors"
 	"log/slog"
 	"sync"
 	"sync/atomic"
@@ -28,7 +27,7 @@ type Pipeline struct {
 	Prober *probe.Prober
 	Log    *slog.Logger
 
-	// Workers is the number of concurrent probes (default 16).
+	// Workers is the number of concurrent probes (default DefaultWorkers).
 	Workers int
 	// Writers is the number of goroutines writing to the store (default 4).
 	Writers int
@@ -39,8 +38,15 @@ type Pipeline struct {
 	// Backfill is how often to sweep the store for hosts that were recorded
 	// but never probed. Zero disables the sweep.
 	Backfill time.Duration
-	// BackfillBatch caps how many pending hosts one sweep queues (default 5000).
+	// BackfillBatch caps how many pending hosts one sweep leases (default 5000).
 	BackfillBatch int
+	// BackfillLease is how long a leased host stays out of the queue before
+	// it becomes due again (default DefaultBackfillLease). It only matters
+	// when a run ends holding leases: the hosts come back on their own.
+	BackfillLease time.Duration
+	// DeferBackoff is how long a host waits after its address turned it away
+	// (default DefaultDeferBackoff).
+	DeferBackoff time.Duration
 	// Skip blocks hosts at or under these parent domains, muting a hosting
 	// platform wholesale.
 	Skip SuffixSet
@@ -90,6 +96,7 @@ type Stats struct {
 	Failed     atomic.Int64
 	Changed    atomic.Int64
 	Deferred   atomic.Int64 // probes shed because every worker was busy
+	Throttled  atomic.Int64 // probes put off: address over budget, or no DNS answer
 	Backfilled atomic.Int64 // probes queued by the sweep
 }
 
@@ -107,7 +114,7 @@ type nameSeen struct {
 func (p *Pipeline) Run(ctx context.Context, in <-chan source.Cert) {
 	workers := p.Workers
 	if workers <= 0 {
-		workers = 16
+		workers = DefaultWorkers
 	}
 	writers := p.Writers
 	if writers <= 0 {
@@ -123,7 +130,7 @@ func (p *Pipeline) Run(ctx context.Context, in <-chan source.Cert) {
 	fresh := make(chan string, workers*8)
 	// The backlog queue stays short on purpose: the sweep can always read
 	// more from the store, and buffering it only lets stale work pile up.
-	backlog := make(chan string, workers)
+	backlog := make(chan store.Pending, workers)
 
 	// Most workers take fresh discoveries first. A few are kept for the
 	// backlog, so a sustained burst of new names cannot starve it completely
@@ -136,8 +143,8 @@ func (p *Pipeline) Run(ctx context.Context, in <-chan source.Cert) {
 		go func() {
 			defer probeWG.Done()
 			if backlogOnly {
-				for host := range backlog {
-					p.probe(ctx, host)
+				for item := range backlog {
+					p.probeQueued(ctx, item)
 				}
 				return
 			}
@@ -233,7 +240,7 @@ func backlogWorkers(workers int) int {
 
 // probeFreshFirst serves both queues, preferring fresh. It returns once both
 // are closed and drained.
-func (p *Pipeline) probeFreshFirst(ctx context.Context, fresh, backlog chan string) {
+func (p *Pipeline) probeFreshFirst(ctx context.Context, fresh chan string, backlog chan store.Pending) {
 	for fresh != nil || backlog != nil {
 		// Take a fresh discovery if one is waiting, without blocking.
 		if fresh != nil {
@@ -258,19 +265,24 @@ func (p *Pipeline) probeFreshFirst(ctx context.Context, fresh, backlog chan stri
 				continue
 			}
 			p.probe(ctx, host)
-		case host, ok := <-backlog:
+		case item, ok := <-backlog:
 			if !ok {
 				backlog = nil
 				continue
 			}
-			p.probe(ctx, host)
+			p.probeQueued(ctx, item)
 		}
 	}
 }
 
-// record stores the hostname and queues a probe if one is due, on the fresh
-// queue. A full queue is not an error: the record stays unprobed and the sweep
-// retries it later.
+// record stores the hostname and, when a probe is due, writes it to the
+// store's pending queue and offers it to the in-memory fresh queue as well.
+//
+// The two are not alternatives. The queue entry is the durable one, written in
+// the same transaction as the record so the two cannot disagree; the fresh
+// queue is a fast path that gets recent discoveries probed ahead of a backlog
+// that is drained oldest-first. A host taken by the fast path leaves its queue
+// entry behind, and the sweep drops it on sight once the record shows a probe.
 func (p *Pipeline) record(ctx context.Context, n nameSeen, freshQueue chan<- string) {
 	var (
 		fresh     bool
@@ -291,10 +303,14 @@ func (p *Pipeline) record(ctx context.Context, n nameSeen, freshQueue chan<- str
 		}
 	}
 
-	err := p.Store.Update(host, func(r *store.Record, existed bool) bool {
+	// bolt may run the transaction below more than once, so the due time has
+	// to be fixed before it starts: a clock read inside would queue the host
+	// twice under two different keys.
+	due := time.Now().UTC()
+	err := p.Store.UpdateWithQueue(host, func(r *store.Record, existed bool) (bool, time.Time) {
 		now := n.cert.SeenAt
 		if now.IsZero() {
-			now = time.Now().UTC()
+			now = due
 		}
 		fresh = !existed
 		if fresh {
@@ -313,7 +329,10 @@ func (p *Pipeline) record(ctx context.Context, n nameSeen, freshQueue chan<- str
 			r.Issuer = n.cert.Issuer
 		}
 		wantProbe = !p.NoProbe && (!r.Probed || p.stale(r))
-		return true
+		if !wantProbe {
+			return true, time.Time{}
+		}
+		return true, due
 	})
 	if err != nil {
 		p.Log.Error("store write failed", "host", host, "err", err)
@@ -344,10 +363,40 @@ func (p *Pipeline) record(ctx context.Context, n nameSeen, freshQueue chan<- str
 	}
 }
 
+// probeQueued probes a host the sweep leased, then releases the lease.
+//
+// Dropping the entry is what finishes the work. A run that dies before this
+// point leaves a lease that expires, so the host comes round again rather than
+// going missing.
+func (p *Pipeline) probeQueued(ctx context.Context, item store.Pending) {
+	p.probe(ctx, item.Host)
+	if ctx.Err() != nil {
+		// The run is stopping and this host may not have been fetched. Leave
+		// the lease to expire rather than dropping work that was never done.
+		return
+	}
+	// A deferred probe has already queued the host afresh, so the lease goes
+	// either way: keeping it would only fetch the host twice.
+	if err := p.Store.PendingDone(item.Key); err != nil {
+		p.Log.Error("release pending failed", "host", item.Host, "err", err)
+	}
+}
+
 // probe fetches the host and folds the result into its record.
+//
+// A host turned away by its address's budget is queued again and nothing is
+// written down: nothing was asked of it, so there is nothing to record, and a
+// probe error would be a claim about the host that is not true.
 func (p *Pipeline) probe(ctx context.Context, host string) {
 	res := p.Prober.Probe(ctx, host)
 	if ctx.Err() != nil {
+		return
+	}
+	if res.Deferred {
+		p.stats.Throttled.Add(1)
+		if err := p.Store.Enqueue(host, time.Now().UTC().Add(p.deferBackoff())); err != nil {
+			p.Log.Error("requeue failed", "host", host, "err", err)
+		}
 		return
 	}
 	p.stats.Probed.Add(1)
@@ -356,19 +405,27 @@ func (p *Pipeline) probe(ctx context.Context, host string) {
 	}
 
 	changed := false
-	err := p.Store.Update(host, func(r *store.Record, existed bool) bool {
+	probedAt := time.Now().UTC()
+	// Re-probing is the only thing that queues a host again from here, and
+	// its due time has to be fixed before the transaction for the same reason
+	// record's does.
+	var requeue time.Time
+	if p.Reprobe > 0 && !p.NoProbe {
+		requeue = probedAt.Add(p.Reprobe)
+	}
+	err := p.Store.UpdateWithQueue(host, func(r *store.Record, existed bool) (bool, time.Time) {
 		if !existed {
 			// The record was deleted underneath us; do not resurrect it.
-			return false
+			return false, time.Time{}
 		}
 		r.Probed = true
-		r.ProbedAt = time.Now().UTC()
+		r.ProbedAt = probedAt
 		r.ProbeCount++
 		r.HTTPStatus = res.Status
 		r.FinalURL = res.FinalURL
 		if res.Err != nil {
 			r.ProbeError = res.Err.Error()
-			return true
+			return true, requeue
 		}
 		r.ProbeError = ""
 		r.BodySize = res.Size
@@ -378,7 +435,7 @@ func (p *Pipeline) probe(ctx context.Context, host string) {
 			changed = true
 		}
 		r.BodyHash = res.Hash
-		return true
+		return true, requeue
 	})
 	if err != nil {
 		p.Log.Error("store write failed", "host", host, "err", err)
@@ -397,9 +454,9 @@ func (p *Pipeline) probe(ctx context.Context, host string) {
 	}
 }
 
-// sweepLoop periodically queues hosts that were recorded but never probed,
-// which is how shed probes eventually get done.
-func (p *Pipeline) sweepLoop(ctx context.Context, backlog chan<- string) {
+// sweepLoop periodically hands the probers hosts from the store's pending
+// queue, which is how shed and deferred probes eventually get done.
+func (p *Pipeline) sweepLoop(ctx context.Context, backlog chan<- store.Pending) {
 	if p.Backfill <= 0 || p.NoProbe {
 		return
 	}
@@ -415,48 +472,75 @@ func (p *Pipeline) sweepLoop(ctx context.Context, backlog chan<- string) {
 	}
 }
 
-// sweep collects pending hosts in one read transaction, then queues them.
-// Queuing blocks, so the sweep runs at whatever pace the probers manage.
-func (p *Pipeline) sweep(ctx context.Context, backlog chan<- string) {
+// sweep leases a batch of due hosts and queues them. Queuing blocks, so the
+// sweep runs at whatever pace the probers manage.
+//
+// The queue is ordered by due time, so this takes the hosts that have waited
+// longest — no scan, and no part of the keyspace that the sweep never reaches.
+func (p *Pipeline) sweep(ctx context.Context, backlog chan<- store.Pending) {
 	limit := p.BackfillBatch
 	if limit <= 0 {
 		limit = 5000
 	}
+	lease := p.BackfillLease
+	if lease <= 0 {
+		lease = DefaultBackfillLease
+	}
 
-	var pending []string
-	err := p.Store.ForEach(func(r *store.Record) error {
-		if len(pending) >= limit {
-			return errStopWalk
-		}
-		if !r.Probed || p.stale(r) {
-			pending = append(pending, r.Host)
-		}
-		return nil
-	})
-	if err != nil && !errors.Is(err, errStopWalk) {
+	pending, err := p.Store.PendingLease(time.Now().UTC(), limit, lease)
+	if err != nil {
 		p.Log.Error("backfill sweep failed", "err", err)
 		return
 	}
 	if len(pending) == 0 {
 		return
 	}
-	p.Log.Info("backfill sweep", "pending", len(pending))
-	for _, host := range pending {
+
+	queued, stale := 0, 0
+	for _, item := range pending {
+		// The fast path may have probed this host already, and a host that
+		// has been probed and is not yet stale wants nothing. Dropping those
+		// here is what keeps the queue from growing an entry per discovery.
+		want, err := p.wantsProbe(item.Host)
+		if err != nil {
+			p.Log.Error("store read failed", "host", item.Host, "err", err)
+			continue
+		}
+		if !want {
+			stale++
+			if err := p.Store.PendingDone(item.Key); err != nil {
+				p.Log.Error("release pending failed", "host", item.Host, "err", err)
+			}
+			continue
+		}
 		select {
-		case backlog <- host:
+		case backlog <- item:
+			queued++
 			p.stats.Backfilled.Add(1)
 		case <-ctx.Done():
 			return
 		}
 	}
+	p.Log.Info("backfill sweep", "queued", queued, "already_done", stale)
 }
 
-// errStopWalk ends a store walk early. It never escapes sweep.
-var errStopWalk = stopWalk{}
+// wantsProbe reports whether the stored host still needs fetching. A host
+// whose record has gone wants nothing: it was deleted, not forgotten.
+func (p *Pipeline) wantsProbe(host string) (bool, error) {
+	rec, err := p.Store.Get(host)
+	if err != nil || rec == nil {
+		return false, err
+	}
+	return !rec.Probed || p.stale(rec), nil
+}
 
-type stopWalk struct{}
-
-func (stopWalk) Error() string { return "stop walk" }
+// deferBackoff is how long a host waits after its address turned it away.
+func (p *Pipeline) deferBackoff() time.Duration {
+	if p.DeferBackoff > 0 {
+		return p.DeferBackoff
+	}
+	return DefaultDeferBackoff
+}
 
 // sans applies the SAN policy: none when IgnoreSANs is set, otherwise the
 // first MaxSANs of them.

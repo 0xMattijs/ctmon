@@ -22,6 +22,21 @@ const (
 	// filter remembers. It is sized to hold a few minutes of intake, which
 	// is where the feeds' repetition lives.
 	DefaultRecentHosts = 50000
+	// DefaultWorkers is how many probes run at once.
+	//
+	// It was 16, which with a shared 20-per-second limit put the ceiling at
+	// about 15 probes a second against an intake of 108 hostnames a second:
+	// the monitor fell seven names behind for every one it fetched. Probes
+	// wait on the network rather than on a CPU, so the useful number is set
+	// by how many sockets and lookups are in flight, not by cores.
+	DefaultWorkers = 256
+	// DefaultBackfillLease is how long a host handed to a prober stays out of
+	// the pending queue. It only has to outlast a probe; the cost of setting
+	// it too short is fetching something twice.
+	DefaultBackfillLease = 5 * time.Minute
+	// DefaultDeferBackoff is how long a host waits after its address turned
+	// it away for being over budget.
+	DefaultDeferBackoff = 30 * time.Second
 )
 
 //go:embed skiplist.txt
