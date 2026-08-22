@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -105,5 +106,52 @@ func TestProbeFollowsRedirect(t *testing.T) {
 	want := sha256.Sum256([]byte(body))
 	if res.Hash != hex.EncodeToString(want[:]) {
 		t.Errorf("hash is not the hash of the redirected body")
+	}
+}
+
+// http.Client.Do already returns a *url.Error reading `Get "<url>": <cause>`,
+// so Probe must not name the URL a second time.
+func TestProbeErrorNamesTheURLOnce(t *testing.T) {
+	p := New(Options{
+		Timeout: 2 * time.Second,
+		DialContext: func(context.Context, string, string) (net.Conn, error) {
+			return nil, errors.New("boom")
+		},
+	})
+	res := p.Probe(context.Background(), "down.test")
+	if res.Err == nil {
+		t.Fatal("want an error")
+	}
+	msg := res.Err.Error()
+	if n := strings.Count(msg, "https://down.test/"); n != 1 {
+		t.Errorf("URL appears %d times in %q, want once", n, msg)
+	}
+}
+
+// When a redirect is what failed, the error carries the URL that failed rather
+// than the one the probe started from. That is why Probe passes the *url.Error
+// through instead of restating the original URL.
+func TestProbeErrorNamesTheRedirectTarget(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "https://elsewhere.test/inner", http.StatusFound)
+	}))
+	defer srv.Close()
+
+	start := srv.Listener.Addr().String()
+	p := New(Options{
+		Timeout: 2 * time.Second,
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			if strings.HasPrefix(addr, "elsewhere.test:") {
+				return nil, errors.New("boom")
+			}
+			return (&net.Dialer{}).DialContext(ctx, network, start)
+		},
+	})
+	res := p.Probe(context.Background(), "first.test")
+	if res.Err == nil {
+		t.Fatal("want an error from the redirect target")
+	}
+	if msg := res.Err.Error(); !strings.Contains(msg, "https://elsewhere.test/inner") {
+		t.Errorf("error = %q, want it to name the redirect target", msg)
 	}
 }

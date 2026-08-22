@@ -147,7 +147,12 @@ func (p *Prober) Probe(ctx context.Context, host string) Result {
 
 	resp, err := p.client.Do(req)
 	if err != nil {
-		return Result{Err: fmt.Errorf("get %s: %w", url, err)}
+		// Do returns a *url.Error, which already reads
+		// `Get "https://host/": <cause>`. Naming the URL again here only
+		// printed it twice. When a redirect failed, the URL it carries is
+		// the one that failed, which is worth more than the one we asked
+		// for, so pass it through rather than restating either.
+		return Result{Err: err}
 	}
 	defer resp.Body.Close()
 
