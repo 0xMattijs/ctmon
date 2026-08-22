@@ -109,6 +109,7 @@ func runCmd(args []string) error {
 		private  = fs.Bool("allow-private", false, "probe hosts that resolve to loopback, RFC 1918, or other non-public addresses")
 		ua       = fs.String("user-agent", "ctmon/1.0 (+domain discovery)", "User-Agent for probes and CT requests")
 		compact  = fs.Duration("compact-every", 24*time.Hour, "rewrite the database into full pages this often (0 disables)")
+		snapPath = fs.String("snapshot", "", "where SIGUSR1 writes a readable copy of the database (default: <db>.snap)")
 		report   = fs.Duration("report", time.Minute, "how often to log counters (0 disables)")
 		status   = fs.Bool("status", true, "on a terminal, redraw the counters in place instead of logging a line per report interval")
 		domains  = fs.Bool("domains", false, "log every new domain, one line each")
@@ -207,6 +208,18 @@ func runCmd(args []string) error {
 
 	if *compact > 0 {
 		go compactLoop(ctx, *compact, db, log)
+	}
+
+	// A run holds an exclusive lock on the database, so ctmon stats and the
+	// rest cannot open it. Snapshot on a signal gives them something to read
+	// without stopping the collection.
+	if sig, ok := snapshotSignal(); ok {
+		dst := *snapPath
+		if dst == "" {
+			dst = *dbPath + ".snap"
+		}
+		go snapshotLoop(ctx, sig, db, dst, log)
+		log.Info("snapshot on signal", "signal", sig, "path", dst)
 	}
 
 	switch {
@@ -325,6 +338,33 @@ func compactLoop(ctx context.Context, every time.Duration, db *store.Store, log 
 				"reclaimed", humanBytes(res.OldUsed-res.NewUsed),
 				"file", humanBytes(res.NewBytes),
 				"took", time.Since(start).Round(time.Millisecond))
+		}
+	}
+}
+
+// snapshotLoop writes a consistent copy of the store every time sig arrives.
+//
+// The copy is what ctmon stats, list, and get read while a run is going: bolt
+// hands the writer an exclusive lock on the file, so those commands cannot
+// open the live database at all, not even read-only.
+func snapshotLoop(ctx context.Context, sig os.Signal, db *store.Store, path string, log *slog.Logger) {
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, sig)
+	defer signal.Stop(ch)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ch:
+			start := time.Now()
+			n, err := db.Snapshot(path)
+			if err != nil {
+				log.Error("snapshot failed", "path", path, "err", err)
+				continue
+			}
+			log.Info("snapshot written", "path", path,
+				"size", humanBytes(n), "took", time.Since(start).Round(time.Millisecond))
 		}
 	}
 }

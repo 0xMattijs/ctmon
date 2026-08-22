@@ -401,6 +401,43 @@ booleans. So the packed format:
 Body hashes stay full SHA-256. Timestamps lose sub-second precision, which is
 the one thing the format gives up.
 
+### Reading the store while it runs
+
+A run holds bolt's exclusive lock on the database, so `stats`, `list`, and
+`get` cannot open it — not even read-only, because the shared lock they would
+take conflicts with the writer's:
+
+```console
+$ ctmon stats --db ct.db
+error: open ct.db: timeout
+```
+
+Copying the file is not the answer either. `cp` reads it over several seconds
+while it changes underneath, and the result mixes pages from two eras into a
+tree whose cursor walks in circles. It looks like a working database until a
+full scan repeats records forever.
+
+Signal the run instead. `SIGUSR1` writes a consistent copy beside the live
+file, from a read transaction inside the process that holds the lock, and the
+run keeps collecting throughout:
+
+```console
+$ kill -USR1 $(pgrep -f "ctmon run")
+$ ctmon stats --db ct.db.snap
+domains:    1406056
+probed:     80820
+...
+```
+
+```
+INFO snapshot written path=ct.db.snap size="96.3 MiB" took=1.2s
+```
+
+`--snapshot` puts it somewhere else. The copy lands via an atomic rename, so a
+reader finds either the previous snapshot or the new one, never a half-written
+file. Windows has no `SIGUSR1`, so there the run logs nothing about snapshots
+and the database has to be stopped to read it.
+
 ### Migrating an existing database
 
 `ctmon run` refuses a database in the old JSON format rather than misreading
