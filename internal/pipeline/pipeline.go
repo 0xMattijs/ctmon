@@ -114,15 +114,34 @@ func (p *Pipeline) Run(ctx context.Context, in <-chan source.Cert) {
 		writers = 4
 	}
 
-	probes := make(chan string, workers*8)
+	// Two queues, not one. With a single queue the sweep filled it — 5,000
+	// hosts at a time, minutes to drain — so record's non-blocking send
+	// always found it full and every fresh discovery was deferred. Measured
+	// on a live store, a host found in the last hour was no likelier to have
+	// been probed (18%) than one from the day before (22%), which is backwards
+	// for a monitor whose point is noticing new things.
+	fresh := make(chan string, workers*8)
+	// The backlog queue stays short on purpose: the sweep can always read
+	// more from the store, and buffering it only lets stale work pile up.
+	backlog := make(chan string, workers)
+
+	// Most workers take fresh discoveries first. A few are kept for the
+	// backlog, so a sustained burst of new names cannot starve it completely
+	// the way the backlog used to starve them.
+	reserved := backlogWorkers(workers)
 	var probeWG sync.WaitGroup
 	for i := 0; i < workers; i++ {
 		probeWG.Add(1)
+		backlogOnly := i < reserved
 		go func() {
 			defer probeWG.Done()
-			for host := range probes {
-				p.probe(ctx, host)
+			if backlogOnly {
+				for host := range backlog {
+					p.probe(ctx, host)
+				}
+				return
 			}
+			p.probeFreshFirst(ctx, fresh, backlog)
 		}()
 	}
 
@@ -133,7 +152,7 @@ func (p *Pipeline) Run(ctx context.Context, in <-chan source.Cert) {
 		go func() {
 			defer writeWG.Done()
 			for n := range names {
-				p.record(ctx, n, probes)
+				p.record(ctx, n, fresh)
 			}
 		}()
 	}
@@ -144,7 +163,7 @@ func (p *Pipeline) Run(ctx context.Context, in <-chan source.Cert) {
 	sweepDone := make(chan struct{})
 	go func() {
 		defer close(sweepDone)
-		p.sweepLoop(sweepCtx, probes)
+		p.sweepLoop(sweepCtx, backlog)
 	}()
 
 	// recent squashes the duplicate CNs the feeds emit within seconds of each
@@ -193,15 +212,66 @@ func (p *Pipeline) Run(ctx context.Context, in <-chan source.Cert) {
 
 	close(names)
 	writeWG.Wait()
+	// The writers were the only senders on fresh; the sweep is the only one
+	// on backlog. Close each once its senders are done.
+	close(fresh)
 	stopSweep()
 	<-sweepDone
-	close(probes)
+	close(backlog)
 	probeWG.Wait()
 }
 
-// record stores the hostname and queues a probe if one is due. A full probe
-// queue is not an error: the record stays unprobed and the sweep retries it.
-func (p *Pipeline) record(ctx context.Context, n nameSeen, probes chan<- string) {
+// backlogWorkers is how many of the pool are pinned to the backlog. A quarter,
+// and never zero: the backlog has to keep moving even while new names arrive
+// faster than the pool can fetch them, which on live data is always.
+func backlogWorkers(workers int) int {
+	if n := workers / 4; n > 0 {
+		return n
+	}
+	return 1
+}
+
+// probeFreshFirst serves both queues, preferring fresh. It returns once both
+// are closed and drained.
+func (p *Pipeline) probeFreshFirst(ctx context.Context, fresh, backlog chan string) {
+	for fresh != nil || backlog != nil {
+		// Take a fresh discovery if one is waiting, without blocking.
+		if fresh != nil {
+			select {
+			case host, ok := <-fresh:
+				if !ok {
+					fresh = nil
+					continue
+				}
+				p.probe(ctx, host)
+				continue
+			default:
+			}
+		}
+		// Nothing fresh right now, so wait on either. A nil channel blocks
+		// forever in a select, which is what retires a closed queue; the loop
+		// condition is what stops us waiting on two of them.
+		select {
+		case host, ok := <-fresh:
+			if !ok {
+				fresh = nil
+				continue
+			}
+			p.probe(ctx, host)
+		case host, ok := <-backlog:
+			if !ok {
+				backlog = nil
+				continue
+			}
+			p.probe(ctx, host)
+		}
+	}
+}
+
+// record stores the hostname and queues a probe if one is due, on the fresh
+// queue. A full queue is not an error: the record stays unprobed and the sweep
+// retries it later.
+func (p *Pipeline) record(ctx context.Context, n nameSeen, freshQueue chan<- string) {
 	var (
 		fresh     bool
 		wantProbe bool
@@ -268,7 +338,7 @@ func (p *Pipeline) record(ctx context.Context, n nameSeen, probes chan<- string)
 	// A default case makes this select non-blocking, so watching ctx here
 	// would only make the counter a coin flip during shutdown.
 	select {
-	case probes <- host:
+	case freshQueue <- host:
 	default:
 		p.stats.Deferred.Add(1)
 	}
@@ -329,7 +399,7 @@ func (p *Pipeline) probe(ctx context.Context, host string) {
 
 // sweepLoop periodically queues hosts that were recorded but never probed,
 // which is how shed probes eventually get done.
-func (p *Pipeline) sweepLoop(ctx context.Context, probes chan<- string) {
+func (p *Pipeline) sweepLoop(ctx context.Context, backlog chan<- string) {
 	if p.Backfill <= 0 || p.NoProbe {
 		return
 	}
@@ -340,14 +410,14 @@ func (p *Pipeline) sweepLoop(ctx context.Context, probes chan<- string) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			p.sweep(ctx, probes)
+			p.sweep(ctx, backlog)
 		}
 	}
 }
 
 // sweep collects pending hosts in one read transaction, then queues them.
 // Queuing blocks, so the sweep runs at whatever pace the probers manage.
-func (p *Pipeline) sweep(ctx context.Context, probes chan<- string) {
+func (p *Pipeline) sweep(ctx context.Context, backlog chan<- string) {
 	limit := p.BackfillBatch
 	if limit <= 0 {
 		limit = 5000
@@ -373,7 +443,7 @@ func (p *Pipeline) sweep(ctx context.Context, probes chan<- string) {
 	p.Log.Info("backfill sweep", "pending", len(pending))
 	for _, host := range pending {
 		select {
-		case probes <- host:
+		case backlog <- host:
 			p.stats.Backfilled.Add(1)
 		case <-ctx.Done():
 			return

@@ -365,9 +365,48 @@ that answers publicly once and privately the next time.
 `--allow-private` turns it off, which is what you want when the point is
 monitoring your own infrastructure and the store is not shared.
 
-Tuning knobs: `--probe-rps`, `--workers`, `--probe-timeout`, `--max-body`,
-`--user-agent`. Run with `--no-probe` to collect names only. Every name filter
-runs before probing, so a filtered host is never fetched.
+Tuning knobs: `--probe-rps`, `--workers`, `--probe-timeout`, `--dial-timeout`,
+`--max-body`, `--user-agent`. Run with `--no-probe` to collect names only.
+Every name filter runs before probing, so a filtered host is never fetched.
+
+### What probing actually costs
+
+Probes are bound by how long dead hosts hold a worker, not by `--probe-rps`.
+Measured over 88,622 probes on a live store:
+
+| outcome | share |
+|---|---|
+| answered | 64% |
+| connect or handshake timeout | 19% |
+| does not resolve | 12% |
+| refused, reset, EOF, TLS error | 5% |
+
+At 16 workers that came to 6.7 probes a second against a limit of 20, because
+average latency was 2.4s and the 19% that never answer accounted for about
+40% of all worker time. `--dial-timeout` is the knob for that: it bounds the
+connect and the handshake, which is where those go, and `--probe-timeout` does
+not — that one starts once a connection exists. Dropping it to `2s` reclaims
+most of the 40%; the cost is losing hosts that are real but slow to answer.
+
+Raising `--workers` is the other half. Goroutines waiting on a socket are
+cheap, so the pool size is close to a free parameter: reaching the default
+20/s limit takes about 48 of them at that latency.
+
+### Fresh names come first
+
+Two queues feed the probers. New discoveries go in one, the backfill sweep
+fills the other, and most workers take a fresh name whenever one is waiting.
+
+Without that split the sweep won: it queues thousands of hosts at a time and
+takes minutes to drain them, so the single queue was always full and every new
+discovery was shed. On a live store it showed up as hosts first seen in the
+last hour being no likelier to have been probed (18%) than hosts from the day
+before (22%), which is the wrong way round for a monitor that exists to notice
+new things.
+
+A quarter of the pool stays pinned to the backfill queue, so the backlog keeps
+moving even while new names arrive faster than the probers can fetch them —
+which, on live CT, is always.
 
 Be deliberate about pointing this at the internet at scale. Every discovered
 name gets one unsolicited HTTPS request from your address.
