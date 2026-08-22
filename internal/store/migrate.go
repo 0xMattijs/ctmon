@@ -107,12 +107,23 @@ func Migrate(oldPath, newPath string) (MigrateResult, error) {
 		return res, fmt.Errorf("open %s: %w", oldPath, err)
 	}
 	defer old.Close()
+	if err := requireLegacy(old, oldPath); err != nil {
+		return res, err
+	}
 
 	dst, err := Open(newPath)
 	if err != nil {
 		return res, err
 	}
-	defer dst.Close()
+	// Migrate refuses to start when the target exists, so a destination left
+	// behind by a failed run would block the retry. Take it away again.
+	done := false
+	defer func() {
+		dst.Close()
+		if !done {
+			os.Remove(newPath)
+		}
+	}()
 
 	// Records first, in chunks: read a batch out of the old store, then write
 	// it to the new one in a single transaction.
@@ -157,6 +168,13 @@ func Migrate(oldPath, newPath string) (MigrateResult, error) {
 	if err := flush(); err != nil {
 		return res, err
 	}
+	// Every record unreadable means this is not the database we think it is.
+	// Reporting that as a successful migration of zero records, and then
+	// inviting the operator to move the empty result over the original, is how
+	// a migration tool eats a store.
+	if res.Records == 0 && res.Skipped > 0 {
+		return res, fmt.Errorf("%s: none of its %d records are version-1 JSON", oldPath, res.Skipped)
+	}
 
 	// Then the log positions, so a migrated monitor resumes where it stopped.
 	err = old.View(func(tx *bolt.Tx) error {
@@ -183,7 +201,30 @@ func Migrate(oldPath, newPath string) (MigrateResult, error) {
 		res.NewBytes = info.Size()
 	}
 	res.NewUsed = dst.usedBytes()
+	done = true
 	return res, nil
+}
+
+// requireLegacy refuses a source that is not a version-1 JSON database.
+//
+// Pointed at a packed database, Migrate reads every value as JSON, fails on
+// every one, and writes an empty result. Catching it here costs one read and
+// happens before anything is created.
+func requireLegacy(db *bolt.DB, path string) error {
+	return db.View(func(tx *bolt.Tx) error {
+		meta := tx.Bucket(bucketMeta)
+		if meta == nil {
+			return nil // predates the format stamp, so it is version 1
+		}
+		switch v := meta.Get(keyFormat); {
+		case v == nil, len(v) == 1 && v[0] < formatVersion:
+			return nil
+		case len(v) == 1 && v[0] == formatVersion:
+			return fmt.Errorf("%s is already in the packed format", path)
+		default:
+			return fmt.Errorf("%s uses unknown record format %v", path, v)
+		}
+	})
 }
 
 // usedBytes reports how many bytes of pages a store holds.
