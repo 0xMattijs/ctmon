@@ -444,7 +444,10 @@ func (r *reader) uint32() uint32 {
 }
 
 func (r *reader) take(n int) []byte {
-	if n < 0 || r.i+n > len(r.b) {
+	// n comes from a length varint on disk, so a corrupt record can make it
+	// enormous. Compare against the bytes left rather than r.i+n, which wraps
+	// negative near MaxInt and slips past the check.
+	if n < 0 || n > len(r.b)-r.i {
 		r.fail()
 		return nil
 	}
