@@ -50,9 +50,20 @@ type Options struct {
 	// to fingerprint whatever the host serves, and hosts found through CT
 	// routinely serve mismatched or expired certificates.
 	VerifyTLS bool
-	UserAgent string
+	// AllowPrivate permits probes of loopback, RFC 1918, link-local, and the
+	// other addresses that are not out on the public internet. It is off by
+	// default. Every hostname reaching this package came out of a stranger's
+	// certificate, and anyone who can have one issued for a name that resolves
+	// to 127.0.0.1 could otherwise point the monitor at services on the
+	// machine running it and read the status, size, and body hash back out of
+	// the store.
+	AllowPrivate bool
+	UserAgent    string
 	// DialContext overrides how connections are made. Leave it nil for
 	// normal use; it exists so tests can point every host at one server.
+	// A dialer supplied here brings its own policy: AllowPrivate applies to
+	// the built-in dialer, which is the only one that sees resolved
+	// addresses before connecting.
 	DialContext func(ctx context.Context, network, addr string) (net.Conn, error)
 }
 
@@ -79,10 +90,14 @@ func New(opts Options) *Prober {
 
 	dial := opts.DialContext
 	if dial == nil {
-		dial = (&net.Dialer{
+		d := &net.Dialer{
 			Timeout:   5 * time.Second,
 			KeepAlive: 15 * time.Second,
-		}).DialContext
+		}
+		if !opts.AllowPrivate {
+			d.Control = refusePrivate
+		}
+		dial = d.DialContext
 	}
 	// Keepalives are off on purpose. A probe makes one request per host and
 	// the hosts almost never repeat, so a pool would only hold thousands of
