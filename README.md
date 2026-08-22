@@ -347,7 +347,7 @@ A hostname that resolves to a private address is not fetched:
 
 ```console
 $ ctmon get --db ct.db intranet.example.com
-  "probe_error": "... dial tcp 10.0.0.7:443: refusing to probe a non-public address: 10.0.0.7"
+  "probe_error": "Get \"https://intranet.example.com/\": dial tcp 10.0.0.7:443: refusing to probe a non-public address: 10.0.0.7"
 ```
 
 Every name here comes out of a stranger's certificate, and a certificate for a
