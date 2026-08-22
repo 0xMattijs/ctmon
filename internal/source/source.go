@@ -64,6 +64,20 @@ func backoff(n int, base, max time.Duration) time.Duration {
 	return d
 }
 
+// healthyRun is how long a feed has to stay up before its failure counts as a
+// fresh one. Without it the backoff only ever climbs: a feed that drops once an
+// hour would end up waiting the maximum between every retry, forever.
+const healthyRun = time.Minute
+
+// nextAttempt returns the backoff counter for the next try, given how long the
+// failed run lasted.
+func nextAttempt(attempt int, ran time.Duration) int {
+	if ran >= healthyRun {
+		return 0
+	}
+	return attempt + 1
+}
+
 // sleep waits for d, or until ctx is cancelled.
 func sleep(ctx context.Context, d time.Duration) error {
 	t := time.NewTimer(d)
