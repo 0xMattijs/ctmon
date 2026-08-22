@@ -16,6 +16,17 @@ import (
 	"golang.org/x/time/rate"
 )
 
+// DeferReason says why a probe did not happen.
+type DeferReason string
+
+const (
+	// DeferAddressBudget: the destination address had already had its share.
+	DeferAddressBudget DeferReason = "address_budget"
+	// DeferNoAnswer: the resolver did not answer, so there is no address to
+	// spend a budget against and nothing to record about the host.
+	DeferNoAnswer DeferReason = "no_dns_answer"
+)
+
 // Result is one HTTPS fetch.
 type Result struct {
 	Status   int    // HTTP status of the final response
@@ -23,10 +34,13 @@ type Result struct {
 	Size     int64  // bytes hashed, capped at MaxBody
 	Hash     string // sha256 of the body, hex; empty when the fetch failed
 	Err      error
-	// Deferred says the probe never happened because the destination address
-	// is over its budget. It is not a result about the host: nothing was
-	// asked, nothing should be recorded, and the host should be tried again.
-	Deferred bool
+	// Deferred says the probe never happened. It is not a result about the
+	// host: nothing was asked, nothing should be recorded, and the host
+	// should be tried again. DeferReason says which kind of not-happening it
+	// was, because the two call for different fixes — one is the monitor
+	// pacing itself, the other is the resolver failing to answer.
+	Deferred    bool
+	DeferReason DeferReason
 }
 
 // Prober fetches sites politely: bounded concurrency, a global rate limit,
@@ -38,7 +52,10 @@ type Prober struct {
 	// lookup resolves a name, or is nil when something else owns resolution:
 	// a caller-supplied DialContext resolves for itself, and the per-address
 	// budget goes with it.
-	lookup       func(ctx context.Context, host string) ([]netip.Addr, error)
+	lookup func(ctx context.Context, host string) ([]netip.Addr, error)
+	// dial is the transport's dialer, kept so callers outside this package
+	// can reach the network the same way probes do.
+	dial         func(ctx context.Context, network, addr string) (net.Conn, error)
 	resolver     *resolver
 	allowPrivate bool
 	userAgent    string
@@ -75,12 +92,23 @@ type Options struct {
 	// MaxBody caps how many bytes are read and hashed (default 2 MiB).
 	// Bodies larger than this hash their first MaxBody bytes.
 	MaxBody int64
-	// RequestsPerSecond caps outbound probes across all workers. It is off
-	// by default: a limit shared by unrelated hosts spares none of them, and
-	// PerIPRPS is the one that means anything. Set it to put a ceiling on the
-	// monitor as a whole — a link budget, say, rather than a courtesy.
+	// RequestsPerSecond caps outbound probes across all workers (default
+	// 100). Zero turns the ceiling off.
+	//
+	// This is not about politeness to the sites — PerIPRPS is the limit that
+	// means anything to them. It is about the network between here and them.
+	// Keepalives are off, so every probe is a fresh connection, and every
+	// connection holds a translation entry on whatever does NAT for this
+	// machine until it times out. The steady-state table size is roughly the
+	// probe rate times that timeout: at 100 a second against a typical
+	// two-minute timeout, some 12,000 entries. Consumer routers fall over
+	// well below that, and when they do it is not the monitor that suffers,
+	// it is everything else on the network.
+	//
+	// Lower it if probing is making the network unhappy. Raise it, or turn it
+	// off, when the path out is yours to saturate.
 	RequestsPerSecond float64
-	// Burst is the overall limiter's burst (default 5).
+	// Burst is the overall limiter's burst (default 20).
 	Burst int
 	// PerIPRPS caps requests to one destination address (default 32), and
 	// PerIPBurst is its burst (default 64). A probe over the budget is
@@ -158,8 +186,11 @@ func New(opts Options) *Prober {
 	if opts.MaxBody <= 0 {
 		opts.MaxBody = 2 << 20
 	}
+	if opts.RequestsPerSecond < 0 {
+		opts.RequestsPerSecond = 0
+	}
 	if opts.Burst <= 0 {
-		opts.Burst = 5
+		opts.Burst = 20
 	}
 	if opts.PerIPRPS <= 0 {
 		opts.PerIPRPS = 32
@@ -237,6 +268,7 @@ func New(opts Options) *Prober {
 		ResponseHeaderTimeout: opts.Timeout,
 		DisableKeepAlives:     true,
 	}
+	p.dial = dial
 	p.client = &http.Client{
 		Transport: tr,
 		Timeout:   opts.Timeout,
@@ -311,10 +343,12 @@ func (p *Prober) reserve(ctx context.Context, host string) (Result, bool) {
 	}
 	addrs, err := p.lookup(ctx, host)
 	if err != nil {
-		if transientDNS(err) {
-			// Nothing was learned about the host, so record nothing and ask
-			// again later rather than writing down the resolver's bad day.
-			return Result{Deferred: true}, false
+		// A failed lookup is put off only while the resolver is failing
+		// generally. Once it is answering again, a name that still will not
+		// resolve is a fact about the name — record it, or the host comes
+		// back on every sweep for as long as the database exists.
+		if transientDNS(err) && !p.resolver.health.reliable() {
+			return Result{Deferred: true, DeferReason: DeferNoAnswer}, false
 		}
 		return Result{Err: err}, false
 	}
@@ -325,7 +359,7 @@ func (p *Prober) reserve(ctx context.Context, host string) (Result, bool) {
 	// The first address is the one the dialer will try first, so it is the
 	// one whose budget this probe spends.
 	if !p.ips.allow(addrs[0]) {
-		return Result{Deferred: true}, false
+		return Result{Deferred: true, DeferReason: DeferAddressBudget}, false
 	}
 	return Result{}, true
 }

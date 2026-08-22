@@ -390,11 +390,14 @@ failing**, against an intake of about 108 new hostnames a second.
 
 Three things were in the way, and only the first was obvious:
 
-1. **A global rate limit that spared nobody.** Every probe is a different host
-   getting exactly one request, so a limit shared across all of them was not
-   politeness, it was a cap. It is off by default now; `--probe-rps-per-ip`
-   rations by destination address instead, which is the unit a site can
-   actually object to.
+1. **One rate limit doing two jobs badly.** A limit shared across all hosts is
+   not politeness — every probe is a different site getting a single request,
+   so the sites cannot tell. `--probe-rps-per-ip` rations by destination
+   address instead, which is the unit a site can object to.
+
+   But the shared limit was doing a second job worth keeping, and it is not
+   about the sites at all. See [What this does to your
+   network](#what-this-does-to-your-network).
 2. **Names resolved by the HTTP client.** A name that does not exist cost a
    worker the whole dial timeout. Resolving first makes it cost a DNS answer.
 3. **The resolver itself.** This is the one that matters, and it does not
@@ -433,6 +436,38 @@ failing rather than queueing when too many arrive at once. Leave it near the
 default when using the system resolver; raise it when you have given `ctmon` a
 resolver that can keep up.
 
+The feed uses the same resolver as the probes. It has to: a run probing hard
+enough to saturate DNS otherwise starves its own source of certificates, which
+shows up as every log failing `get-sth: ... server misbehaving` and the feed
+stopping altogether while the probers carry on.
+
+#### When the resolver gives up
+
+Two counters say a probe did not happen. `throttled` is the monitor pacing
+itself — a destination address had already had its share this second.
+`unresolved` is the resolver not answering, and it is the one to watch: it
+means probes are being attempted faster than DNS can serve them.
+
+A lookup that fails is only put off while the resolver is failing *generally*,
+judged over the last thousand or so lookups. Once it is answering again, a name
+that still will not resolve is a fact about that name and gets recorded.
+Without that distinction a domain whose nameservers are permanently dead never
+gets marked probed, so it comes back on every sweep for as long as the database
+exists — measured at 156,130 deferrals against 9,981 real probes before the
+rule was added, and 4,718 after.
+
+For the same reason the backfill sweep stops while the resolver is down:
+
+```console
+WARN backfill paused: the resolver is not answering
+INFO backfill resumed: the resolver is answering again
+```
+
+Feeding the backlog through a resolver that cannot answer is worse than doing
+nothing. Every host leased comes straight back undone, so the sweep spins
+through the queue rewriting entries and the resolver never gets the quiet it
+needs to recover.
+
 An `unbound` configured as a caching forwarder is a good answer. The settings
 that mattered were plenty of outgoing ports, a large message cache, no DNSSEC
 validation — a validating resolver answers SERVFAIL for the many CT names whose
@@ -451,6 +486,37 @@ failures.
 Raising `--workers` is close to free — goroutines waiting on a socket cost
 almost nothing — which is why the default is 256. It is also not the knob that
 will help you once DNS is where the time goes.
+
+### What this does to your network
+
+Probing is thousands of short-lived connections to thousands of strangers,
+which is a traffic shape most home and office networks never see. Two things
+about the way `ctmon` probes make it harder on the network than the byte count
+suggests:
+
+- **Every probe is a new connection.** Keepalives are off, because a host is
+  fetched once and almost never again, so a pool would only hold idle sockets
+  open to sites the monitor has finished with.
+- **A closed connection is not a freed one.** Whatever does NAT between this
+  machine and the internet keeps a translation entry for a while after the
+  connection ends — typically a minute or two.
+
+Steady-state entries are roughly the probe rate times that timeout. At the
+default `--probe-rps 100` and a two-minute timeout, that is around 12,000
+entries held at once. Consumer routers run out well below that, and when the
+table fills it is not the monitor that suffers, it is everything else sharing
+the connection.
+
+So `--probe-rps` is a ceiling on the monitor as a whole, and the number to turn
+down first if probing is making the network unhappy. `--probe-rps 0` removes it
+for the case where the path out is yours to saturate.
+
+DNS deserves the same thought. Hundreds of lookups a second is its own kind of
+load, and if the machine resolves through the router — which is the default on
+most networks — that lands on the same box. Pointing `--resolvers` at a local
+`unbound` forwarding to upstreams on the internet takes that traffic off the
+router entirely, which is worth doing for the router's sake even where DNS
+throughput is not the problem.
 
 ### Fresh names come first
 

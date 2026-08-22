@@ -63,6 +63,9 @@ func TestProbeDefersWhenTheAddressIsOverBudget(t *testing.T) {
 	if !res.Deferred {
 		t.Errorf("second probe = %+v, want it deferred", res)
 	}
+	if res.DeferReason != DeferAddressBudget {
+		t.Errorf("defer reason = %q, want the address budget", res.DeferReason)
+	}
 	if res.Err != nil {
 		t.Errorf("a deferred probe carries err %v, want nothing to record", res.Err)
 	}

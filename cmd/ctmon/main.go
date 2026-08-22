@@ -12,6 +12,7 @@ import (
 	"io"
 	"log/slog"
 	"maps"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -103,7 +104,7 @@ func runCmd(args []string) error {
 		useSANs   = fs.Bool("sans", true, "read hostnames from subject alternative names, not just the CN")
 		maxSANs   = fs.Int("max-sans", 0, "maximum SANs to read from one certificate (0 = all)")
 		noProbe   = fs.Bool("no-probe", false, "record domains without fetching them")
-		probeRPS  = fs.Float64("probe-rps", 0, "overall ceiling on HTTPS probes per second (0 = no overall limit)")
+		probeRPS  = fs.Float64("probe-rps", 100, "ceiling on HTTPS probes per second across all workers, which is what bounds NAT state on the way out (0 = no limit)")
 		ipRPS     = fs.Float64("probe-rps-per-ip", 32, "HTTPS probes per second to one destination address")
 		timeout   = fs.Duration("probe-timeout", 6*time.Second, "per-probe timeout, end to end")
 		dialTO    = fs.Duration("dial-timeout", 2*time.Second, "how long to wait for the TCP connect")
@@ -159,30 +160,32 @@ func runCmd(args []string) error {
 	}
 	defer db.Close()
 
+	prober := probe.New(probe.Options{
+		Timeout:           *timeout,
+		DialTimeout:       *dialTO,
+		TLSTimeout:        *tlsTO,
+		MaxBody:           *maxBody,
+		RequestsPerSecond: *probeRPS,
+		PerIPRPS:          *ipRPS,
+		Resolvers:         splitList(*resolves),
+		ResolveTimeout:    *dnsTO,
+		MaxLookups:        *dnsConc,
+		DNSTTL:            *dnsTTL,
+		DNSNegativeTTL:    *dnsNegTTL,
+		VerifyTLS:         *verify,
+		AllowPrivate:      *private,
+		UserAgent:         *ua,
+	})
+
 	feeds, err := buildSources(*sources, *csURL, *logURIs, *listURL, *fromTop,
-		*batch, *maxLag, *poll, *logRPS, *ua, db, log)
+		*batch, *maxLag, *poll, *logRPS, *ua, db, log, prober.DialContext)
 	if err != nil {
 		return err
 	}
 
 	pipe := &pipeline.Pipeline{
-		Store: db,
-		Prober: probe.New(probe.Options{
-			Timeout:           *timeout,
-			DialTimeout:       *dialTO,
-			TLSTimeout:        *tlsTO,
-			MaxBody:           *maxBody,
-			RequestsPerSecond: *probeRPS,
-			PerIPRPS:          *ipRPS,
-			Resolvers:         splitList(*resolves),
-			ResolveTimeout:    *dnsTO,
-			MaxLookups:        *dnsConc,
-			DNSTTL:            *dnsTTL,
-			DNSNegativeTTL:    *dnsNegTTL,
-			VerifyTLS:         *verify,
-			AllowPrivate:      *private,
-			UserAgent:         *ua,
-		}),
+		Store:         db,
+		Prober:        prober,
 		Log:           log,
 		Workers:       *workers,
 		Writers:       *writers,
@@ -283,7 +286,8 @@ func loadSkipSuffixes(inline, path string, useDefault bool) (pipeline.SuffixSet,
 // buildSources turns the flags into the configured feeds.
 func buildSources(sel, csURL, logURIs, listURL string, fromStart bool,
 	batch int, maxLag uint64, poll time.Duration, logRPS float64, ua string,
-	db *store.Store, log *slog.Logger) ([]source.Source, error) {
+	db *store.Store, log *slog.Logger,
+	dial func(ctx context.Context, network, addr string) (net.Conn, error)) ([]source.Source, error) {
 
 	want := map[string]bool{}
 	for _, s := range strings.Split(sel, ",") {
@@ -316,7 +320,11 @@ func buildSources(sel, csURL, logURIs, listURL string, fromStart bool,
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
 			var err error
-			uris, err = source.DiscoverLogs(ctx, &http.Client{Timeout: 30 * time.Second}, listURL)
+			hc := &http.Client{Timeout: 30 * time.Second}
+			if dial != nil {
+				hc.Transport = &http.Transport{DialContext: dial, ForceAttemptHTTP2: true}
+			}
+			uris, err = source.DiscoverLogs(ctx, hc, listURL)
 			if err != nil {
 				return nil, err
 			}
@@ -331,6 +339,7 @@ func buildSources(sel, csURL, logURIs, listURL string, fromStart bool,
 			PollInterval:      poll,
 			RequestsPerSecond: logRPS,
 			UserAgent:         ua,
+			DialContext:       dial,
 			Log:               log,
 		})
 	}
@@ -450,6 +459,7 @@ func statsFields(p *pipeline.Pipeline) []any {
 		"changed", s.Changed.Load(),
 		"deferred", s.Deferred.Load(),
 		"throttled", s.Throttled.Load(),
+		"unresolved", s.Unresolved.Load(),
 		"backfilled", s.Backfilled.Load(),
 	}
 }

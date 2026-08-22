@@ -96,7 +96,8 @@ type Stats struct {
 	Failed     atomic.Int64
 	Changed    atomic.Int64
 	Deferred   atomic.Int64 // probes shed because every worker was busy
-	Throttled  atomic.Int64 // probes put off: address over budget, or no DNS answer
+	Throttled  atomic.Int64 // probes put off because their address was over budget
+	Unresolved atomic.Int64 // probes put off because the resolver gave no answer
 	Backfilled atomic.Int64 // probes queued by the sweep
 }
 
@@ -393,7 +394,11 @@ func (p *Pipeline) probe(ctx context.Context, host string) {
 		return
 	}
 	if res.Deferred {
-		p.stats.Throttled.Add(1)
+		if res.DeferReason == probe.DeferNoAnswer {
+			p.stats.Unresolved.Add(1)
+		} else {
+			p.stats.Throttled.Add(1)
+		}
 		if err := p.Store.Enqueue(host, time.Now().UTC().Add(p.deferBackoff())); err != nil {
 			p.Log.Error("requeue failed", "host", host, "err", err)
 		}
@@ -462,14 +467,39 @@ func (p *Pipeline) sweepLoop(ctx context.Context, backlog chan<- store.Pending) 
 	}
 	t := time.NewTicker(p.Backfill)
 	defer t.Stop()
+	stalled := false
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
+			// Feeding the backlog while the resolver cannot answer is worse
+			// than doing nothing: every host leased comes straight back
+			// undone, so the sweep spins through the queue rewriting entries
+			// and the resolver never gets the quiet it needs to recover. On a
+			// live run that looked like 156,130 deferrals against 9,981
+			// probes. Wait instead.
+			if !p.resolverHealthy() {
+				if !stalled {
+					stalled = true
+					p.Log.Warn("backfill paused: the resolver is not answering")
+				}
+				continue
+			}
+			if stalled {
+				stalled = false
+				p.Log.Info("backfill resumed: the resolver is answering again")
+			}
 			p.sweep(ctx, backlog)
 		}
 	}
+}
+
+// resolverHealthy reports whether it is worth handing the probers more work.
+// A pipeline without a prober — the no-probe path, and some tests — is never
+// held back by this.
+func (p *Pipeline) resolverHealthy() bool {
+	return p.Prober == nil || p.Prober.ResolverHealthy()
 }
 
 // sweep leases a batch of due hosts and queues them. Queuing blocks, so the

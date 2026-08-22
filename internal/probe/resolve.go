@@ -46,6 +46,64 @@ func transientDNS(err error) bool {
 	return err != nil
 }
 
+// Health thresholds for deciding whether a failed lookup says something about
+// the name or about the resolver.
+const (
+	// healthWindow is roughly how many recent lookups the judgement rests on.
+	healthWindow = 1024
+	// healthMinSamples is how much evidence is needed before distrusting the
+	// resolver at all. Below it, a failure is taken at face value.
+	healthMinSamples = 64
+	// healthMinRate is the share of lookups that must come back with an
+	// answer — including "no such host", which is an answer — for the
+	// resolver to be considered to be working.
+	healthMinRate = 0.5
+)
+
+// health tracks how often lookups come back with an answer.
+//
+// It exists to settle one question: when a lookup fails, is that about the
+// name or about the resolver? Getting it wrong is expensive in both
+// directions. Record a resolver's bad minute and the store fills with claims
+// about hosts nobody asked; defer a name whose nameservers are permanently
+// dead and it never gets marked probed at all, so it returns on every sweep
+// forever. The second mistake is the one that was made: on a live run it left
+// 50,137 deferrals against 8,520 actual probes, the backlog spinning through
+// names that could never resolve.
+type health struct {
+	mu               sync.Mutex
+	answered, missed float64
+}
+
+// observe records one lookup outcome. Counts are halved rather than reset when
+// the window fills, so the view stays recent without lurching.
+func (h *health) observe(answered bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if answered {
+		h.answered++
+	} else {
+		h.missed++
+	}
+	if h.answered+h.missed >= healthWindow {
+		h.answered /= 2
+		h.missed /= 2
+	}
+}
+
+// reliable reports whether the resolver is answering well enough that a
+// failure for one name can be believed about that name. With too little
+// evidence it says yes: the default is to trust what the resolver says.
+func (h *health) reliable() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	total := h.answered + h.missed
+	if total < healthMinSamples {
+		return true
+	}
+	return h.answered/total >= healthMinRate
+}
+
 // resolver is a caching DNS front end. It is safe for concurrent use.
 type resolver struct {
 	net     *net.Resolver
@@ -66,6 +124,8 @@ type resolver struct {
 	// waiting, which costs a moment; the alternative is a timeout recorded
 	// against a host that was never asked about.
 	slots chan struct{}
+
+	health health
 
 	mu      sync.Mutex
 	entries map[string]*answer
@@ -134,6 +194,10 @@ func (r *resolver) lookup(ctx context.Context, host string) ([]netip.Addr, error
 	ctx, cancel := context.WithTimeout(ctx, r.timeout)
 	defer cancel()
 	addrs, err := r.net.LookupNetIP(ctx, "ip", host)
+
+	// "No such host" counts as an answer: the resolver did its job and the
+	// name does not exist.
+	r.health.observe(err == nil || !transientDNS(err))
 
 	ttl := r.ttl
 	switch {
@@ -218,3 +282,18 @@ func (p *Prober) dialer(base func(ctx context.Context, network, addr string) (ne
 		return nil, errors.Join(errs...)
 	}
 }
+
+// DialContext returns the prober's dialer: the same resolution, cache, and
+// public-address policy the probes use. It is exported so the rest of the
+// monitor can reach the network the same way — notably the certificate feed,
+// which otherwise resolves through the system resolver and gets starved by the
+// probing it is supposed to be feeding.
+func (p *Prober) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	return p.dial(ctx, network, addr)
+}
+
+// ResolverHealthy reports whether lookups are coming back with answers often
+// enough to be worth making. It is false when the resolver is failing
+// generally, which is the monitor's cue to stop asking for a while rather than
+// to keep feeding work that cannot be done.
+func (p *Prober) ResolverHealthy() bool { return p.resolver.health.reliable() }

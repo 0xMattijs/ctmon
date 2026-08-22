@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"sync"
 	"time"
@@ -52,7 +53,13 @@ type CTLog struct {
 	// RequestsPerSecond caps get-entries calls per log (default 4).
 	RequestsPerSecond float64
 	UserAgent         string
-	Log               *slog.Logger
+	// DialContext overrides how connections to the logs are made. It exists
+	// so the monitor can give its own feed the same resolver it gives the
+	// probers: left to the system resolver, a run probing hard enough to
+	// saturate DNS starves its own source of certificates, which fails as
+	// "get-sth: ... server misbehaving" and stops the feed entirely.
+	DialContext func(ctx context.Context, network, addr string) (net.Conn, error)
+	Log         *slog.Logger
 }
 
 // Batch sizes are adapted per log between minBatchSize and the configured
@@ -199,8 +206,7 @@ func (c *CTLog) follow(ctx context.Context, uri string, out chan<- Cert, st *log
 	}
 	limiter := rate.NewLimiter(rate.Limit(rps), 1)
 
-	hc := &http.Client{Timeout: 60 * time.Second}
-	lc, err := client.New(uri, hc, jsonclient.Options{UserAgent: c.UserAgent})
+	lc, err := client.New(uri, c.httpClient(), jsonclient.Options{UserAgent: c.UserAgent})
 	if err != nil {
 		return fmt.Errorf("client: %w", err)
 	}
@@ -361,4 +367,17 @@ func issuerName(cn string, org []string) string {
 		return org[0]
 	}
 	return ""
+}
+
+// httpClient builds the client used to talk to a log, honouring DialContext.
+func (c *CTLog) httpClient() *http.Client {
+	hc := &http.Client{Timeout: 60 * time.Second}
+	if c.DialContext != nil {
+		hc.Transport = &http.Transport{
+			DialContext:         c.DialContext,
+			ForceAttemptHTTP2:   true,
+			MaxIdleConnsPerHost: 2,
+		}
+	}
+	return hc
 }

@@ -124,10 +124,11 @@ func TestUsableDropsPrivateAddressesUnlessAllowed(t *testing.T) {
 	}
 }
 
-// A resolver that times out or returns SERVFAIL has not told us anything about
-// the host. Recording that as a probe result would put an unchecked claim in
-// the store, so the probe is put off instead.
-func TestProbeDefersWhenTheResolverGivesNoAnswer(t *testing.T) {
+// While the resolver is failing generally, a lookup failure says nothing about
+// the host, so the probe is put off. Once it recovers, the same failure is a
+// fact about the name and gets recorded — otherwise a name whose nameservers
+// are dead returns on every sweep forever.
+func TestFailedLookupsAreDeferredOnlyWhileTheResolverIsFailing(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		err  error
@@ -146,14 +147,62 @@ func TestProbeDefersWhenTheResolverGivesNoAnswer(t *testing.T) {
 					return nil, errors.New("should not be reached")
 				},
 			})
+
+			// With no evidence either way, the resolver is trusted and the
+			// failure is recorded.
+			if res := p.Probe(context.Background(), "unknown.test"); res.Deferred {
+				t.Errorf("res = %+v, want the failure recorded while the resolver looks fine", res)
+			}
+
+			// Enough failures in a row and it plainly is not fine.
+			for i := 0; i < healthMinSamples; i++ {
+				p.resolver.health.observe(false)
+			}
 			res := p.Probe(context.Background(), "unknown.test")
 			if !res.Deferred {
-				t.Errorf("res = %+v, want it deferred", res)
+				t.Errorf("res = %+v, want it deferred while the resolver is failing", res)
+			}
+			if res.DeferReason != DeferNoAnswer {
+				t.Errorf("defer reason = %q, want the resolver", res.DeferReason)
 			}
 			if res.Err != nil {
 				t.Errorf("a deferred probe carries err %v, want nothing to record", res.Err)
 			}
+
+			// And once it recovers, failures are believed again.
+			for i := 0; i < healthMinSamples*2; i++ {
+				p.resolver.health.observe(true)
+			}
+			if res := p.Probe(context.Background(), "unknown.test"); res.Deferred {
+				t.Errorf("res = %+v, want the failure recorded once the resolver recovered", res)
+			}
 		})
+	}
+}
+
+func TestHealthNeedsEvidenceBeforeDistrustingTheResolver(t *testing.T) {
+	var h health
+	if !h.reliable() {
+		t.Error("an untouched resolver was distrusted; want the benefit of the doubt")
+	}
+	for i := 0; i < healthMinSamples-1; i++ {
+		h.observe(false)
+	}
+	if !h.reliable() {
+		t.Errorf("distrusted after %d failures, want to wait for %d samples",
+			healthMinSamples-1, healthMinSamples)
+	}
+	h.observe(false)
+	if h.reliable() {
+		t.Error("still trusted after a full window of nothing but failures")
+	}
+	// A resolver answering most of the time is working, even with some misses.
+	var mixed health
+	for i := 0; i < healthMinSamples; i++ {
+		mixed.observe(i%4 != 0) // 75% answered
+	}
+	if !mixed.reliable() {
+		t.Error("a resolver answering three lookups in four was called broken")
 	}
 }
 
