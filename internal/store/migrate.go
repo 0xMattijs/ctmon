@@ -4,7 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"sort"
+	"slices"
+	"strings"
 	"time"
 
 	bolt "go.etcd.io/bbolt"
@@ -260,24 +261,28 @@ func usedBytes(path string) int64 {
 // keys in advance, so it has no reason to leave every leaf half empty the way
 // bolt does for random inserts.
 func (s *Store) putAll(recs []*Record) error {
-	keys := make(map[*Record]string, len(recs))
-	for _, rec := range recs {
-		keys[rec] = reverseHost(rec.Host)
+	type entry struct {
+		key string
+		rec *Record
 	}
-	sort.Slice(recs, func(i, j int) bool { return keys[recs[i]] < keys[recs[j]] })
+	entries := make([]entry, len(recs))
+	for i, rec := range recs {
+		entries[i] = entry{key: reverseHost(rec.Host), rec: rec}
+	}
+	slices.SortFunc(entries, func(a, b entry) int { return strings.Compare(a.key, b.key) })
 
 	var fresh []freshID
 	err := s.db.Update(func(tx *bolt.Tx) error {
 		fresh = fresh[:0]
 		b := tx.Bucket(bucketDomains)
 		b.FillPercent = 0.95
-		for _, rec := range recs {
-			raw, ids, err := s.encode(tx, rec)
+		for _, e := range entries {
+			raw, ids, err := s.encode(tx, e.rec)
 			if err != nil {
-				return fmt.Errorf("encode %s: %w", rec.Host, err)
+				return fmt.Errorf("encode %s: %w", e.rec.Host, err)
 			}
 			fresh = append(fresh, ids...)
-			if err := b.Put([]byte(keys[rec]), raw); err != nil {
+			if err := b.Put([]byte(e.key), raw); err != nil {
 				return err
 			}
 		}

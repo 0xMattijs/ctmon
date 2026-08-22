@@ -11,9 +11,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net/http"
 	"os"
 	"os/signal"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -586,8 +588,8 @@ func statsCmd(args []string) error {
 		st.Sources, st.Issuers, st.ErrorKind)
 	if len(st.Logs) > 0 {
 		fmt.Printf("\nct log positions:\n")
-		for uri, pos := range st.Logs {
-			fmt.Printf("  %-60s %d\n", uri, pos)
+		for _, uri := range slices.Sorted(maps.Keys(st.Logs)) {
+			fmt.Printf("  %-60s %d\n", uri, st.Logs[uri])
 		}
 	}
 	return nil
