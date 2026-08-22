@@ -84,14 +84,16 @@ func New(opts Options) *Prober {
 			KeepAlive: 15 * time.Second,
 		}).DialContext
 	}
+	// Keepalives are off on purpose. A probe makes one request per host and
+	// the hosts almost never repeat, so a pool would only hold thousands of
+	// idle sockets open to sites we are done with. That also means there is no
+	// connection to hand back, so nothing here drains a body it has finished
+	// with: the transport closes the socket either way.
 	tr := &http.Transport{
 		DialContext:           dial,
 		TLSClientConfig:       &tls.Config{InsecureSkipVerify: !opts.VerifyTLS},
 		TLSHandshakeTimeout:   5 * time.Second,
 		ResponseHeaderTimeout: opts.Timeout,
-		MaxIdleConns:          256,
-		MaxIdleConnsPerHost:   2,
-		IdleConnTimeout:       30 * time.Second,
 		DisableKeepAlives:     true,
 	}
 	return &Prober{
@@ -146,7 +148,5 @@ func (p *Prober) Probe(ctx context.Context, host string) Result {
 		// Keep the partial hash out of the record: it is not reproducible.
 		return Result{Status: res.Status, FinalURL: res.FinalURL, Err: fmt.Errorf("read body: %w", err)}
 	}
-	// Drain the rest so the connection can be reused and the cap is honest.
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
 	return res
 }
