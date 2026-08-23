@@ -325,6 +325,13 @@ postponement — a probe held back because its destination address had already
 had its share this second. Set `--reprobe 24h` to also re-fetch known hosts
 once a day, which is what turns the store into a change monitor.
 
+One counter is not about certificates at all. `store_errors` counts reads and
+writes the database refused. Everything in the pipeline logs a failure and
+carries on, which is right for one bad host and wrong as the only trace of a
+full disk: a run that has stopped being able to write looks exactly like a
+quiet hour otherwise. Anything but zero there means discoveries are being
+dropped.
+
 The feeds also repeat themselves — the same certificate arrives from certstream
 and from the log it was written to, and packed certificates re-list the same
 names — so a set of the last `--recent-hosts` hostnames (default 50,000)
@@ -439,7 +446,14 @@ resolver that can keep up.
 The feed uses the same resolver as the probes. It has to: a run probing hard
 enough to saturate DNS otherwise starves its own source of certificates, which
 shows up as every log failing `get-sth: ... server misbehaving` and the feed
-stopping altogether while the probers carry on.
+stopping altogether while the probers carry on. That shared resolver is
+`internal/resolve`, built once at startup and handed to both, so neither owns
+the thing they depend on equally.
+
+The two dial it differently. A probe may only reach a public address, because
+anyone can have a certificate issued for a name pointing at `127.0.0.1`. A CT
+log came from `--logs` or from the log list, which is your own configuration,
+so the feed dials whatever the name resolves to.
 
 #### When the resolver gives up
 
@@ -742,6 +756,7 @@ records per second; raise it if you turn the filters off.
 cmd/ctmon            command line: run, list, get, stats
 internal/source      certificate feeds (certstream, RFC 6962 log poller)
 internal/domain      CN and SAN → hostname expansion, validation, depth
+internal/resolve     caching DNS front end, shared by the probes and the feed
 internal/probe       HTTPS fetch and body hashing
 internal/store       packed records, dictionaries, migration, compaction
 internal/pipeline    wiring: filters, record, probe, backfill
@@ -756,5 +771,7 @@ go test -race ./...
 The suite covers CN and SAN expansion, subdomain depth against the public
 suffix list, the suffix blocklist and parent cap, record round-trips through
 the packed codec, key reversal and range scans, migration from the old format,
-compaction, probe hashing (including the body cap and redirects), certstream
-message parsing, and the pipeline end to end against a local HTTPS server.
+compaction, probe hashing (including the body cap and redirects), DNS caching
+and the resolver-health judgement, certstream message parsing, what the
+pipeline does when the store refuses a write, and the pipeline end to end
+against a local HTTPS server.
