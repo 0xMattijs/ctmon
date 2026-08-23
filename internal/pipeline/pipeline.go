@@ -21,11 +21,34 @@ import (
 	"github.com/mvo/ct/internal/store"
 )
 
+// Store is the persistence a Pipeline needs. *store.Store is the
+// implementation; the interface is here so that the pipeline depends on the
+// six calls it makes rather than on bbolt, and so that a test can make a write
+// fail — which is the one thing a real store will not do on request, and the
+// path that decides whether a discovery is kept or dropped.
+type Store interface {
+	Get(host string) (*store.Record, error)
+	GetAll(hosts []string) (map[string]*store.Record, error)
+	UpdateWithQueue(host string, fn func(rec *store.Record, existed bool) (write bool, due time.Time)) error
+	Enqueue(host string, due time.Time) error
+	PendingLease(now time.Time, limit int, lease time.Duration) ([]store.Pending, error)
+	PendingDone(keys ...[]byte) error
+}
+
+// Prober fetches one host. *probe.Prober is the implementation.
+//
+// ResolverHealthy is on it because the pipeline has to decide whether handing
+// out more work is worth doing, and only the thing doing the work knows.
+type Prober interface {
+	Probe(ctx context.Context, host string) probe.Result
+	ResolverHealthy() bool
+}
+
 // Pipeline consumes certificates, expands their CNs into hostnames, and
 // records each hostname with a hash of the HTML it serves.
 type Pipeline struct {
-	Store  *store.Store
-	Prober *probe.Prober
+	Store  Store
+	Prober Prober
 	Log    *slog.Logger
 
 	// Workers is the number of concurrent probes (default DefaultWorkers).
