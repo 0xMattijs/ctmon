@@ -259,7 +259,7 @@ func compactLoop(ctx context.Context, every time.Duration, db *store.Store, log 
 			return
 		case <-t.C:
 			start := time.Now()
-			res, err := db.Compact()
+			res, err := db.CompactInPlace()
 			if err != nil {
 				log.Error("compaction failed", "err", err)
 				continue
@@ -490,7 +490,7 @@ func compactCmd(args []string) error {
 	}
 
 	start := time.Now()
-	res, err := store.Compact(*dbPath, dst)
+	res, err := store.CompactTo(*dbPath, dst)
 	if err != nil {
 		return err
 	}

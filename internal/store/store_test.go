@@ -190,7 +190,7 @@ func TestCompactShrinksAndKeepsEverything(t *testing.T) {
 	}
 	before := s.usedBytes()
 
-	res, err := s.Compact()
+	res, err := s.CompactInPlace()
 	if err != nil {
 		t.Fatalf("compact: %v", err)
 	}
@@ -272,7 +272,7 @@ func TestCompactUnderConcurrentUse(t *testing.T) {
 	}
 
 	for i := 0; i < 3; i++ {
-		if _, err := s.Compact(); err != nil {
+		if _, err := s.CompactInPlace(); err != nil {
 			t.Fatalf("compact %d: %v", i, err)
 		}
 	}

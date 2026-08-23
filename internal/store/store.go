@@ -6,7 +6,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"os"
 	"strings"
 	"sync"
 	"time"
@@ -390,81 +389,6 @@ func (s *Store) SetLogPos(uri string, pos uint64) error {
 	return s.batch(func(tx *bolt.Tx) error {
 		return tx.Bucket(bucketLogPos).Put([]byte(uri), buf[:])
 	})
-}
-
-// compactTxSize bounds how much one compaction transaction copies, which
-// bounds its peak memory on a large store.
-const compactTxSize = 64 << 20
-
-// Compact rewrites the database into full pages and swaps the result in.
-//
-// bolt never shrinks a file, and random inserts leave leaf pages about 70%
-// full, so a long-running store drifts to roughly twice the size of the
-// records it holds. Compaction rewrites every page in key order and gives the
-// slack back. The interned dictionaries survive: the copy preserves their ids
-// verbatim, so the in-memory tables still describe the new file.
-//
-// Every other store call blocks for the duration, which on a large store is
-// seconds. The original file is replaced by an atomic rename, so an
-// interrupted compaction leaves either the old database or the new one, never
-// a partial write.
-func (s *Store) Compact() (CompactResult, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	res := CompactResult{OldUsed: s.usedBytes()}
-	if info, err := os.Stat(s.path); err == nil {
-		res.OldBytes = info.Size()
-	}
-
-	tmp := s.path + ".compacting"
-	// A leftover from a killed compaction is garbage: the real database is
-	// still at s.path, and this file was never swapped in.
-	if err := os.Remove(tmp); err != nil && !os.IsNotExist(err) {
-		return res, err
-	}
-	dst, err := bolt.Open(tmp, 0o600, &bolt.Options{Timeout: 5 * time.Second})
-	if err != nil {
-		return res, fmt.Errorf("create %s: %w", tmp, err)
-	}
-	if err := bolt.Compact(dst, s.db, compactTxSize); err != nil {
-		dst.Close()
-		os.Remove(tmp)
-		return res, fmt.Errorf("compact: %w", err)
-	}
-	_ = dst.View(func(tx *bolt.Tx) error {
-		res.NewUsed = tx.Size()
-		return nil
-	})
-	if err := dst.Close(); err != nil {
-		os.Remove(tmp)
-		return res, err
-	}
-
-	// From here the handle is closed, so every path has to reopen one.
-	if err := s.db.Close(); err != nil {
-		os.Remove(tmp)
-		return res, s.reopen(err)
-	}
-	if err := os.Rename(tmp, s.path); err != nil {
-		os.Remove(tmp)
-		return res, s.reopen(fmt.Errorf("swap in %s: %w", tmp, err))
-	}
-	if info, err := os.Stat(s.path); err == nil {
-		res.NewBytes = info.Size()
-	}
-	return res, s.reopen(nil)
-}
-
-// reopen restores the handle after a swap. It reports cause, the failure that
-// led here, unless reopening failed too — then the caller needs both.
-func (s *Store) reopen(cause error) error {
-	db, err := bolt.Open(s.path, 0o600, &bolt.Options{Timeout: 5 * time.Second})
-	if err != nil {
-		return errors.Join(cause, fmt.Errorf("reopen %s: %w", s.path, err))
-	}
-	s.db = db
-	return cause
 }
 
 // GetAll returns the records for hosts that exist, keyed by hostname, in one
