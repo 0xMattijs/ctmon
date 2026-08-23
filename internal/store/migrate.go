@@ -101,7 +101,7 @@ func Migrate(oldPath, newPath string) (MigrateResult, error) {
 		return res, err
 	}
 	res.OldBytes = info.Size()
-	res.OldUsed = usedBytes(oldPath)
+	res.OldUsed = usedBytesAt(oldPath)
 
 	old, err := bolt.Open(oldPath, 0o600, &bolt.Options{ReadOnly: true, Timeout: 5 * time.Second})
 	if err != nil {
@@ -228,30 +228,28 @@ func requireLegacy(db *bolt.DB, path string) error {
 	})
 }
 
-// usedBytes reports how many bytes of pages a store holds.
-func (s *Store) usedBytes() int64 {
-	var n int64
-	_ = s.db.View(func(tx *bolt.Tx) error {
-		n = tx.Size()
-		return nil
-	})
-	return n
-}
-
-// usedBytes opens a database read-only just to measure it. It returns 0 if the
-// file cannot be read, since this only ever feeds a progress report.
-func usedBytes(path string) int64 {
-	db, err := bolt.Open(path, 0o600, &bolt.Options{ReadOnly: true, Timeout: 5 * time.Second})
-	if err != nil {
-		return 0
-	}
-	defer db.Close()
+// usedBytes reports how many bytes of pages a database holds.
+func usedBytes(db *bolt.DB) int64 {
 	var n int64
 	_ = db.View(func(tx *bolt.Tx) error {
 		n = tx.Size()
 		return nil
 	})
 	return n
+}
+
+// usedBytes reports how many bytes of pages this store holds.
+func (s *Store) usedBytes() int64 { return usedBytes(s.db) }
+
+// usedBytesAt opens a database read-only just to measure it. It returns 0 if
+// the file cannot be read, since this only ever feeds a progress report.
+func usedBytesAt(path string) int64 {
+	db, err := bolt.Open(path, 0o600, &bolt.Options{ReadOnly: true, Timeout: 5 * time.Second})
+	if err != nil {
+		return 0
+	}
+	defer db.Close()
+	return usedBytes(db)
 }
 
 // putAll writes records in one transaction. It is only used by migration,
@@ -323,7 +321,7 @@ func Compact(srcPath, dstPath string) (CompactResult, error) {
 		return res, err
 	}
 	res.OldBytes = info.Size()
-	res.OldUsed = usedBytes(srcPath)
+	res.OldUsed = usedBytesAt(srcPath)
 
 	src, err := bolt.Open(srcPath, 0o600, &bolt.Options{ReadOnly: true, Timeout: 5 * time.Second})
 	if err != nil {
@@ -335,8 +333,7 @@ func Compact(srcPath, dstPath string) (CompactResult, error) {
 	if err != nil {
 		return res, fmt.Errorf("create %s: %w", dstPath, err)
 	}
-	// One transaction per 64 MiB keeps peak memory bounded on a large store.
-	if err := bolt.Compact(dst, src, 64<<20); err != nil {
+	if err := bolt.Compact(dst, src, compactTxSize); err != nil {
 		dst.Close()
 		return res, fmt.Errorf("compact: %w", err)
 	}
@@ -347,6 +344,6 @@ func Compact(srcPath, dstPath string) (CompactResult, error) {
 	if info, err := os.Stat(dstPath); err == nil {
 		res.NewBytes = info.Size()
 	}
-	res.NewUsed = usedBytes(dstPath)
+	res.NewUsed = usedBytesAt(dstPath)
 	return res, nil
 }
