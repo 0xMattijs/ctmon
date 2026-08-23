@@ -558,10 +558,14 @@ func statsCmd(args []string) error {
 	})
 }
 
-// withStore opens the database, hands it to fn, and closes it again. The
-// read-only commands all want exactly this and nothing more.
+// withStore opens the database for reading, hands it to fn, and closes it
+// again. The read-only commands all want exactly this and nothing more.
+//
+// Reading is the whole contract: a path that names no database is an error
+// rather than an invitation to create one, and the handle takes no write lock
+// on the way past.
 func withStore(path string, fn func(*store.Store) error) error {
-	db, err := store.Open(path)
+	db, err := store.OpenReadOnly(path)
 	if err != nil {
 		return err
 	}

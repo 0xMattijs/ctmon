@@ -165,6 +165,9 @@ func (s *Store) PendingDone(keys ...[]byte) error {
 func (s *Store) PendingStats() (count int, oldest time.Time, err error) {
 	err = s.view(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucketPending)
+		if b == nil {
+			return nil
+		}
 		count = b.Stats().KeyN
 		if k, _ := b.Cursor().First(); k != nil {
 			oldest = pendingDue(k)
