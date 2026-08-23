@@ -961,3 +961,18 @@ func TestBacklogWorkersAlwaysReservesOne(t *testing.T) {
 		}
 	}
 }
+
+// With no sweep there is no backlog, so pinning a worker to one only parks it
+// on a channel nothing ever sends to. At the default count that would idle 64
+// of 256 workers for the whole run.
+func TestNoWorkerIsPinnedToAQueueNothingFills(t *testing.T) {
+	swept := &Pipeline{Backfill: time.Minute}
+	if got := swept.reservedWorkers(256); got != 64 {
+		t.Errorf("reservedWorkers(256) with a sweep = %d, want 64", got)
+	}
+	for _, p := range []*Pipeline{{Backfill: 0}, {Backfill: time.Minute, NoProbe: true}} {
+		if got := p.reservedWorkers(256); got != 0 {
+			t.Errorf("reservedWorkers(256) with Queuing()=%v = %d, want 0", p.Queuing(), got)
+		}
+	}
+}

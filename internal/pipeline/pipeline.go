@@ -201,7 +201,7 @@ func (p *Pipeline) Run(ctx context.Context, in <-chan source.Cert) {
 	// Most workers take fresh discoveries first. A few are kept for the
 	// backlog, so a sustained burst of new names cannot starve it completely
 	// the way the backlog used to starve them.
-	reserved := backlogWorkers(workers)
+	reserved := p.reservedWorkers(workers)
 	var probeWG sync.WaitGroup
 	for i := 0; i < workers; i++ {
 		probeWG.Add(1)
@@ -288,6 +288,18 @@ func (p *Pipeline) Run(ctx context.Context, in <-chan source.Cert) {
 	<-sweepDone
 	close(backlog)
 	probeWG.Wait()
+}
+
+// reservedWorkers is how many of the pool are pinned to the backlog for this
+// run. Without a sweep there is no backlog to pin them to, and a worker that
+// waits on one anyway parks on a channel nothing sends to until the run ends:
+// at the default worker count that is 64 goroutines idle while fresh
+// discoveries queue behind the remaining 192.
+func (p *Pipeline) reservedWorkers(workers int) int {
+	if !p.Queuing() {
+		return 0
+	}
+	return backlogWorkers(workers)
 }
 
 // backlogWorkers is how many of the pool are pinned to the backlog. A quarter,
@@ -455,11 +467,15 @@ func (p *Pipeline) probeQueued(ctx context.Context, item store.Pending) {
 //
 // A host turned away by its address's budget is queued again and nothing is
 // written down: nothing was asked of it, so there is nothing to record, and a
-// probe error would be a claim about the host that is not true.
+// probe error would be a claim about the host that is not true. With no sweep
+// to drain the queue there is nowhere to put it, and the host is dropped
+// instead.
 //
-// It reports whether the host is settled — either its result is in the store,
-// or it has been queued afresh. A caller holding a lease must keep it when
-// this is false.
+// It reports whether the host is settled — its result is in the store, or it
+// has been queued afresh. A caller holding a lease must keep it when this is
+// false, with one exception: a dropped host is not settled and has no lease to
+// keep, because a queue nothing sweeps hands nothing out. Queuing() is what
+// keeps those two facts in step.
 func (p *Pipeline) probe(ctx context.Context, host string) bool {
 	res := p.Prober.Probe(ctx, host)
 	if ctx.Err() != nil {

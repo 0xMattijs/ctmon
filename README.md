@@ -603,6 +603,17 @@ they arrive:
 - Startup skips filling the queue from existing records, which is otherwise a
   walk of the whole store.
 
+What that costs is every probe that could not happen the moment the name
+arrived. A host shed because all the workers were busy, or turned away by its
+address's budget, is recorded unprobed and nothing schedules it. Turning the
+sweep back on later does not find it either: the startup seed runs only on a
+store the queue has not been seeded for, so a database that was already seeded
+under the same `--reprobe` setting is left alone. The host comes back when a
+certificate names it again, and not before.
+
+`--backfill 0` is for a run you want to leave no backlog behind. It is not a
+way to probe less.
+
 Re-probing rides on the same queue. A finished probe schedules the next one,
 and because that leaves every host probed before `--reprobe` was set out of the
 queue entirely, changing the setting seeds the store again for the new policy.

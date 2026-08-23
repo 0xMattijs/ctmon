@@ -137,7 +137,7 @@ func runCmd(args []string) error {
 		if ctx.Err() != nil {
 			return nil
 		}
-	} else if !cfg.prober.disabled {
+	} else if !pipe.NoProbe {
 		log.Info("backfill is off: hosts are probed as they arrive and none are queued")
 	}
 
