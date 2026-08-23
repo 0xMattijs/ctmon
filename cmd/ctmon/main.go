@@ -308,13 +308,13 @@ const statusInterval = time.Second
 func statusLoop(ctx context.Context, every time.Duration, p *pipeline.Pipeline, line *statusLine) {
 	t := time.NewTicker(every)
 	defer t.Stop()
-	line.Set(statusText(statsFields(p)))
+	line.Set(statusText(p.Stats().Fields()))
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			line.Set(statusText(statsFields(p)))
+			line.Set(statusText(p.Stats().Fields()))
 		}
 	}
 }
@@ -333,33 +333,7 @@ func reportLoop(ctx context.Context, every time.Duration, p *pipeline.Pipeline, 
 }
 
 func logStats(p *pipeline.Pipeline, log *slog.Logger, msg string) {
-	log.Info(msg, statsFields(p)...)
-}
-
-// statsFields renders the counters as alternating keys and values, so the
-// progress line, the live status line, and the final line all share a shape.
-func statsFields(p *pipeline.Pipeline) []any {
-	s := p.Stats()
-	return []any{
-		"certs", s.Certs.Load(),
-		"names", s.Names.Load(),
-		"skipped_cn", s.Skipped.Load(),
-		"too_deep", s.TooDeep.Load(),
-		"from_san", s.FromSAN.Load(),
-		"sans_cut", s.SANsCut.Load(),
-		"blocked", s.Blocked.Load(),
-		"capped", s.Capped.Load(),
-		"new", s.New.Load(),
-		"repeat", s.Repeat.Load(),
-		"dup", s.Dup.Load(),
-		"probed", s.Probed.Load(),
-		"probe_failed", s.Failed.Load(),
-		"changed", s.Changed.Load(),
-		"deferred", s.Deferred.Load(),
-		"throttled", s.Throttled.Load(),
-		"unresolved", s.Unresolved.Load(),
-		"backfilled", s.Backfilled.Load(),
-	}
+	log.Info(msg, p.Stats().Fields()...)
 }
 
 func listCmd(args []string) error {
@@ -376,51 +350,47 @@ func listCmd(args []string) error {
 	)
 	fs.Parse(args)
 
-	db, err := store.Open(*dbPath)
-	if err != nil {
+	return withStore(*dbPath, func(db *store.Store) error {
+		enc := json.NewEncoder(os.Stdout)
+		n := 0
+		stop := errors.New("limit reached")
+		walk := db.ForEach
+		if *under != "" {
+			walk = func(fn func(*store.Record) error) error { return db.ForEachUnder(*under, fn) }
+		}
+		err := walk(func(r *store.Record) error {
+			switch {
+			case *onlyHash && r.BodyHash == "":
+				return nil
+			case *onlyWild && !r.FromWildcard:
+				return nil
+			case *changed && r.PrevHash == "":
+				return nil
+			case *since > 0 && time.Since(r.FirstSeen) > *since:
+				return nil
+			}
+			if *asJSON {
+				if err := enc.Encode(r); err != nil {
+					return err
+				}
+			} else {
+				hash := r.BodyHash
+				if hash == "" {
+					hash = "-"
+				}
+				fmt.Printf("%s\t%d\t%s\t%s\n", r.Host, r.HTTPStatus, hash, r.FirstSeen.Format(time.RFC3339))
+			}
+			n++
+			if *limit > 0 && n >= *limit {
+				return stop
+			}
+			return nil
+		})
+		if errors.Is(err, stop) {
+			return nil
+		}
 		return err
-	}
-	defer db.Close()
-
-	enc := json.NewEncoder(os.Stdout)
-	n := 0
-	stop := errors.New("limit reached")
-	walk := db.ForEach
-	if *under != "" {
-		walk = func(fn func(*store.Record) error) error { return db.ForEachUnder(*under, fn) }
-	}
-	err = walk(func(r *store.Record) error {
-		switch {
-		case *onlyHash && r.BodyHash == "":
-			return nil
-		case *onlyWild && !r.FromWildcard:
-			return nil
-		case *changed && r.PrevHash == "":
-			return nil
-		case *since > 0 && time.Since(r.FirstSeen) > *since:
-			return nil
-		}
-		if *asJSON {
-			if err := enc.Encode(r); err != nil {
-				return err
-			}
-		} else {
-			hash := r.BodyHash
-			if hash == "" {
-				hash = "-"
-			}
-			fmt.Printf("%s\t%d\t%s\t%s\n", r.Host, r.HTTPStatus, hash, r.FirstSeen.Format(time.RFC3339))
-		}
-		n++
-		if *limit > 0 && n >= *limit {
-			return stop
-		}
-		return nil
 	})
-	if errors.Is(err, stop) {
-		return nil
-	}
-	return err
 }
 
 func getCmd(args []string) error {
@@ -431,22 +401,18 @@ func getCmd(args []string) error {
 		return errors.New("usage: ctmon get [--db path] <host>")
 	}
 
-	db, err := store.Open(*dbPath)
-	if err != nil {
-		return err
-	}
-	defer db.Close()
-
-	rec, err := db.Get(strings.ToLower(fs.Arg(0)))
-	if err != nil {
-		return err
-	}
-	if rec == nil {
-		return fmt.Errorf("%s: not found", fs.Arg(0))
-	}
-	enc := json.NewEncoder(os.Stdout)
-	enc.SetIndent("", "  ")
-	return enc.Encode(rec)
+	return withStore(*dbPath, func(db *store.Store) error {
+		rec, err := db.Get(strings.ToLower(fs.Arg(0)))
+		if err != nil {
+			return err
+		}
+		if rec == nil {
+			return fmt.Errorf("%s: not found", fs.Arg(0))
+		}
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(rec)
+	})
 }
 
 // humanBytes renders a byte count for a person.
@@ -539,39 +505,46 @@ func statsCmd(args []string) error {
 	dbPath := fs.String("db", "ct.db", "path to the bbolt database")
 	fs.Parse(args)
 
-	db, err := store.Open(*dbPath)
+	return withStore(*dbPath, func(db *store.Store) error {
+		st, err := db.Stats()
+		if err != nil {
+			return err
+		}
+		fmt.Printf("domains:    %d\n", st.Domains)
+		fmt.Printf("probed:     %d\n", st.Probed)
+		fmt.Printf("with hash:  %d\n", st.WithHash)
+		fmt.Printf("wildcards:  %d\n", st.Wildcards)
+		fmt.Printf("errors:     %d\n", st.Errors)
+		fmt.Printf("changed:    %d\n", st.Changed)
+		fmt.Printf("queued:     %d\n", st.Pending)
+		if !st.Oldest.IsZero() {
+			fmt.Printf("waiting:    %s (oldest queued probe)\n", waited(st.Oldest))
+		}
+		fmt.Printf("\nfile size:  %s\n", humanBytes(st.Bytes))
+		if st.Domains > 0 {
+			fmt.Printf("per record: %d B\n", st.Bytes/int64(st.Domains))
+		}
+		fmt.Printf("interned:   %d sources, %d issuers, %d error shapes\n",
+			st.Sources, st.Issuers, st.ErrorKind)
+		if len(st.Logs) > 0 {
+			fmt.Printf("\nct log positions:\n")
+			for _, uri := range slices.Sorted(maps.Keys(st.Logs)) {
+				fmt.Printf("  %-60s %d\n", uri, st.Logs[uri])
+			}
+		}
+		return nil
+	})
+}
+
+// withStore opens the database, hands it to fn, and closes it again. The
+// read-only commands all want exactly this and nothing more.
+func withStore(path string, fn func(*store.Store) error) error {
+	db, err := store.Open(path)
 	if err != nil {
 		return err
 	}
 	defer db.Close()
-
-	st, err := db.Stats()
-	if err != nil {
-		return err
-	}
-	fmt.Printf("domains:    %d\n", st.Domains)
-	fmt.Printf("probed:     %d\n", st.Probed)
-	fmt.Printf("with hash:  %d\n", st.WithHash)
-	fmt.Printf("wildcards:  %d\n", st.Wildcards)
-	fmt.Printf("errors:     %d\n", st.Errors)
-	fmt.Printf("changed:    %d\n", st.Changed)
-	fmt.Printf("queued:     %d\n", st.Pending)
-	if !st.Oldest.IsZero() {
-		fmt.Printf("waiting:    %s (oldest queued probe)\n", waited(st.Oldest))
-	}
-	fmt.Printf("\nfile size:  %s\n", humanBytes(st.Bytes))
-	if st.Domains > 0 {
-		fmt.Printf("per record: %d B\n", st.Bytes/int64(st.Domains))
-	}
-	fmt.Printf("interned:   %d sources, %d issuers, %d error shapes\n",
-		st.Sources, st.Issuers, st.ErrorKind)
-	if len(st.Logs) > 0 {
-		fmt.Printf("\nct log positions:\n")
-		for _, uri := range slices.Sorted(maps.Keys(st.Logs)) {
-			fmt.Printf("  %-60s %d\n", uri, st.Logs[uri])
-		}
-	}
-	return nil
+	return fn(db)
 }
 
 // splitList reads a comma-separated flag into its entries, dropping the empty
