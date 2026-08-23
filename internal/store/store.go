@@ -189,6 +189,10 @@ func (s *Store) Get(host string) (*Record, error) {
 //
 // Update uses bolt's batching, so concurrent callers coalesce into shared
 // transactions.
+//
+// It is UpdateWithQueue for a caller with nothing to queue. The pipeline
+// always has something to say about a probe, so it takes the other one; this
+// is the form for a change to a record on its own.
 func (s *Store) Update(host string, fn func(rec *Record, existed bool) bool) error {
 	return s.UpdateWithQueue(host, func(rec *Record, existed bool) (bool, time.Time) {
 		return fn(rec, existed), time.Time{}
@@ -213,6 +217,9 @@ func (s *Store) UpdateWithQueue(host string, fn func(rec *Record, existed bool) 
 
 		b := tx.Bucket(bucketDomains)
 		key := []byte(reverseHost(host))
+		// Host is set here and not left to decode, which is what fills it in
+		// everywhere else: a record being created for the first time never
+		// reaches decode, and fn would see a hostname-less record.
 		rec := &Record{Host: host}
 		existed := false
 		if raw := b.Get(key); raw != nil {
@@ -474,7 +481,7 @@ func (s *Store) GetAll(hosts []string) (map[string]*Record, error) {
 			if raw == nil {
 				continue
 			}
-			rec := &Record{Host: host}
+			rec := &Record{}
 			if err := s.decode(host, raw, rec); err != nil {
 				return fmt.Errorf("decode %s: %w", host, err)
 			}

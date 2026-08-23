@@ -2,9 +2,10 @@ package probe
 
 import (
 	"net/netip"
-	"sync"
 
 	"golang.org/x/time/rate"
+
+	"github.com/mvo/ct/internal/bounded"
 )
 
 // Politeness is per destination, not per monitor.
@@ -20,21 +21,22 @@ import (
 // spread thin while leaving the long tail of one-name hosts untouched.
 
 // ipLimiter rations requests per destination address.
+//
+// The table is bounded, and filling it drops every bucket at once — which
+// refunds every budget at once. That is a real loss of accounting rather than
+// a stale entry, so the ceiling is set far above the number of addresses a
+// busy monitor sees in a burst.
 type ipLimiter struct {
-	rate  rate.Limit
-	burst int
-	max   int
-
-	mu      sync.Mutex
-	buckets map[netip.Addr]*rate.Limiter
+	rate    rate.Limit
+	burst   int
+	buckets *bounded.Map[netip.Addr, *rate.Limiter]
 }
 
 func newIPLimiter(perSecond float64, burst, max int) *ipLimiter {
 	return &ipLimiter{
 		rate:    rate.Limit(perSecond),
 		burst:   burst,
-		max:     max,
-		buckets: make(map[netip.Addr]*rate.Limiter, max/4),
+		buckets: bounded.New[netip.Addr, *rate.Limiter](max),
 	}
 }
 
@@ -45,18 +47,10 @@ func (l *ipLimiter) allow(addr netip.Addr) bool {
 	if l == nil {
 		return true
 	}
-	l.mu.Lock()
-	b, ok := l.buckets[addr]
-	if !ok {
-		if len(l.buckets) >= l.max {
-			// Dropping the table refunds every bucket at once. It is a real
-			// loss of accounting, so the table is sized to hold far more
-			// addresses than a busy monitor sees in a burst.
-			l.buckets = make(map[netip.Addr]*rate.Limiter, l.max/4)
-		}
-		b = rate.NewLimiter(l.rate, l.burst)
-		l.buckets[addr] = b
-	}
-	l.mu.Unlock()
+	// Spending from the bucket happens after GetOrPut returns, so the table is
+	// not locked while it does.
+	b, _ := l.buckets.GetOrPut(addr, func() *rate.Limiter {
+		return rate.NewLimiter(l.rate, l.burst)
+	})
 	return b.Allow()
 }

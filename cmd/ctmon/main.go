@@ -9,7 +9,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"log/slog"
 	"maps"
 	"net"
@@ -23,7 +22,6 @@ import (
 	"time"
 
 	"github.com/mvo/ct/internal/pipeline"
-	"github.com/mvo/ct/internal/probe"
 	"github.com/mvo/ct/internal/source"
 	"github.com/mvo/ct/internal/store"
 )
@@ -77,133 +75,35 @@ func main() {
 
 func runCmd(args []string) error {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
-	var (
-		dbPath    = fs.String("db", "ct.db", "path to the bbolt database")
-		sources   = fs.String("source", "both", "certificate feed: certstream, ctlog, or both")
-		csURL     = fs.String("certstream-url", source.DefaultCertstreamURL, "certstream websocket URL")
-		logURIs   = fs.String("logs", "", "comma-separated CT log URLs (default: discover usable logs)")
-		listURL   = fs.String("log-list-url", "", "CT log list URL (default: Google's v3 list)")
-		fromTop   = fs.Bool("from-start", false, "read each new log from index 0 instead of its current tip")
-		batch     = fs.Int("batch", 256, "entries per get-entries request (a ceiling: a log that times out gets asked for less)")
-		maxLag    = fs.Uint64("max-lag", 0, "skip a log to its tree head when it falls this many entries behind (0 = never skip)")
-		poll      = fs.Duration("poll", 30*time.Second, "how long to wait after catching up with a log")
-		logRPS    = fs.Float64("log-rps", 4, "get-entries requests per second, per log")
-		workers   = fs.Int("workers", pipeline.DefaultWorkers, "concurrent HTTPS probes")
-		writers   = fs.Int("writers", 4, "concurrent store writers")
-		backfill  = fs.Duration("backfill", 10*time.Second, "how often to take hosts off the pending queue (0 disables)")
-		bfBatch   = fs.Int("backfill-batch", 5000, "maximum hosts leased per sweep")
-		bfLease   = fs.Duration("backfill-lease", pipeline.DefaultBackfillLease, "how long a host handed to a prober stays off the pending queue; must outlast a whole --backfill-batch")
-		reprobe   = fs.Duration("reprobe", 0, "re-probe a known host after this long (0 disables)")
-		skipSfx   = fs.String("skip-suffix", "", "extra parent domains to drop, comma-separated, e.g. workers.dev,pages.dev")
-		skipFile  = fs.String("skip-suffix-file", "", "file of extra parent domains to drop, one per line (# comments allowed)")
-		defSkip   = fs.Bool("default-skip", true, "apply the built-in hosting-platform blocklist")
-		parCap    = fs.Int("parent-cap", pipeline.DefaultParentCap, "maximum new hosts accepted per registrable domain per window (0 = no cap)")
-		parWin    = fs.Duration("parent-window", pipeline.DefaultParentWindow, "window for --parent-cap")
-		recent    = fs.Int("recent-hosts", pipeline.DefaultRecentHosts, "hostnames the in-memory duplicate filter remembers (0 = default)")
-		maxDepth  = fs.Int("max-depth", pipeline.DefaultMaxDepth, "drop hosts nested deeper than this below their registrable domain (0 = no limit)")
-		useSANs   = fs.Bool("sans", true, "read hostnames from subject alternative names, not just the CN")
-		maxSANs   = fs.Int("max-sans", 0, "maximum SANs to read from one certificate (0 = all)")
-		noProbe   = fs.Bool("no-probe", false, "record domains without fetching them")
-		probeRPS  = fs.Float64("probe-rps", 100, "ceiling on HTTPS probes per second across all workers, which is what bounds NAT state on the way out (0 = no limit)")
-		ipRPS     = fs.Float64("probe-rps-per-ip", 32, "HTTPS probes per second to one destination address (0 = no per-address limit)")
-		timeout   = fs.Duration("probe-timeout", 6*time.Second, "per-probe timeout, end to end")
-		dialTO    = fs.Duration("dial-timeout", 2*time.Second, "how long to wait for the TCP connect")
-		tlsTO     = fs.Duration("tls-timeout", 3*time.Second, "how long to wait for the TLS handshake")
-		resolves  = fs.String("resolvers", "", "nameservers to probe with, comma-separated host:port (default: the system's)")
-		dnsTO     = fs.Duration("resolve-timeout", 2*time.Second, "how long to wait for a DNS answer")
-		dnsTTL    = fs.Duration("dns-ttl", 5*time.Minute, "how long to cache a name that resolved")
-		dnsNegTTL = fs.Duration("dns-negative-ttl", 15*time.Minute, "how long to cache a name that did not resolve")
-		dnsConc   = fs.Int("resolve-concurrency", 64, "how many DNS lookups may run at once")
-		maxBody   = fs.Int64("max-body", 2<<20, "bytes of body to read and hash")
-		verify    = fs.Bool("verify-tls", false, "verify TLS certificates when probing")
-		private   = fs.Bool("allow-private", false, "probe hosts that resolve to loopback, RFC 1918, or other non-public addresses")
-		ua        = fs.String("user-agent", "ctmon/1.0 (+domain discovery)", "User-Agent for probes and CT requests")
-		compact   = fs.Duration("compact-every", 24*time.Hour, "rewrite the database into full pages this often (0 disables)")
-		snapPath  = fs.String("snapshot", "", "where SIGUSR1 writes a readable copy of the database (default: <db>.snap)")
-		report    = fs.Duration("report", time.Minute, "how often to log counters (0 disables)")
-		status    = fs.Bool("status", true, "on a terminal, redraw the counters in place instead of logging a line per report interval")
-		domains   = fs.Bool("domains", false, "log every new domain, one line each")
-		verbose   = fs.Bool("v", false, "debug logging")
-	)
+	var cfg runConfig
+	cfg.bind(fs)
 	fs.Parse(args)
 
-	level := slog.LevelInfo
-	if *verbose {
-		level = slog.LevelDebug
-	}
-	// The live counter line and debug logging fight over the terminal, so
-	// -v keeps the plain scrolling output.
-	var line *statusLine
-	if *status && !*verbose && *report > 0 {
-		line = newStatusLine(os.Stderr)
-	}
-	var out io.Writer = os.Stderr
-	if line != nil {
-		out = line
-	}
-	log := slog.New(slog.NewTextHandler(out, &slog.HandlerOptions{Level: level}))
+	log, line := cfg.logger()
 
-	skip, err := loadSkipSuffixes(*skipSfx, *skipFile, *defSkip)
+	skip, err := loadSkipSuffixes(cfg.filter.skipSuffix, cfg.filter.skipFile, cfg.filter.useDefaults)
 	if err != nil {
 		return err
 	}
 	log.Info("filters",
 		"skip_suffixes", len(skip),
-		"parent_cap", *parCap,
-		"parent_window", *parWin,
-		"max_depth", *maxDepth,
+		"parent_cap", cfg.filter.parentCap,
+		"parent_window", cfg.filter.parentWin,
+		"max_depth", cfg.filter.maxDepth,
 	)
 
-	db, err := store.Open(*dbPath)
+	db, err := store.Open(cfg.dbPath)
 	if err != nil {
 		return err
 	}
 	defer db.Close()
 
-	prober := probe.New(probe.Options{
-		Timeout:           *timeout,
-		DialTimeout:       *dialTO,
-		TLSTimeout:        *tlsTO,
-		MaxBody:           *maxBody,
-		RequestsPerSecond: *probeRPS,
-		PerIPRPS:          *ipRPS,
-		NoPerIPLimit:      *ipRPS == 0,
-		Resolvers:         splitList(*resolves),
-		ResolveTimeout:    *dnsTO,
-		MaxLookups:        *dnsConc,
-		DNSTTL:            *dnsTTL,
-		DNSNegativeTTL:    *dnsNegTTL,
-		VerifyTLS:         *verify,
-		AllowPrivate:      *private,
-		UserAgent:         *ua,
-	})
-
-	feeds, err := buildSources(*sources, *csURL, *logURIs, *listURL, *fromTop,
-		*batch, *maxLag, *poll, *logRPS, *ua, db, log, prober.TrustedDialContext)
+	prober := cfg.newProber()
+	feeds, err := buildSources(cfg.feed, cfg.userAgent, db, log, prober.TrustedDialContext)
 	if err != nil {
 		return err
 	}
-
-	pipe := &pipeline.Pipeline{
-		Store:         db,
-		Prober:        prober,
-		Log:           log,
-		Workers:       *workers,
-		Writers:       *writers,
-		Skip:          skip,
-		ParentCap:     *parCap,
-		ParentWindow:  *parWin,
-		MaxDepth:      *maxDepth,
-		IgnoreSANs:    !*useSANs,
-		MaxSANs:       *maxSANs,
-		Reprobe:       *reprobe,
-		Backfill:      *backfill,
-		BackfillBatch: *bfBatch,
-		BackfillLease: *bfLease,
-		NoProbe:       *noProbe,
-		LogDomains:    *domains,
-		RecentHosts:   *recent,
-	}
+	pipe := cfg.newPipeline(db, prober, log, skip)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -212,7 +112,7 @@ func runCmd(args []string) error {
 	// store of a couple of million records it runs for the best part of a
 	// minute, and until the handler exists a Ctrl-C during it kills the
 	// process outright.
-	if !*noProbe {
+	if !cfg.prober.disabled {
 		if err := seedPending(ctx, db, pipe, log); err != nil {
 			return err
 		}
@@ -241,18 +141,15 @@ func runCmd(args []string) error {
 		close(certs)
 	}()
 
-	if *compact > 0 {
-		go compactLoop(ctx, *compact, db, log)
+	if cfg.compactEvery > 0 {
+		go compactLoop(ctx, cfg.compactEvery, db, log)
 	}
 
 	// A run holds an exclusive lock on the database, so ctmon stats and the
 	// rest cannot open it. Snapshot on a signal gives them something to read
 	// without stopping the collection.
 	if sig, ok := snapshotSignal(); ok {
-		dst := *snapPath
-		if dst == "" {
-			dst = *dbPath + ".snap"
-		}
+		dst := cfg.snapshotPath()
 		go snapshotLoop(ctx, sig, db, dst, log)
 		log.Info("snapshot on signal", "signal", sig, "path", dst)
 	}
@@ -260,8 +157,8 @@ func runCmd(args []string) error {
 	switch {
 	case line != nil:
 		go statusLoop(ctx, statusInterval, pipe, line)
-	case *report > 0:
-		go reportLoop(ctx, *report, pipe, log)
+	case cfg.output.report > 0:
+		go reportLoop(ctx, cfg.output.report, pipe, log)
 	}
 
 	pipe.Run(ctx, certs)
@@ -291,14 +188,12 @@ func loadSkipSuffixes(inline, path string, useDefault bool) (pipeline.SuffixSet,
 	return pipeline.NewSuffixSet(entries), nil
 }
 
-// buildSources turns the flags into the configured feeds.
-func buildSources(sel, csURL, logURIs, listURL string, fromStart bool,
-	batch int, maxLag uint64, poll time.Duration, logRPS float64, ua string,
-	db *store.Store, log *slog.Logger,
+// buildSources turns the feed flags into the configured feeds.
+func buildSources(cfg feedConfig, userAgent string, db *store.Store, log *slog.Logger,
 	dial func(ctx context.Context, network, addr string) (net.Conn, error)) ([]source.Source, error) {
 
 	want := map[string]bool{}
-	for _, s := range strings.Split(sel, ",") {
+	for _, s := range strings.Split(cfg.sources, ",") {
 		switch s = strings.TrimSpace(s); s {
 		case "both":
 			want["certstream"], want["ctlog"] = true, true
@@ -315,15 +210,10 @@ func buildSources(sel, csURL, logURIs, listURL string, fromStart bool,
 
 	var feeds []source.Source
 	if want["certstream"] {
-		feeds = append(feeds, &source.Certstream{URL: csURL, UserAgent: ua, Log: log})
+		feeds = append(feeds, &source.Certstream{URL: cfg.certURL, UserAgent: userAgent, Log: log})
 	}
 	if want["ctlog"] {
-		var uris []string
-		for _, u := range strings.Split(logURIs, ",") {
-			if u = strings.TrimSpace(u); u != "" {
-				uris = append(uris, u)
-			}
-		}
+		uris := splitList(cfg.logURIs)
 		if len(uris) == 0 {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
@@ -332,7 +222,7 @@ func buildSources(sel, csURL, logURIs, listURL string, fromStart bool,
 			if dial != nil {
 				hc.Transport = &http.Transport{DialContext: dial, ForceAttemptHTTP2: true}
 			}
-			uris, err = source.DiscoverLogs(ctx, hc, listURL)
+			uris, err = source.DiscoverLogs(ctx, hc, cfg.listURL)
 			if err != nil {
 				return nil, err
 			}
@@ -341,12 +231,12 @@ func buildSources(sel, csURL, logURIs, listURL string, fromStart bool,
 		feeds = append(feeds, &source.CTLog{
 			URIs:              uris,
 			Positions:         db,
-			FromStart:         fromStart,
-			BatchSize:         batch,
-			MaxLag:            maxLag,
-			PollInterval:      poll,
-			RequestsPerSecond: logRPS,
-			UserAgent:         ua,
+			FromStart:         cfg.fromStart,
+			BatchSize:         cfg.batch,
+			MaxLag:            cfg.maxLag,
+			PollInterval:      cfg.poll,
+			RequestsPerSecond: cfg.rps,
+			UserAgent:         userAgent,
 			DialContext:       dial,
 			Log:               log,
 		})
@@ -418,13 +308,13 @@ const statusInterval = time.Second
 func statusLoop(ctx context.Context, every time.Duration, p *pipeline.Pipeline, line *statusLine) {
 	t := time.NewTicker(every)
 	defer t.Stop()
-	line.Set(statusText(statsFields(p)))
+	line.Set(statusText(p.Stats().Fields()))
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			line.Set(statusText(statsFields(p)))
+			line.Set(statusText(p.Stats().Fields()))
 		}
 	}
 }
@@ -443,33 +333,7 @@ func reportLoop(ctx context.Context, every time.Duration, p *pipeline.Pipeline, 
 }
 
 func logStats(p *pipeline.Pipeline, log *slog.Logger, msg string) {
-	log.Info(msg, statsFields(p)...)
-}
-
-// statsFields renders the counters as alternating keys and values, so the
-// progress line, the live status line, and the final line all share a shape.
-func statsFields(p *pipeline.Pipeline) []any {
-	s := p.Stats()
-	return []any{
-		"certs", s.Certs.Load(),
-		"names", s.Names.Load(),
-		"skipped_cn", s.Skipped.Load(),
-		"too_deep", s.TooDeep.Load(),
-		"from_san", s.FromSAN.Load(),
-		"sans_cut", s.SANsCut.Load(),
-		"blocked", s.Blocked.Load(),
-		"capped", s.Capped.Load(),
-		"new", s.New.Load(),
-		"repeat", s.Repeat.Load(),
-		"dup", s.Dup.Load(),
-		"probed", s.Probed.Load(),
-		"probe_failed", s.Failed.Load(),
-		"changed", s.Changed.Load(),
-		"deferred", s.Deferred.Load(),
-		"throttled", s.Throttled.Load(),
-		"unresolved", s.Unresolved.Load(),
-		"backfilled", s.Backfilled.Load(),
-	}
+	log.Info(msg, p.Stats().Fields()...)
 }
 
 func listCmd(args []string) error {
@@ -486,51 +350,47 @@ func listCmd(args []string) error {
 	)
 	fs.Parse(args)
 
-	db, err := store.Open(*dbPath)
-	if err != nil {
+	return withStore(*dbPath, func(db *store.Store) error {
+		enc := json.NewEncoder(os.Stdout)
+		n := 0
+		stop := errors.New("limit reached")
+		walk := db.ForEach
+		if *under != "" {
+			walk = func(fn func(*store.Record) error) error { return db.ForEachUnder(*under, fn) }
+		}
+		err := walk(func(r *store.Record) error {
+			switch {
+			case *onlyHash && r.BodyHash == "":
+				return nil
+			case *onlyWild && !r.FromWildcard:
+				return nil
+			case *changed && r.PrevHash == "":
+				return nil
+			case *since > 0 && time.Since(r.FirstSeen) > *since:
+				return nil
+			}
+			if *asJSON {
+				if err := enc.Encode(r); err != nil {
+					return err
+				}
+			} else {
+				hash := r.BodyHash
+				if hash == "" {
+					hash = "-"
+				}
+				fmt.Printf("%s\t%d\t%s\t%s\n", r.Host, r.HTTPStatus, hash, r.FirstSeen.Format(time.RFC3339))
+			}
+			n++
+			if *limit > 0 && n >= *limit {
+				return stop
+			}
+			return nil
+		})
+		if errors.Is(err, stop) {
+			return nil
+		}
 		return err
-	}
-	defer db.Close()
-
-	enc := json.NewEncoder(os.Stdout)
-	n := 0
-	stop := errors.New("limit reached")
-	walk := db.ForEach
-	if *under != "" {
-		walk = func(fn func(*store.Record) error) error { return db.ForEachUnder(*under, fn) }
-	}
-	err = walk(func(r *store.Record) error {
-		switch {
-		case *onlyHash && r.BodyHash == "":
-			return nil
-		case *onlyWild && !r.FromWildcard:
-			return nil
-		case *changed && r.PrevHash == "":
-			return nil
-		case *since > 0 && time.Since(r.FirstSeen) > *since:
-			return nil
-		}
-		if *asJSON {
-			if err := enc.Encode(r); err != nil {
-				return err
-			}
-		} else {
-			hash := r.BodyHash
-			if hash == "" {
-				hash = "-"
-			}
-			fmt.Printf("%s\t%d\t%s\t%s\n", r.Host, r.HTTPStatus, hash, r.FirstSeen.Format(time.RFC3339))
-		}
-		n++
-		if *limit > 0 && n >= *limit {
-			return stop
-		}
-		return nil
 	})
-	if errors.Is(err, stop) {
-		return nil
-	}
-	return err
 }
 
 func getCmd(args []string) error {
@@ -541,22 +401,18 @@ func getCmd(args []string) error {
 		return errors.New("usage: ctmon get [--db path] <host>")
 	}
 
-	db, err := store.Open(*dbPath)
-	if err != nil {
-		return err
-	}
-	defer db.Close()
-
-	rec, err := db.Get(strings.ToLower(fs.Arg(0)))
-	if err != nil {
-		return err
-	}
-	if rec == nil {
-		return fmt.Errorf("%s: not found", fs.Arg(0))
-	}
-	enc := json.NewEncoder(os.Stdout)
-	enc.SetIndent("", "  ")
-	return enc.Encode(rec)
+	return withStore(*dbPath, func(db *store.Store) error {
+		rec, err := db.Get(strings.ToLower(fs.Arg(0)))
+		if err != nil {
+			return err
+		}
+		if rec == nil {
+			return fmt.Errorf("%s: not found", fs.Arg(0))
+		}
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(rec)
+	})
 }
 
 // humanBytes renders a byte count for a person.
@@ -649,39 +505,46 @@ func statsCmd(args []string) error {
 	dbPath := fs.String("db", "ct.db", "path to the bbolt database")
 	fs.Parse(args)
 
-	db, err := store.Open(*dbPath)
+	return withStore(*dbPath, func(db *store.Store) error {
+		st, err := db.Stats()
+		if err != nil {
+			return err
+		}
+		fmt.Printf("domains:    %d\n", st.Domains)
+		fmt.Printf("probed:     %d\n", st.Probed)
+		fmt.Printf("with hash:  %d\n", st.WithHash)
+		fmt.Printf("wildcards:  %d\n", st.Wildcards)
+		fmt.Printf("errors:     %d\n", st.Errors)
+		fmt.Printf("changed:    %d\n", st.Changed)
+		fmt.Printf("queued:     %d\n", st.Pending)
+		if !st.Oldest.IsZero() {
+			fmt.Printf("waiting:    %s (oldest queued probe)\n", waited(st.Oldest))
+		}
+		fmt.Printf("\nfile size:  %s\n", humanBytes(st.Bytes))
+		if st.Domains > 0 {
+			fmt.Printf("per record: %d B\n", st.Bytes/int64(st.Domains))
+		}
+		fmt.Printf("interned:   %d sources, %d issuers, %d error shapes\n",
+			st.Sources, st.Issuers, st.ErrorKind)
+		if len(st.Logs) > 0 {
+			fmt.Printf("\nct log positions:\n")
+			for _, uri := range slices.Sorted(maps.Keys(st.Logs)) {
+				fmt.Printf("  %-60s %d\n", uri, st.Logs[uri])
+			}
+		}
+		return nil
+	})
+}
+
+// withStore opens the database, hands it to fn, and closes it again. The
+// read-only commands all want exactly this and nothing more.
+func withStore(path string, fn func(*store.Store) error) error {
+	db, err := store.Open(path)
 	if err != nil {
 		return err
 	}
 	defer db.Close()
-
-	st, err := db.Stats()
-	if err != nil {
-		return err
-	}
-	fmt.Printf("domains:    %d\n", st.Domains)
-	fmt.Printf("probed:     %d\n", st.Probed)
-	fmt.Printf("with hash:  %d\n", st.WithHash)
-	fmt.Printf("wildcards:  %d\n", st.Wildcards)
-	fmt.Printf("errors:     %d\n", st.Errors)
-	fmt.Printf("changed:    %d\n", st.Changed)
-	fmt.Printf("queued:     %d\n", st.Pending)
-	if !st.Oldest.IsZero() {
-		fmt.Printf("waiting:    %s (oldest queued probe)\n", waited(st.Oldest))
-	}
-	fmt.Printf("\nfile size:  %s\n", humanBytes(st.Bytes))
-	if st.Domains > 0 {
-		fmt.Printf("per record: %d B\n", st.Bytes/int64(st.Domains))
-	}
-	fmt.Printf("interned:   %d sources, %d issuers, %d error shapes\n",
-		st.Sources, st.Issuers, st.ErrorKind)
-	if len(st.Logs) > 0 {
-		fmt.Printf("\nct log positions:\n")
-		for _, uri := range slices.Sorted(maps.Keys(st.Logs)) {
-			fmt.Printf("  %-60s %d\n", uri, st.Logs[uri])
-		}
-	}
-	return nil
+	return fn(db)
 }
 
 // splitList reads a comma-separated flag into its entries, dropping the empty

@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/mvo/ct/internal/bounded"
 	"github.com/mvo/ct/internal/domain"
 	"github.com/mvo/ct/internal/probe"
 	"github.com/mvo/ct/internal/source"
@@ -29,7 +30,8 @@ type Pipeline struct {
 
 	// Workers is the number of concurrent probes (default DefaultWorkers).
 	Workers int
-	// Writers is the number of goroutines writing to the store (default 4).
+	// Writers is the number of goroutines writing to the store (default
+	// DefaultWriters).
 	Writers int
 	// Reprobe re-fetches a known host when its last probe is older than
 	// this, which is how body-hash changes get noticed. Zero never
@@ -38,7 +40,8 @@ type Pipeline struct {
 	// Backfill is how often to sweep the store for hosts that were recorded
 	// but never probed. Zero disables the sweep.
 	Backfill time.Duration
-	// BackfillBatch caps how many pending hosts one sweep leases (default 5000).
+	// BackfillBatch caps how many pending hosts one sweep leases (default
+	// DefaultBackfillBatch).
 	BackfillBatch int
 	// BackfillLease is how long a leased host stays out of the queue before
 	// it becomes due again (default DefaultBackfillLease). It only matters
@@ -104,6 +107,35 @@ type Stats struct {
 // Stats returns a pointer to the live counters.
 func (p *Pipeline) Stats() *Stats { return &p.stats }
 
+// Fields renders the counters as the alternating keys and values slog takes,
+// so the progress line, the live status line, and the final line all read the
+// same.
+//
+// The names live here rather than where they are printed, so that adding a
+// counter above is one edit and not two in two packages.
+func (s *Stats) Fields() []any {
+	return []any{
+		"certs", s.Certs.Load(),
+		"names", s.Names.Load(),
+		"skipped_cn", s.Skipped.Load(),
+		"too_deep", s.TooDeep.Load(),
+		"from_san", s.FromSAN.Load(),
+		"sans_cut", s.SANsCut.Load(),
+		"blocked", s.Blocked.Load(),
+		"capped", s.Capped.Load(),
+		"new", s.New.Load(),
+		"repeat", s.Repeat.Load(),
+		"dup", s.Dup.Load(),
+		"probed", s.Probed.Load(),
+		"probe_failed", s.Failed.Load(),
+		"changed", s.Changed.Load(),
+		"deferred", s.Deferred.Load(),
+		"throttled", s.Throttled.Load(),
+		"unresolved", s.Unresolved.Load(),
+		"backfilled", s.Backfilled.Load(),
+	}
+}
+
 // nameSeen is one hostname to record, with the certificate it came from.
 type nameSeen struct {
 	name domain.Name
@@ -113,14 +145,7 @@ type nameSeen struct {
 // Run reads certificates from in until the channel closes or ctx is
 // cancelled, then returns once every queued write and probe has finished.
 func (p *Pipeline) Run(ctx context.Context, in <-chan source.Cert) {
-	workers := p.Workers
-	if workers <= 0 {
-		workers = DefaultWorkers
-	}
-	writers := p.Writers
-	if writers <= 0 {
-		writers = 4
-	}
+	workers, writers := p.workers(), p.writers()
 
 	// Two queues, not one. With a single queue the sweep filled it — 5,000
 	// hosts at a time, minutes to drain — so record's non-blocking send
@@ -176,11 +201,7 @@ func (p *Pipeline) Run(ctx context.Context, in <-chan source.Cert) {
 
 	// recent squashes the duplicate CNs the feeds emit within seconds of each
 	// other, so a burst does not cost one store read per copy.
-	recentHosts := p.RecentHosts
-	if recentHosts <= 0 {
-		recentHosts = DefaultRecentHosts
-	}
-	recent := newRecentSet(recentHosts)
+	recent := newRecentSet(p.recentHosts())
 
 	for cert := range in {
 		if ctx.Err() != nil {
@@ -521,16 +542,7 @@ func (p *Pipeline) resolverHealthy() bool {
 // The queue is ordered by due time, so this takes the hosts that have waited
 // longest — no scan, and no part of the keyspace that the sweep never reaches.
 func (p *Pipeline) sweep(ctx context.Context, backlog chan<- store.Pending) {
-	limit := p.BackfillBatch
-	if limit <= 0 {
-		limit = 5000
-	}
-	lease := p.BackfillLease
-	if lease <= 0 {
-		lease = DefaultBackfillLease
-	}
-
-	pending, err := p.Store.PendingLease(time.Now().UTC(), limit, lease)
+	pending, err := p.Store.PendingLease(time.Now().UTC(), p.backfillBatch(), p.backfillLease())
 	if err != nil {
 		p.Log.Error("backfill sweep failed", "err", err)
 		return
@@ -598,14 +610,6 @@ func (p *Pipeline) wantsProbe(items []store.Pending) (map[string]bool, error) {
 // ever came of it.
 func (p *Pipeline) queuing() bool { return p.Backfill > 0 && !p.NoProbe }
 
-// deferBackoff is how long a host waits after its address turned it away.
-func (p *Pipeline) deferBackoff() time.Duration {
-	if p.DeferBackoff > 0 {
-		return p.DeferBackoff
-	}
-	return DefaultDeferBackoff
-}
-
 // sans applies the SAN policy: none when IgnoreSANs is set, otherwise the
 // first MaxSANs of them.
 func (p *Pipeline) sans(sans []string) []string {
@@ -651,29 +655,18 @@ func (p *Pipeline) stale(rec *store.Record) bool {
 }
 
 // recentSet is a bounded set of recently handled hosts. It exists to shed
-// duplicate work, so forgetting an entry early is harmless.
+// duplicate work, so forgetting an entry early is harmless: the store is the
+// real deduplicator, and a name this set has forgotten costs one read there.
 type recentSet struct {
-	mu    sync.Mutex
-	max   int
-	hosts map[string]struct{}
+	hosts *bounded.Map[string, struct{}]
 }
 
 func newRecentSet(max int) *recentSet {
-	return &recentSet{max: max, hosts: make(map[string]struct{}, max/4)}
+	return &recentSet{hosts: bounded.New[string, struct{}](max)}
 }
 
 // seen records host and reports whether it was already present.
 func (r *recentSet) seen(host string) bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if _, ok := r.hosts[host]; ok {
-		return true
-	}
-	if len(r.hosts) >= r.max {
-		// Cheapest possible eviction: start over. The set is an optimization,
-		// not a correctness boundary — the store is the real deduplicator.
-		r.hosts = make(map[string]struct{}, r.max/4)
-	}
-	r.hosts[host] = struct{}{}
-	return false
+	_, existed := r.hosts.GetOrPut(host, func() struct{} { return struct{}{} })
+	return existed
 }

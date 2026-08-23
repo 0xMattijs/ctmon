@@ -31,10 +31,7 @@ func TestIPLimiterStaysBounded(t *testing.T) {
 	for i := 0; i < 100; i++ {
 		l.allow(netip.AddrFrom4([4]byte{192, 0, 2, byte(i)}))
 	}
-	l.mu.Lock()
-	n := len(l.buckets)
-	l.mu.Unlock()
-	if n > 4 {
+	if n := l.buckets.Len(); n > 4 {
 		t.Errorf("table holds %d addresses, want at most its 4-address bound", n)
 	}
 }

@@ -9,6 +9,8 @@ import (
 	"net/netip"
 	"sync"
 	"time"
+
+	"github.com/mvo/ct/internal/bounded"
 )
 
 // Resolution happens before the fetch, on purpose.
@@ -123,7 +125,6 @@ type resolver struct {
 	timeout time.Duration
 	ttl     time.Duration // how long a good answer is kept
 	negTTL  time.Duration // how long a failure is kept
-	max     int
 	// retryTTL is how long a lookup that got no answer is remembered. It is
 	// short on purpose: the point is to stop a burst of names under one
 	// parent from re-asking a struggling resolver all at once, not to
@@ -140,8 +141,7 @@ type resolver struct {
 
 	health health
 
-	mu      sync.Mutex
-	entries map[string]*answer
+	entries *bounded.Map[string, *answer]
 }
 
 // answer is one cached lookup. A failed lookup is cached too: a name that does
@@ -173,8 +173,7 @@ func newResolver(servers []string, timeout, ttl, negTTL time.Duration, max, inFl
 		ttl:      ttl,
 		negTTL:   negTTL,
 		retryTTL: 5 * time.Second,
-		max:      max,
-		entries:  make(map[string]*answer, max/4),
+		entries:  bounded.New[string, *answer](max),
 	}
 	if inFlight > 0 {
 		res.slots = make(chan struct{}, inFlight)
@@ -231,25 +230,17 @@ func (r *resolver) lookup(ctx context.Context, host string) ([]netip.Addr, error
 }
 
 func (r *resolver) cached(host string, now time.Time) (*answer, bool) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	a, ok := r.entries[host]
+	a, ok := r.entries.Get(host)
 	if !ok || now.After(a.expires) {
 		return nil, false
 	}
 	return a, true
 }
 
+// store keeps an answer. The cache sheds work rather than deciding anything,
+// so an entry the table drops on its way past its ceiling costs one lookup.
 func (r *resolver) store(host string, a *answer) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if len(r.entries) >= r.max {
-		// The same eviction the recent-hosts filter uses: start over. The
-		// cache sheds work, it does not decide anything, so forgetting an
-		// entry early only costs one lookup.
-		r.entries = make(map[string]*answer, r.max/4)
-	}
-	r.entries[host] = a
+	r.entries.Put(host, a)
 }
 
 // usable filters a lookup down to the addresses this monitor may dial, which
