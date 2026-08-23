@@ -22,6 +22,10 @@ const (
 	// filter remembers. It is sized to hold a few minutes of intake, which
 	// is where the feeds' repetition lives.
 	DefaultRecentHosts = 50000
+	// DefaultWriters is how many goroutines write to the store.
+	DefaultWriters = 4
+	// DefaultBackfillBatch is how many pending hosts one sweep leases.
+	DefaultBackfillBatch = 5000
 	// DefaultWorkers is how many probes run at once.
 	//
 	// It was 16, which with a shared 20-per-second limit put the ceiling at
@@ -45,6 +49,55 @@ const (
 	// it away for being over budget.
 	DefaultDeferBackoff = 30 * time.Second
 )
+
+// Every default is applied here rather than where it is used, so the constant
+// above and the code honouring it stay in one place. They are methods rather
+// than a fill-in-the-struct pass because a Pipeline is driven from more than
+// one entry point — Run, and the sweep and probe paths a test can call on
+// their own — and each has to behave the same on a zero-valued field.
+
+func (p *Pipeline) workers() int {
+	if p.Workers > 0 {
+		return p.Workers
+	}
+	return DefaultWorkers
+}
+
+func (p *Pipeline) writers() int {
+	if p.Writers > 0 {
+		return p.Writers
+	}
+	return DefaultWriters
+}
+
+func (p *Pipeline) recentHosts() int {
+	if p.RecentHosts > 0 {
+		return p.RecentHosts
+	}
+	return DefaultRecentHosts
+}
+
+func (p *Pipeline) backfillBatch() int {
+	if p.BackfillBatch > 0 {
+		return p.BackfillBatch
+	}
+	return DefaultBackfillBatch
+}
+
+func (p *Pipeline) backfillLease() time.Duration {
+	if p.BackfillLease > 0 {
+		return p.BackfillLease
+	}
+	return DefaultBackfillLease
+}
+
+// deferBackoff is how long a host waits after its address turned it away.
+func (p *Pipeline) deferBackoff() time.Duration {
+	if p.DeferBackoff > 0 {
+		return p.DeferBackoff
+	}
+	return DefaultDeferBackoff
+}
 
 //go:embed skiplist.txt
 var defaultSkipList string

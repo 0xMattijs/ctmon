@@ -29,7 +29,8 @@ type Pipeline struct {
 
 	// Workers is the number of concurrent probes (default DefaultWorkers).
 	Workers int
-	// Writers is the number of goroutines writing to the store (default 4).
+	// Writers is the number of goroutines writing to the store (default
+	// DefaultWriters).
 	Writers int
 	// Reprobe re-fetches a known host when its last probe is older than
 	// this, which is how body-hash changes get noticed. Zero never
@@ -38,7 +39,8 @@ type Pipeline struct {
 	// Backfill is how often to sweep the store for hosts that were recorded
 	// but never probed. Zero disables the sweep.
 	Backfill time.Duration
-	// BackfillBatch caps how many pending hosts one sweep leases (default 5000).
+	// BackfillBatch caps how many pending hosts one sweep leases (default
+	// DefaultBackfillBatch).
 	BackfillBatch int
 	// BackfillLease is how long a leased host stays out of the queue before
 	// it becomes due again (default DefaultBackfillLease). It only matters
@@ -113,14 +115,7 @@ type nameSeen struct {
 // Run reads certificates from in until the channel closes or ctx is
 // cancelled, then returns once every queued write and probe has finished.
 func (p *Pipeline) Run(ctx context.Context, in <-chan source.Cert) {
-	workers := p.Workers
-	if workers <= 0 {
-		workers = DefaultWorkers
-	}
-	writers := p.Writers
-	if writers <= 0 {
-		writers = 4
-	}
+	workers, writers := p.workers(), p.writers()
 
 	// Two queues, not one. With a single queue the sweep filled it — 5,000
 	// hosts at a time, minutes to drain — so record's non-blocking send
@@ -176,11 +171,7 @@ func (p *Pipeline) Run(ctx context.Context, in <-chan source.Cert) {
 
 	// recent squashes the duplicate CNs the feeds emit within seconds of each
 	// other, so a burst does not cost one store read per copy.
-	recentHosts := p.RecentHosts
-	if recentHosts <= 0 {
-		recentHosts = DefaultRecentHosts
-	}
-	recent := newRecentSet(recentHosts)
+	recent := newRecentSet(p.recentHosts())
 
 	for cert := range in {
 		if ctx.Err() != nil {
@@ -521,16 +512,7 @@ func (p *Pipeline) resolverHealthy() bool {
 // The queue is ordered by due time, so this takes the hosts that have waited
 // longest — no scan, and no part of the keyspace that the sweep never reaches.
 func (p *Pipeline) sweep(ctx context.Context, backlog chan<- store.Pending) {
-	limit := p.BackfillBatch
-	if limit <= 0 {
-		limit = 5000
-	}
-	lease := p.BackfillLease
-	if lease <= 0 {
-		lease = DefaultBackfillLease
-	}
-
-	pending, err := p.Store.PendingLease(time.Now().UTC(), limit, lease)
+	pending, err := p.Store.PendingLease(time.Now().UTC(), p.backfillBatch(), p.backfillLease())
 	if err != nil {
 		p.Log.Error("backfill sweep failed", "err", err)
 		return
@@ -597,14 +579,6 @@ func (p *Pipeline) wantsProbe(items []store.Pending) (map[string]bool, error) {
 // hostname seen, for ever — at live rates some millions a day — while no probe
 // ever came of it.
 func (p *Pipeline) queuing() bool { return p.Backfill > 0 && !p.NoProbe }
-
-// deferBackoff is how long a host waits after its address turned it away.
-func (p *Pipeline) deferBackoff() time.Duration {
-	if p.DeferBackoff > 0 {
-		return p.DeferBackoff
-	}
-	return DefaultDeferBackoff
-}
 
 // sans applies the SAN policy: none when IgnoreSANs is set, otherwise the
 // first MaxSANs of them.
