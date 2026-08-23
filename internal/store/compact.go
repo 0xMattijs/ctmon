@@ -79,7 +79,7 @@ func (s *Store) CompactInPlace() (CompactResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	res := CompactResult{OldUsed: s.usedBytes()}
+	res := CompactResult{OldUsed: usedBytes(s.db)}
 	if info, err := os.Stat(s.path); err == nil {
 		res.OldBytes = info.Size()
 	}
@@ -139,7 +139,7 @@ func CompactTo(srcPath, dstPath string) (CompactResult, error) {
 	res.OldBytes = info.Size()
 	res.OldUsed = usedBytesAt(srcPath)
 
-	src, err := bolt.Open(srcPath, 0o600, readOnlyOptions(5*time.Second))
+	src, err := openReadOnly(srcPath, 5*time.Second)
 	if err != nil {
 		return res, fmt.Errorf("open %s: %w", srcPath, err)
 	}
@@ -178,13 +178,20 @@ func usedBytes(db *bolt.DB) int64 {
 	return n
 }
 
-// usedBytes reports how many bytes of pages this store holds.
-func (s *Store) usedBytes() int64 { return usedBytes(s.db) }
+// usedBytes reports how many bytes of pages this store holds. It takes the
+// handle lock, so a compaction cannot swap the file out from under the
+// measurement — CompactInPlace already holds that lock when it measures, and
+// calls the function above directly.
+func (s *Store) usedBytes() int64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return usedBytes(s.db)
+}
 
 // usedBytesAt opens a database read-only just to measure it. It returns 0 if
 // the file cannot be read, since this only ever feeds a progress report.
 func usedBytesAt(path string) int64 {
-	db, err := bolt.Open(path, 0o600, readOnlyOptions(5*time.Second))
+	db, err := openReadOnly(path, 5*time.Second)
 	if err != nil {
 		return 0
 	}

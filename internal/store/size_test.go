@@ -132,3 +132,131 @@ func TestStatsReportsTheFileSize(t *testing.T) {
 		t.Errorf("Used = %d, want between 0 and the %d byte file", st.Used, st.Bytes)
 	}
 }
+
+// scrambled writes a store and then zeroes everything after the meta pages,
+// leaving the length alone. The freelist bolt is told to read is inside the
+// file and is not a freelist, which is the damage a recover can do something
+// about; truncating instead would put pages outside the mapping, and reading
+// one of those is a SIGBUS that takes the process with it either way.
+func scrambled(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "scrambled.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	s.db.NoSync = true
+	s.db.MaxBatchDelay = 0
+	for i := 0; i < 2000; i++ {
+		host := fmt.Sprintf("host%d.example.com", i)
+		err := s.Update(host, func(r *Record, existed bool) bool {
+			r.FirstSeen, r.LastSeen = time.Now().UTC(), time.Now().UTC()
+			r.SeenCount = 1
+			return true
+		})
+		if err != nil {
+			t.Fatalf("update %s: %v", host, err)
+		}
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	f, err := os.OpenFile(path, os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	// Past the two meta pages, so bolt still finds the file and still
+	// believes what it says about where the freelist is.
+	from := int64(2 * os.Getpagesize())
+	if _, err := f.WriteAt(make([]byte, info.Size()-from), from); err != nil {
+		t.Fatalf("scramble: %v", err)
+	}
+	return path
+}
+
+// Loading the freelist at open moves a failure that used to surface on a
+// later read into the open itself, and bolt reports that one by panicking. A
+// command asked to report on a damaged file has to say so instead.
+func TestOpenReadOnlyReportsAnUnreadableFreelist(t *testing.T) {
+	path := scrambled(t)
+
+	s, err := OpenReadOnly(path)
+	if err == nil {
+		s.Close()
+		t.Fatalf("OpenReadOnly succeeded on a database with no readable freelist")
+	}
+	t.Logf("error: %v", err)
+}
+
+// usedBytesAt only ever feeds a progress report, and promises 0 for a file it
+// cannot read rather than taking the command down with it.
+func TestUsedBytesAtReportsZeroForAnUnreadableFreelist(t *testing.T) {
+	if n := usedBytesAt(scrambled(t)); n != 0 {
+		t.Errorf("usedBytesAt = %d, want 0", n)
+	}
+}
+
+// Stats measures through the same handle a compaction closes and replaces, so
+// the measurement has to take the lock the swap holds. Without it, a stats
+// call running alongside compactLoop races on the handle and, landing
+// mid-swap, measures a closed database as zero. Hold the lock and watch the
+// call wait for it.
+func TestUsedBytesWaitsForTheHandleLock(t *testing.T) {
+	s := open(t)
+	err := s.Update("only.example.com", func(r *Record, existed bool) bool {
+		r.FirstSeen, r.LastSeen = time.Now().UTC(), time.Now().UTC()
+		r.SeenCount = 1
+		return true
+	})
+	if err != nil {
+		t.Fatalf("update: %v", err)
+	}
+
+	s.mu.Lock()
+	measured := make(chan int64, 1)
+	go func() { measured <- s.usedBytes() }()
+
+	select {
+	case n := <-measured:
+		s.mu.Unlock()
+		t.Fatalf("usedBytes returned %d while the handle was locked", n)
+	case <-time.After(50 * time.Millisecond):
+	}
+	s.mu.Unlock()
+
+	if n := <-measured; n <= 0 {
+		t.Errorf("usedBytes = %d once the lock was free, want the pages it holds", n)
+	}
+}
+
+// The path a store was opened from can be replaced, or taken away, while the
+// handle goes on reading the file it holds. A size is not worth failing the
+// whole report over, and zero is not an answer.
+func TestStatsFallsBackWhenThePathIsGone(t *testing.T) {
+	s := open(t)
+	err := s.Update("only.example.com", func(r *Record, existed bool) bool {
+		r.FirstSeen, r.LastSeen = time.Now().UTC(), time.Now().UTC()
+		r.SeenCount = 1
+		return true
+	})
+	if err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if err := os.Remove(s.path); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+
+	st, err := s.Stats()
+	if err != nil {
+		t.Fatalf("stats: %v", err)
+	}
+	if st.Bytes <= 0 || st.Bytes < st.Used {
+		t.Errorf("Bytes = %d with %d in use, want the high-water mark", st.Bytes, st.Used)
+	}
+}

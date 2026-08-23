@@ -103,7 +103,7 @@ func Migrate(oldPath, newPath string) (MigrateResult, error) {
 	res.OldBytes = info.Size()
 	res.OldUsed = usedBytesAt(oldPath)
 
-	old, err := bolt.Open(oldPath, 0o600, readOnlyOptions(5*time.Second))
+	old, err := openReadOnly(oldPath, 5*time.Second)
 	if err != nil {
 		return res, fmt.Errorf("open %s: %w", oldPath, err)
 	}
