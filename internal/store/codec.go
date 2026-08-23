@@ -2,6 +2,7 @@ package store
 
 import (
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"strings"
 	"sync"
@@ -372,32 +373,21 @@ func appendString(dst []byte, s string) []byte {
 }
 
 // hexBytes decodes a 64-character hex digest into its 32 raw bytes.
+//
+// The length is checked here and not left to the callers, both of which
+// already check it: hex.Decode writes one byte per pair of input characters
+// without regard for how big the destination is, so a longer digest would run
+// off the end of the array rather than be reported.
 func hexBytes(s string) ([]byte, error) {
+	if len(s) != 64 {
+		return nil, fmt.Errorf("digest is %d characters, want 64", len(s))
+	}
 	out := make([]byte, 32)
-	for i := 0; i < 32; i++ {
-		hi, ok1 := hexVal(s[i*2])
-		lo, ok2 := hexVal(s[i*2+1])
-		if !ok1 || !ok2 {
-			return nil, fmt.Errorf("digest %q is not hex", s)
-		}
-		out[i] = hi<<4 | lo
+	if _, err := hex.Decode(out, []byte(s)); err != nil {
+		return nil, fmt.Errorf("digest %q is not hex: %w", s, err)
 	}
 	return out, nil
 }
-
-func hexVal(c byte) (byte, bool) {
-	switch {
-	case c >= '0' && c <= '9':
-		return c - '0', true
-	case c >= 'a' && c <= 'f':
-		return c - 'a' + 10, true
-	case c >= 'A' && c <= 'F':
-		return c - 'A' + 10, true
-	}
-	return 0, false
-}
-
-const hexDigits = "0123456789abcdef"
 
 // reader walks an encoded record. Past the end it yields zeroes and records an
 // error, so a truncated value cannot panic.
@@ -475,12 +465,7 @@ func (r *reader) hex(n int) string {
 	if raw == nil {
 		return ""
 	}
-	out := make([]byte, n*2)
-	for i, c := range raw {
-		out[i*2] = hexDigits[c>>4]
-		out[i*2+1] = hexDigits[c&0xf]
-	}
-	return string(out)
+	return hex.EncodeToString(raw)
 }
 
 // dict interns a small vocabulary — log URIs, issuers, error templates — into
