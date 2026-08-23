@@ -188,7 +188,7 @@ func (c *runConfig) logger() (*slog.Logger, *statusLine) {
 	return slog.New(slog.NewTextHandler(out, &slog.HandlerOptions{Level: level})), line
 }
 
-// prober builds the prober from the probe and resolver flags.
+// newProber builds the prober from the probe and resolver flags.
 func (c *runConfig) newProber() *probe.Prober {
 	p := c.prober
 	return probe.New(probe.Options{
