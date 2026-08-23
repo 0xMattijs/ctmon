@@ -558,15 +558,32 @@ func statsCmd(args []string) error {
 	})
 }
 
-// withStore opens the database, hands it to fn, and closes it again. The
-// read-only commands all want exactly this and nothing more.
+// withStore opens the database for reading, hands it to fn, and closes it
+// again. The read-only commands all want exactly this and nothing more.
+//
+// Reading is the whole contract: a path that names no database is an error
+// rather than an invitation to create one, and the handle takes no write lock
+// on the way past.
 func withStore(path string, fn func(*store.Store) error) error {
-	db, err := store.Open(path)
+	db, err := store.OpenReadOnly(path)
 	if err != nil {
-		return err
+		return readErr(path, err)
 	}
 	defer db.Close()
 	return fn(db)
+}
+
+// readErr says what to do about a database a run is holding. The store only
+// reports that someone has it; the way in is a snapshot, and whether one can
+// be asked for is a property of this build.
+func readErr(path string, err error) error {
+	if !errors.Is(err, store.ErrLocked) {
+		return err
+	}
+	if _, ok := snapshotSignal(); ok {
+		return fmt.Errorf("%w; send it %s and read the snapshot instead", err, snapshotSignalName)
+	}
+	return fmt.Errorf("%w; stop the run to read it", err)
 }
 
 // splitList reads a comma-separated flag into its entries, dropping the empty
