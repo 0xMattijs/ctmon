@@ -309,10 +309,17 @@ wildcards:  2154
 errors:     314
 changed:    0
 
-file size:  1.2 MiB
+file size:  2.0 MiB
+in use:     1.2 MiB
 per record: 57 B
 interned:   6 sources, 86 issuers, 29 error shapes
 ```
+
+The two sizes answer different questions. *File size* is what the file
+occupies, which is what a disk quota cares about. *In use* is what its pages
+hold: bolt grows the file in mmap-sized steps and keeps freed pages on a
+freelist for reuse, and neither counts toward this number. The gap between the
+two is room the store can fill without growing.
 
 ## How the pipeline handles load
 
@@ -762,11 +769,11 @@ off and run the command by hand instead.
 INFO compacted in_use="6.7 MiB" reclaimed="3.1 MiB" file="8.0 MiB" took=1.689s
 ```
 
-Two sizes are worth separating. *In use* is pages holding data; on a real
-141,818-record store compaction took it from 9.8 MiB to 6.7 MiB. *On disk* is
-bolt's mmap high-water mark, which doubles as the store grows and never
-shrinks — 16 MiB before, 8 MiB after. The file re-inflates as writes resume,
-which is why this is a schedule rather than a one-time fix.
+Two sizes are worth separating. *In use* is pages holding data, with the
+freelist left out; on a real 141,818-record store compaction took it from
+9.8 MiB to 6.7 MiB. *On disk* is the file, which bolt grows in mmap-sized
+steps and never shrinks — 16 MiB before, 8 MiB after. The file re-inflates as
+writes resume, which is why this is a schedule rather than a one-time fix.
 
 Raising bolt's `FillPercent` on the live path looks like the obvious way to
 avoid the slack in the first place. It does the opposite. `FillPercent` sets

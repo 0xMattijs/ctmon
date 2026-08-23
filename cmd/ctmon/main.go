@@ -543,8 +543,9 @@ func statsCmd(args []string) error {
 			fmt.Printf("waiting:    %s (oldest queued probe)\n", waited(st.Oldest))
 		}
 		fmt.Printf("\nfile size:  %s\n", humanBytes(st.Bytes))
+		fmt.Printf("in use:     %s\n", humanBytes(st.Used))
 		if st.Domains > 0 {
-			fmt.Printf("per record: %d B\n", st.Bytes/int64(st.Domains))
+			fmt.Printf("per record: %d B\n", st.Used/int64(st.Domains))
 		}
 		fmt.Printf("interned:   %d sources, %d issuers, %d error shapes\n",
 			st.Sources, st.Issuers, st.ErrorKind)
