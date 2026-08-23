@@ -582,13 +582,26 @@ func (d *dict) len() int {
 // hosts under example.com" a range scan instead of a full walk.
 //
 // reverseHost is its own inverse.
+//
+// It walks the labels backwards into one buffer rather than splitting and
+// rejoining, because it runs on every read, every write, and every step of
+// every walk of the store, and the slice of labels in between was pure
+// bookkeeping.
 func reverseHost(host string) string {
-	if !strings.Contains(host, ".") {
+	if strings.IndexByte(host, '.') < 0 {
 		return host
 	}
-	labels := strings.Split(host, ".")
-	for i, j := 0, len(labels)-1; i < j; i, j = i+1, j-1 {
-		labels[i], labels[j] = labels[j], labels[i]
+	var b strings.Builder
+	b.Grow(len(host))
+	end := len(host)
+	for i := len(host) - 1; i >= 0; i-- {
+		if host[i] != '.' {
+			continue
+		}
+		b.WriteString(host[i+1 : end])
+		b.WriteByte('.')
+		end = i
 	}
-	return strings.Join(labels, ".")
+	b.WriteString(host[:end])
+	return b.String()
 }
