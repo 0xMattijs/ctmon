@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/mvo/ct/internal/bounded"
 	"github.com/mvo/ct/internal/domain"
 	"github.com/mvo/ct/internal/probe"
 	"github.com/mvo/ct/internal/source"
@@ -654,29 +655,18 @@ func (p *Pipeline) stale(rec *store.Record) bool {
 }
 
 // recentSet is a bounded set of recently handled hosts. It exists to shed
-// duplicate work, so forgetting an entry early is harmless.
+// duplicate work, so forgetting an entry early is harmless: the store is the
+// real deduplicator, and a name this set has forgotten costs one read there.
 type recentSet struct {
-	mu    sync.Mutex
-	max   int
-	hosts map[string]struct{}
+	hosts *bounded.Map[string, struct{}]
 }
 
 func newRecentSet(max int) *recentSet {
-	return &recentSet{max: max, hosts: make(map[string]struct{}, max/4)}
+	return &recentSet{hosts: bounded.New[string, struct{}](max)}
 }
 
 // seen records host and reports whether it was already present.
 func (r *recentSet) seen(host string) bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if _, ok := r.hosts[host]; ok {
-		return true
-	}
-	if len(r.hosts) >= r.max {
-		// Cheapest possible eviction: start over. The set is an optimization,
-		// not a correctness boundary — the store is the real deduplicator.
-		r.hosts = make(map[string]struct{}, r.max/4)
-	}
-	r.hosts[host] = struct{}{}
-	return false
+	_, existed := r.hosts.GetOrPut(host, func() struct{} { return struct{}{} })
+	return existed
 }

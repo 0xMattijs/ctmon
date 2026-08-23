@@ -102,10 +102,7 @@ func TestResolverCacheStaysBounded(t *testing.T) {
 	for i := 0; i < 100; i++ {
 		r.store(string(rune('a'+i%26))+string(rune('a'+i/26)), &answer{expires: time.Now().Add(time.Minute)})
 	}
-	r.mu.Lock()
-	n := len(r.entries)
-	r.mu.Unlock()
-	if n > 8 {
+	if n := r.entries.Len(); n > 8 {
 		t.Errorf("cache holds %d entries, want at most its 8-entry bound", n)
 	}
 }
