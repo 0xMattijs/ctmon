@@ -70,9 +70,6 @@ func TestOpenReadOnlyReadsAnExistingStore(t *testing.T) {
 	if st.Logs["https://ct.example/logs/x"] != 9 {
 		t.Errorf("log positions = %v", st.Logs)
 	}
-	if st.Sources != 0 || st.Issuers != 0 {
-		t.Errorf("dictionaries = %d sources, %d issuers; want the stored ones", st.Sources, st.Issuers)
-	}
 }
 
 // The dictionaries have to survive the trip, because a record's source and
@@ -141,8 +138,8 @@ func TestOpenReadOnlyRefusesADatabaseAWriterHolds(t *testing.T) {
 		s.Close()
 		t.Fatal("OpenReadOnly on a held database succeeded; want an error")
 	}
-	if !strings.Contains(err.Error(), "SIGUSR1") {
-		t.Errorf("err = %v; want it to point at the snapshot", err)
+	if !errors.Is(err, ErrLocked) {
+		t.Errorf("err = %v; want ErrLocked", err)
 	}
 }
 
@@ -210,5 +207,75 @@ func TestOpenReadOnlyRefusesTheLegacyFormat(t *testing.T) {
 	}
 	if !errors.Is(err, ErrLegacyFormat) {
 		t.Errorf("err = %v; want ErrLegacyFormat", err)
+	}
+}
+
+// A database old enough to predate the format stamp has no meta bucket at
+// all. Migrate converts it, so it is a database of ours and has to be named
+// as one — an unreadable format, not an unrecognized file.
+func TestOpenReadOnlyRefusesALegacyDatabaseWithNoMetaBucket(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ancient.db")
+	db, err := bolt.Open(path, 0o600, &bolt.Options{Timeout: 5 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = db.Update(func(tx *bolt.Tx) error {
+		b, err := tx.CreateBucketIfNotExists(bucketDomains)
+		if err != nil {
+			return err
+		}
+		return b.Put([]byte("example.com"), []byte(`{"host":"example.com"}`))
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	s, err := OpenReadOnly(path)
+	if err == nil {
+		s.Close()
+		t.Fatal("OpenReadOnly on an unstamped legacy database succeeded; want an error")
+	}
+	if !errors.Is(err, ErrLegacyFormat) {
+		t.Errorf("err = %v; want ErrLegacyFormat", err)
+	}
+}
+
+// The same database with nothing in it is not legacy, only empty, and reading
+// it is fine.
+func TestOpenReadOnlyReadsAStoreWithOnlyTheDomainsBucket(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "bare.db")
+	db, err := bolt.Open(path, 0o600, &bolt.Options{Timeout: 5 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = db.Update(func(tx *bolt.Tx) error {
+		_, err := tx.CreateBucketIfNotExists(bucketDomains)
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	s, err := OpenReadOnly(path)
+	if err != nil {
+		t.Fatalf("OpenReadOnly: %v", err)
+	}
+	defer s.Close()
+
+	// Every read path over a bucket the handle could not create.
+	st, err := s.Stats()
+	if err != nil {
+		t.Fatalf("stats: %v", err)
+	}
+	if st.Domains != 0 || st.Pending != 0 || len(st.Logs) != 0 {
+		t.Errorf("stats = %+v; want an empty store", st)
+	}
+	if _, ok, err := s.LogPos("https://ct.example/logs/x"); err != nil || ok {
+		t.Errorf("LogPos = %v, %v; want no position and no error", ok, err)
+	}
+	if rec, err := s.Get("example.com"); err != nil || rec != nil {
+		t.Errorf("Get = %v, %v; want nil, nil", rec, err)
 	}
 }

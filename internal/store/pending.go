@@ -164,6 +164,8 @@ func (s *Store) PendingDone(keys ...[]byte) error {
 // older is probing that cannot keep up.
 func (s *Store) PendingStats() (count int, oldest time.Time, err error) {
 	err = s.view(func(tx *bolt.Tx) error {
+		// Absent only on a database a read-only handle opened without being
+		// able to create it. See OpenReadOnly.
 		b := tx.Bucket(bucketPending)
 		if b == nil {
 			return nil

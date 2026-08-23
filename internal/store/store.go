@@ -36,6 +36,11 @@ var ErrLegacyFormat = errors.New("database uses the old JSON record format; run 
 // ErrNoDatabase says the path does not name a database that already exists.
 var ErrNoDatabase = errors.New("no such database")
 
+// ErrLocked says another process holds the database. In practice that process
+// is a run, which keeps bolt's exclusive lock for as long as it lives. What to
+// do about it depends on the platform, so the command says that part.
+var ErrLocked = errors.New("database is held by another process")
+
 // Record is everything known about one discovered hostname.
 type Record struct {
 	Host string `json:"host"`
@@ -115,8 +120,7 @@ func Open(path string) (*Store, error) {
 // path should say so, not conjure an empty database and print zeros about it.
 //
 // The handle takes a shared lock, so it also refuses a database a run is
-// holding rather than waiting on it. Snapshot is the way in there, and the
-// error says so.
+// holding rather than waiting on it, with ErrLocked.
 func OpenReadOnly(path string) (*Store, error) {
 	switch fi, err := os.Stat(path); {
 	case errors.Is(err, fs.ErrNotExist):
@@ -134,19 +138,18 @@ func OpenReadOnly(path string) (*Store, error) {
 	db, err := bolt.Open(path, 0o600, &bolt.Options{ReadOnly: true, Timeout: time.Second})
 	if err != nil {
 		if errors.Is(err, bolt.ErrTimeout) {
-			return nil, fmt.Errorf("%s is locked by a running ctmon; send it SIGUSR1 and read the snapshot instead", path)
+			return nil, fmt.Errorf("%s: %w", path, ErrLocked)
 		}
 		return nil, fmt.Errorf("open %s: %w", path, err)
 	}
 	s := newStore(db, path)
 	err = db.View(func(tx *bolt.Tx) error {
-		// Open creates the four buckets; a read-only handle cannot. The two
-		// that identify a ctmon database have to be there already, because
-		// every read path takes them for granted.
-		for _, b := range [][]byte{bucketDomains, bucketMeta} {
-			if tx.Bucket(b) == nil {
-				return ErrNoDatabase
-			}
+		// Open creates the four buckets; a read-only handle cannot. Only
+		// domains says the file is a store of ours — a database old enough to
+		// predate the format stamp has no meta bucket either, and that is
+		// formatOf's business to report, not a reason to disown the file.
+		if tx.Bucket(bucketDomains) == nil {
+			return ErrNoDatabase
 		}
 		if _, err := formatOf(tx); err != nil {
 			return err
@@ -229,7 +232,14 @@ func checkFormat(tx *bolt.Tx) error {
 // It is checkFormat without the write, because a read-only handle has to make
 // the same judgement and cannot stamp anything.
 func formatOf(tx *bolt.Tx) (stamped bool, err error) {
-	switch v := tx.Bucket(bucketMeta).Get(keyFormat); {
+	// A database with no meta bucket at all predates the stamp too. Open
+	// creates the bucket before it asks, so only a read-only handle gets
+	// here with one missing.
+	var v []byte
+	if meta := tx.Bucket(bucketMeta); meta != nil {
+		v = meta.Get(keyFormat)
+	}
+	switch {
 	case v == nil:
 		if tx.Bucket(bucketDomains).Stats().KeyN > 0 {
 			return false, ErrLegacyFormat
@@ -438,6 +448,8 @@ func (s *Store) Stats() (Stats, error) {
 	}
 	err = s.view(func(tx *bolt.Tx) error {
 		st.Bytes = tx.Size()
+		// Absent only on a database a read-only handle opened without being
+		// able to create it. See OpenReadOnly.
 		b := tx.Bucket(bucketLogPos)
 		if b == nil {
 			return nil
@@ -463,7 +475,11 @@ func (s *Store) LogPos(uri string) (uint64, bool, error) {
 		ok  bool
 	)
 	err := s.view(func(tx *bolt.Tx) error {
-		v := tx.Bucket(bucketLogPos).Get([]byte(uri))
+		b := tx.Bucket(bucketLogPos)
+		if b == nil {
+			return nil
+		}
+		v := b.Get([]byte(uri))
 		if len(v) == 8 {
 			pos, ok = binary.BigEndian.Uint64(v), true
 		}

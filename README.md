@@ -286,8 +286,9 @@ $ ctmon stats --db ct.dbb
 error: ct.dbb: no such database
 ```
 
-`run`, `migrate`, and `compact` write, and `run` still creates the database on
-first use.
+`run` is the one command that writes to `--db`, and it still creates the
+database on first use. `migrate` and `compact` read `--db` and write to
+`--out`, leaving the original untouched.
 
 Useful `list` filters: `--with-hash`, `--wildcard`, `--changed`, `--since 1h`,
 `--under example.com`, `--limit N`, `--json` for JSON lines.
@@ -689,7 +690,7 @@ take conflicts with the writer's:
 
 ```console
 $ ctmon stats --db ct.db
-error: ct.db is locked by a running ctmon; send it SIGUSR1 and read the snapshot instead
+error: ct.db: database is held by another process; send it SIGUSR1 and read the snapshot instead
 ```
 
 Copying the file is not the answer either. `cp` reads it over several seconds
