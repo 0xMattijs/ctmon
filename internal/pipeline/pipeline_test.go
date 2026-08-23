@@ -401,6 +401,16 @@ func TestSweepReprobesStaleHosts(t *testing.T) {
 	}
 }
 
+// fixedResolver answers every lookup with the same address, so a test can
+// drive the per-address budget without a nameserver.
+type fixedResolver []netip.Addr
+
+func (r fixedResolver) Lookup(context.Context, string) ([]netip.Addr, error) {
+	return r, nil
+}
+
+func (fixedResolver) Healthy() bool { return true }
+
 // A deferred probe writes nothing about the host and puts it back on the queue
 // for later: nothing was asked, so there is nothing to record.
 func TestDeferredProbeRequeuesInsteadOfRecording(t *testing.T) {
@@ -409,9 +419,7 @@ func TestDeferredProbeRequeuesInsteadOfRecording(t *testing.T) {
 	rig.pipe.Prober = probe.New(probe.Options{
 		PerIPRPS:   1,
 		PerIPBurst: 1,
-		Lookup: func(context.Context, string) ([]netip.Addr, error) {
-			return []netip.Addr{netip.MustParseAddr("192.0.2.1")}, nil
-		},
+		Resolver:   fixedResolver{netip.MustParseAddr("192.0.2.1")},
 		DialContext: func(context.Context, string, string) (net.Conn, error) {
 			return nil, errors.New("dial refused by the test")
 		},

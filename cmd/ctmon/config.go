@@ -9,6 +9,7 @@ import (
 
 	"github.com/mvo/ct/internal/pipeline"
 	"github.com/mvo/ct/internal/probe"
+	"github.com/mvo/ct/internal/resolve"
 	"github.com/mvo/ct/internal/source"
 	"github.com/mvo/ct/internal/store"
 )
@@ -27,11 +28,12 @@ type runConfig struct {
 	compactEvery time.Duration
 	snapshot     string
 
-	feed   feedConfig
-	filter filterConfig
-	prober proberConfig
-	pipe   pipeConfig
-	output outputConfig
+	feed     feedConfig
+	filter   filterConfig
+	resolver resolverConfig
+	prober   proberConfig
+	pipe     pipeConfig
+	output   outputConfig
 }
 
 // feedConfig selects and paces the certificate sources.
@@ -60,7 +62,17 @@ type filterConfig struct {
 	maxSANs     int
 }
 
-// proberConfig governs the HTTPS fetch and the resolution in front of it.
+// resolverConfig governs name resolution, which the probes and the CT feed
+// share. It is its own group because it belongs to neither of them.
+type resolverConfig struct {
+	servers  string
+	timeout  time.Duration
+	ttl      time.Duration
+	negTTL   time.Duration
+	inFlight int
+}
+
+// proberConfig governs the HTTPS fetch.
 type proberConfig struct {
 	disabled     bool
 	rps          float64
@@ -68,11 +80,6 @@ type proberConfig struct {
 	timeout      time.Duration
 	dialTimeout  time.Duration
 	tlsTimeout   time.Duration
-	resolvers    string
-	resolveTO    time.Duration
-	dnsTTL       time.Duration
-	dnsNegTTL    time.Duration
-	resolveConc  int
 	maxBody      int64
 	verifyTLS    bool
 	allowPrivate bool
@@ -134,14 +141,16 @@ func (c *runConfig) bind(fs *flag.FlagSet) {
 	fs.DurationVar(&p.timeout, "probe-timeout", 6*time.Second, "per-probe timeout, end to end")
 	fs.DurationVar(&p.dialTimeout, "dial-timeout", 2*time.Second, "how long to wait for the TCP connect")
 	fs.DurationVar(&p.tlsTimeout, "tls-timeout", 3*time.Second, "how long to wait for the TLS handshake")
-	fs.StringVar(&p.resolvers, "resolvers", "", "nameservers to probe with, comma-separated host:port (default: the system's)")
-	fs.DurationVar(&p.resolveTO, "resolve-timeout", 2*time.Second, "how long to wait for a DNS answer")
-	fs.DurationVar(&p.dnsTTL, "dns-ttl", 5*time.Minute, "how long to cache a name that resolved")
-	fs.DurationVar(&p.dnsNegTTL, "dns-negative-ttl", 15*time.Minute, "how long to cache a name that did not resolve")
-	fs.IntVar(&p.resolveConc, "resolve-concurrency", 64, "how many DNS lookups may run at once")
 	fs.Int64Var(&p.maxBody, "max-body", 2<<20, "bytes of body to read and hash")
 	fs.BoolVar(&p.verifyTLS, "verify-tls", false, "verify TLS certificates when probing")
 	fs.BoolVar(&p.allowPrivate, "allow-private", false, "probe hosts that resolve to loopback, RFC 1918, or other non-public addresses")
+
+	r := &c.resolver
+	fs.StringVar(&r.servers, "resolvers", "", "nameservers to use, comma-separated host:port (default: the system's)")
+	fs.DurationVar(&r.timeout, "resolve-timeout", resolve.DefaultTimeout, "how long to wait for a DNS answer")
+	fs.DurationVar(&r.ttl, "dns-ttl", resolve.DefaultTTL, "how long to cache a name that resolved")
+	fs.DurationVar(&r.negTTL, "dns-negative-ttl", resolve.DefaultNegativeTTL, "how long to cache a name that did not resolve")
+	fs.IntVar(&r.inFlight, "resolve-concurrency", resolve.DefaultMaxInFlight, "how many DNS lookups may run at once")
 
 	n := &c.pipe
 	fs.IntVar(&n.workers, "workers", pipeline.DefaultWorkers, "concurrent HTTPS probes")
@@ -188,8 +197,24 @@ func (c *runConfig) logger() (*slog.Logger, *statusLine) {
 	return slog.New(slog.NewTextHandler(out, &slog.HandlerOptions{Level: level})), line
 }
 
-// newProber builds the prober from the probe and resolver flags.
-func (c *runConfig) newProber() *probe.Prober {
+// newResolver builds the resolver the probes and the CT feed share.
+//
+// One resolver, not two. Probing saturates DNS, and a feed left on the system
+// resolver queues behind its own probes: on a live run that surfaced as
+// "get-sth: ... server misbehaving" and stopped the feed outright.
+func (c *runConfig) newResolver() *resolve.Resolver {
+	r := c.resolver
+	return resolve.New(resolve.Options{
+		Servers:     splitList(r.servers),
+		Timeout:     r.timeout,
+		TTL:         r.ttl,
+		NegativeTTL: r.negTTL,
+		MaxInFlight: r.inFlight,
+	})
+}
+
+// newProber builds the prober from the probe flags, over the shared resolver.
+func (c *runConfig) newProber(res probe.Resolver) *probe.Prober {
 	p := c.prober
 	return probe.New(probe.Options{
 		Timeout:           p.timeout,
@@ -200,15 +225,11 @@ func (c *runConfig) newProber() *probe.Prober {
 		PerIPRPS:          p.perIPRPS,
 		// Zero means "use the default" for every other option here, so
 		// turning the per-address budget off has to say so separately.
-		NoPerIPLimit:   p.perIPRPS == 0,
-		Resolvers:      splitList(p.resolvers),
-		ResolveTimeout: p.resolveTO,
-		MaxLookups:     p.resolveConc,
-		DNSTTL:         p.dnsTTL,
-		DNSNegativeTTL: p.dnsNegTTL,
-		VerifyTLS:      p.verifyTLS,
-		AllowPrivate:   p.allowPrivate,
-		UserAgent:      c.userAgent,
+		NoPerIPLimit: p.perIPRPS == 0,
+		Resolver:     res,
+		VerifyTLS:    p.verifyTLS,
+		AllowPrivate: p.allowPrivate,
+		UserAgent:    c.userAgent,
 	})
 }
 

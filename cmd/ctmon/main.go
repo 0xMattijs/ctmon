@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/mvo/ct/internal/pipeline"
+	"github.com/mvo/ct/internal/resolve"
 	"github.com/mvo/ct/internal/source"
 	"github.com/mvo/ct/internal/store"
 )
@@ -98,8 +99,19 @@ func runCmd(args []string) error {
 	}
 	defer db.Close()
 
-	prober := cfg.newProber()
-	feeds, err := buildSources(cfg.feed, cfg.userAgent, db, log, prober.TrustedDialContext)
+	// One resolver, shared. The feed dials through it so that a run probing
+	// hard enough to saturate DNS does not starve its own source of
+	// certificates.
+	//
+	// The feed's dialer carries no address filter, unlike the prober's. That
+	// guard exists because anyone can have a certificate issued for a name
+	// pointing at 127.0.0.1 and would otherwise aim this monitor at its own
+	// machine. A CT log URL came from --logs or from the log list, which is
+	// the operator's own configuration: refusing a log on their own network
+	// would break an ordinary setup to guard against themselves.
+	resolver := cfg.newResolver()
+	prober := cfg.newProber(resolver)
+	feeds, err := buildSources(cfg.feed, cfg.userAgent, db, log, resolve.Dialer(resolver, nil, nil))
 	if err != nil {
 		return err
 	}

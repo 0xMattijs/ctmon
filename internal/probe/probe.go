@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"golang.org/x/time/rate"
+
+	"github.com/mvo/ct/internal/resolve"
 )
 
 // DeferReason says why a probe did not happen.
@@ -43,23 +45,28 @@ type Result struct {
 	DeferReason DeferReason
 }
 
+// Resolver is the name resolution a Prober needs. *resolve.Resolver is the
+// implementation; the interface is here so that resolution can be shared,
+// wrapped, or faked without this package owning it.
+//
+// Healthy belongs beside Lookup because the two answers are only useful
+// together: whether to believe a failed lookup depends on whether the resolver
+// is answering at all, and nothing but the resolver knows that.
+type Resolver interface {
+	Lookup(ctx context.Context, host string) ([]netip.Addr, error)
+	Healthy() bool
+}
+
 // Prober fetches sites politely: bounded concurrency, a global rate limit,
 // hard timeouts, and a cap on how much body it will read.
 type Prober struct {
 	client  *http.Client
 	limiter *rate.Limiter // optional overall ceiling; nil when unset
 	ips     *ipLimiter
-	// lookup resolves a name, or is nil when something else owns resolution:
-	// a caller-supplied DialContext resolves for itself, and the per-address
+	// res resolves names, or is nil when something else owns resolution: a
+	// caller-supplied DialContext resolves for itself, and the per-address
 	// budget goes with it.
-	lookup func(ctx context.Context, host string) ([]netip.Addr, error)
-	// dial is the transport's dialer, kept so callers outside this package
-	// can reach the network the same way probes do. trustedDial is the same
-	// but without the public-address refusal, for destinations the operator
-	// configured rather than ones a certificate named.
-	dial         func(ctx context.Context, network, addr string) (net.Conn, error)
-	trustedDial  func(ctx context.Context, network, addr string) (net.Conn, error)
-	resolver     *resolver
+	res          Resolver
 	allowPrivate bool
 	userAgent    string
 	maxBody      int64
@@ -132,25 +139,14 @@ type Options struct {
 	// means "use the default", the way every other option here does, so
 	// turning the budget off needs to say so.
 	NoPerIPLimit bool
-	// Resolvers are the nameservers to ask, as host:port. Empty uses the
-	// system's, which on a machine running a local forwarder means every
-	// lookup queues behind one process; naming real upstreams here is what
-	// lets the worker count rise.
-	Resolvers []string
-	// ResolveTimeout bounds one lookup (default 2s).
-	ResolveTimeout time.Duration
-	// DNSTTL is how long a good lookup is cached (default 5m), DNSNegativeTTL
-	// how long a failed one is (default 15m), and MaxDNSEntries how many are
-	// held (default 131072).
-	DNSTTL         time.Duration
-	DNSNegativeTTL time.Duration
-	MaxDNSEntries  int
-	// MaxLookups bounds how many lookups run at once (default 64). It is
-	// deliberately far below the worker count: the workers wait on sockets,
-	// but their lookups usually land on one local forwarder, and a forwarder
-	// asked several hundred questions at once answers some of them with
-	// failures. Lookups over the bound wait their turn.
-	MaxLookups int
+	// Resolver resolves the names being probed. Share one across everything
+	// in a process that makes lookups: probing saturates DNS, and a feed left
+	// on the system resolver starves behind it.
+	//
+	// Leave it nil and a Prober builds a private one with resolve's defaults,
+	// unless DialContext is also set — a supplied dialer brings its own
+	// resolution, and the per-address budget that depends on it goes too.
+	Resolver Resolver
 	// MaxRedirects is how many redirects to follow (default 3).
 	MaxRedirects int
 	// VerifyTLS validates certificates. It is off by default: the point is
@@ -171,12 +167,9 @@ type Options struct {
 	// A dialer supplied here brings its own policy: AllowPrivate applies to
 	// the built-in dialer, which is the only one that sees resolved
 	// addresses before connecting. Supplying one also turns off the lookup
-	// step and the per-address budget that depends on it, unless Lookup says
-	// otherwise.
+	// step and the per-address budget that depends on it, unless Resolver
+	// says otherwise.
 	DialContext func(ctx context.Context, network, addr string) (net.Conn, error)
-	// Lookup overrides name resolution. Leave it nil for normal use; it
-	// exists so tests can resolve without a nameserver.
-	Lookup func(ctx context.Context, host string) ([]netip.Addr, error)
 }
 
 // New builds a Prober. The returned Prober is safe for concurrent use.
@@ -208,21 +201,6 @@ func New(opts Options) *Prober {
 	if opts.MaxIPs <= 0 {
 		opts.MaxIPs = 1 << 16
 	}
-	if opts.ResolveTimeout <= 0 {
-		opts.ResolveTimeout = 2 * time.Second
-	}
-	if opts.DNSTTL <= 0 {
-		opts.DNSTTL = 5 * time.Minute
-	}
-	if opts.DNSNegativeTTL <= 0 {
-		opts.DNSNegativeTTL = 15 * time.Minute
-	}
-	if opts.MaxDNSEntries <= 0 {
-		opts.MaxDNSEntries = 1 << 17
-	}
-	if opts.MaxLookups <= 0 {
-		opts.MaxLookups = 64
-	}
 	if opts.MaxRedirects <= 0 {
 		opts.MaxRedirects = 3
 	}
@@ -231,41 +209,36 @@ func New(opts Options) *Prober {
 	}
 
 	base := opts.DialContext
-	trustedBase := opts.DialContext
 	if base == nil {
 		d := &net.Dialer{
 			Timeout:   opts.DialTimeout,
 			KeepAlive: 15 * time.Second,
 		}
-		trusted := *d
 		if !opts.AllowPrivate {
 			d.Control = refusePrivate
 		}
-		base, trustedBase = d.DialContext, trusted.DialContext
+		base = d.DialContext
 	}
 	p := &Prober{
-		resolver:     newResolver(opts.Resolvers, opts.ResolveTimeout, opts.DNSTTL, opts.DNSNegativeTTL, opts.MaxDNSEntries, opts.MaxLookups),
+		res:          opts.Resolver,
 		allowPrivate: opts.AllowPrivate,
 		userAgent:    opts.UserAgent,
 		maxBody:      opts.MaxBody,
 	}
+	// A supplied DialContext brings its own policy, resolution included, so a
+	// Prober given one and no resolver does not resolve at all.
+	if p.res == nil && opts.DialContext == nil {
+		p.res = resolve.New(resolve.Options{})
+	}
 	if !opts.NoPerIPLimit {
 		p.ips = newIPLimiter(opts.PerIPRPS, opts.PerIPBurst, opts.MaxIPs)
-	}
-	switch {
-	case opts.Lookup != nil:
-		p.lookup = opts.Lookup
-	case opts.DialContext == nil:
-		p.lookup = p.resolver.lookup
 	}
 	if opts.RequestsPerSecond > 0 {
 		p.limiter = rate.NewLimiter(rate.Limit(opts.RequestsPerSecond), opts.Burst)
 	}
-	// A supplied DialContext brings its own policy, resolution included, so
-	// leave it alone; the cache only fronts the built-in dialer.
 	dial := base
-	if p.lookup != nil {
-		dial = p.dialer(base)
+	if p.res != nil {
+		dial = resolve.Dialer(p.res, base, p.addressPolicy())
 	}
 	// Keepalives are off on purpose. A probe makes one request per host and
 	// the hosts almost never repeat, so a pool would only hold thousands of
@@ -278,12 +251,6 @@ func New(opts Options) *Prober {
 		TLSHandshakeTimeout:   opts.TLSTimeout,
 		ResponseHeaderTimeout: opts.Timeout,
 		DisableKeepAlives:     true,
-	}
-	p.dial = dial
-	p.trustedDial = trustedBase
-	if p.lookup != nil {
-		// Same cache, same lookups; only the address policy differs.
-		p.trustedDial = p.trustingDialer(trustedBase)
 	}
 	p.client = &http.Client{
 		Transport: tr,
@@ -358,21 +325,21 @@ func (p *Prober) Probe(ctx context.Context, host string) Result {
 // makes a name that does not exist cheap. It costs a DNS round trip, usually
 // none at all, against the full dial timeout it used to hold a worker for.
 func (p *Prober) reserve(ctx context.Context, host string) (Result, bool) {
-	if p.lookup == nil {
+	if p.res == nil {
 		return Result{}, true
 	}
-	addrs, err := p.lookup(ctx, host)
+	addrs, err := p.res.Lookup(ctx, host)
 	if err != nil {
 		// A failed lookup is put off only while the resolver is failing
 		// generally. Once it is answering again, a name that still will not
 		// resolve is a fact about the name — record it, or the host comes
 		// back on every sweep for as long as the database exists.
-		if transientDNS(err) && !p.resolver.health.reliable() {
+		if resolve.TransientErr(err) && !p.res.Healthy() {
 			return Result{Deferred: true, DeferReason: DeferNoAnswer}, false
 		}
 		return Result{Err: err}, false
 	}
-	addrs = usable(addrs, p.allowPrivate)
+	addrs = resolve.Allowed(addrs, p.addressPolicy())
 	if len(addrs) == 0 {
 		return Result{Err: fmt.Errorf("%w: %s resolves only to non-public addresses", ErrPrivateAddress, host)}, false
 	}
@@ -383,3 +350,18 @@ func (p *Prober) reserve(ctx context.Context, host string) (Result, bool) {
 	}
 	return Result{}, true
 }
+
+// addressPolicy is the filter deciding which resolved addresses a probe may
+// dial. It is nil — everything goes — only when AllowPrivate is set.
+func (p *Prober) addressPolicy() func(netip.Addr) bool {
+	if p.allowPrivate {
+		return nil
+	}
+	return public
+}
+
+// ResolverHealthy reports whether lookups are coming back with answers often
+// enough to be worth making. A caller handing out probes uses it to stop
+// feeding work that cannot be done. A Prober that does not resolve — one given
+// a dialer of its own — is never held back by it.
+func (p *Prober) ResolverHealthy() bool { return p.res == nil || p.res.Healthy() }
