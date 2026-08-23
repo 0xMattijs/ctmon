@@ -228,30 +228,6 @@ func requireLegacy(db *bolt.DB, path string) error {
 	})
 }
 
-// usedBytes reports how many bytes of pages a database holds.
-func usedBytes(db *bolt.DB) int64 {
-	var n int64
-	_ = db.View(func(tx *bolt.Tx) error {
-		n = tx.Size()
-		return nil
-	})
-	return n
-}
-
-// usedBytes reports how many bytes of pages this store holds.
-func (s *Store) usedBytes() int64 { return usedBytes(s.db) }
-
-// usedBytesAt opens a database read-only just to measure it. It returns 0 if
-// the file cannot be read, since this only ever feeds a progress report.
-func usedBytesAt(path string) int64 {
-	db, err := bolt.Open(path, 0o600, &bolt.Options{ReadOnly: true, Timeout: 5 * time.Second})
-	if err != nil {
-		return 0
-	}
-	defer db.Close()
-	return usedBytes(db)
-}
-
 // putAll writes records in one transaction. It is only used by migration,
 // where the records are already complete and need no read-modify-write.
 //
@@ -293,57 +269,4 @@ func (s *Store) putAll(recs []*Record) error {
 		f.d.confirm(f.id)
 	}
 	return nil
-}
-
-// CompactResult reports what a compaction reclaimed.
-type CompactResult struct {
-	OldUsed  int64
-	NewUsed  int64
-	OldBytes int64
-	NewBytes int64
-}
-
-// Compact rewrites a store into a new file with full pages.
-//
-// Live writes arrive in random key order, so bolt splits leaves at half full
-// and the file drifts toward twice the size it needs. Compaction replays the
-// whole tree in key order into fresh, full pages. The source is only read.
-func Compact(srcPath, dstPath string) (CompactResult, error) {
-	var res CompactResult
-
-	if _, err := os.Stat(dstPath); err == nil {
-		return res, fmt.Errorf("%s already exists", dstPath)
-	} else if !os.IsNotExist(err) {
-		return res, err
-	}
-	info, err := os.Stat(srcPath)
-	if err != nil {
-		return res, err
-	}
-	res.OldBytes = info.Size()
-	res.OldUsed = usedBytesAt(srcPath)
-
-	src, err := bolt.Open(srcPath, 0o600, &bolt.Options{ReadOnly: true, Timeout: 5 * time.Second})
-	if err != nil {
-		return res, fmt.Errorf("open %s: %w", srcPath, err)
-	}
-	defer src.Close()
-
-	dst, err := bolt.Open(dstPath, 0o600, &bolt.Options{Timeout: 5 * time.Second})
-	if err != nil {
-		return res, fmt.Errorf("create %s: %w", dstPath, err)
-	}
-	if err := bolt.Compact(dst, src, compactTxSize); err != nil {
-		dst.Close()
-		return res, fmt.Errorf("compact: %w", err)
-	}
-	if err := dst.Close(); err != nil {
-		return res, err
-	}
-
-	if info, err := os.Stat(dstPath); err == nil {
-		res.NewBytes = info.Size()
-	}
-	res.NewUsed = usedBytesAt(dstPath)
-	return res, nil
 }

@@ -215,7 +215,7 @@ func TestCompactShrinksARandomlyWrittenStore(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	res, err := Compact(path, filepath.Join(dir, "packed.db"))
+	res, err := CompactTo(path, filepath.Join(dir, "packed.db"))
 	if err != nil {
 		t.Fatalf("compact: %v", err)
 	}
@@ -258,7 +258,7 @@ func TestCompactRefusesExistingTarget(t *testing.T) {
 	}
 	s.Close()
 
-	if _, err := Compact(path, path); err == nil {
+	if _, err := CompactTo(path, path); err == nil {
 		t.Error("compact overwrote an existing file")
 	}
 }

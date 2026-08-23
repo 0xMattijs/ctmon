@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -190,7 +191,7 @@ func TestCompactShrinksAndKeepsEverything(t *testing.T) {
 	}
 	before := s.usedBytes()
 
-	res, err := s.Compact()
+	res, err := s.CompactInPlace()
 	if err != nil {
 		t.Fatalf("compact: %v", err)
 	}
@@ -272,10 +273,36 @@ func TestCompactUnderConcurrentUse(t *testing.T) {
 	}
 
 	for i := 0; i < 3; i++ {
-		if _, err := s.Compact(); err != nil {
+		if _, err := s.CompactInPlace(); err != nil {
 			t.Fatalf("compact %d: %v", i, err)
 		}
 	}
 	close(stop)
 	wg.Wait()
+}
+
+// A compaction that cannot even open its destination must not leave the file
+// bolt created on its way to failing. CompactTo refuses a destination that
+// already exists, so a stub left behind fails every retry after it — and the
+// disk being full is both the reason the open fails and the reason someone is
+// compacting in the first place.
+func TestCompactLeavesNoFileWhenItCannotOpenTheDestination(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "dst.db")
+	// Not a bolt database, so opening it fails after the file is already there.
+	if err := os.WriteFile(path, []byte("not a bolt database"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	src, err := Open(filepath.Join(t.TempDir(), "src.db"))
+	if err != nil {
+		t.Fatalf("open source: %v", err)
+	}
+	defer src.Close()
+
+	if _, err := compactInto(path, src.db); err == nil {
+		t.Fatal("want an error opening a destination that is not a database")
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("the failed compaction left %s behind; a retry would refuse it", path)
+	}
 }

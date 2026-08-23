@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/mvo/ct/internal/pipeline"
+	"github.com/mvo/ct/internal/resolve"
 	"github.com/mvo/ct/internal/source"
 	"github.com/mvo/ct/internal/store"
 )
@@ -98,8 +99,20 @@ func runCmd(args []string) error {
 	}
 	defer db.Close()
 
-	prober := cfg.newProber()
-	feeds, err := buildSources(cfg.feed, cfg.userAgent, db, log, prober.TrustedDialContext)
+	// One resolver, shared. The feed dials through it so that a run probing
+	// hard enough to saturate DNS does not starve its own source of
+	// certificates.
+	//
+	// The feed's dialer carries no address filter, unlike the prober's. That
+	// guard exists because anyone can have a certificate issued for a name
+	// pointing at 127.0.0.1 and would otherwise aim this monitor at its own
+	// machine. A CT log URL came from --logs or from the log list, which is
+	// the operator's own configuration: refusing a log on their own network
+	// would break an ordinary setup to guard against themselves.
+	resolver := cfg.newResolver()
+	prober := cfg.newProber(resolver)
+	feedDial := resolve.Dialer(resolver, cfg.feed.dialer(), nil)
+	feeds, err := buildSources(cfg.feed, cfg.userAgent, db, log, feedDial)
 	if err != nil {
 		return err
 	}
@@ -210,7 +223,9 @@ func buildSources(cfg feedConfig, userAgent string, db *store.Store, log *slog.L
 
 	var feeds []source.Source
 	if want["certstream"] {
-		feeds = append(feeds, &source.Certstream{URL: cfg.certURL, UserAgent: userAgent, Log: log})
+		feeds = append(feeds, &source.Certstream{
+			URL: cfg.certURL, UserAgent: userAgent, Dial: dial, Log: log,
+		})
 	}
 	if want["ctlog"] {
 		uris := splitList(cfg.logURIs)
@@ -259,7 +274,7 @@ func compactLoop(ctx context.Context, every time.Duration, db *store.Store, log 
 			return
 		case <-t.C:
 			start := time.Now()
-			res, err := db.Compact()
+			res, err := db.CompactInPlace()
 			if err != nil {
 				log.Error("compaction failed", "err", err)
 				continue
@@ -490,7 +505,7 @@ func compactCmd(args []string) error {
 	}
 
 	start := time.Now()
-	res, err := store.Compact(*dbPath, dst)
+	res, err := store.CompactTo(*dbPath, dst)
 	if err != nil {
 		return err
 	}

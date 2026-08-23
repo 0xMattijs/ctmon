@@ -44,9 +44,7 @@ func TestProbeDefersWhenTheAddressIsOverBudget(t *testing.T) {
 	p := New(Options{
 		PerIPRPS:   1,
 		PerIPBurst: 1,
-		Lookup: func(context.Context, string) ([]netip.Addr, error) {
-			return []netip.Addr{addr}, nil
-		},
+		Resolver:   &fakeResolver{addrs: []netip.Addr{addr}, healthy: true},
 		DialContext: func(context.Context, string, string) (net.Conn, error) {
 			dials++
 			return nil, errors.New("dial refused by the test")
@@ -77,9 +75,7 @@ func TestPerIPLimitCanBeTurnedOff(t *testing.T) {
 	addr := netip.MustParseAddr("192.0.2.1")
 	p := New(Options{
 		NoPerIPLimit: true,
-		Lookup: func(context.Context, string) ([]netip.Addr, error) {
-			return []netip.Addr{addr}, nil
-		},
+		Resolver:     &fakeResolver{addrs: []netip.Addr{addr}, healthy: true},
 		DialContext: func(context.Context, string, string) (net.Conn, error) {
 			return nil, errors.New("dial refused by the test")
 		},

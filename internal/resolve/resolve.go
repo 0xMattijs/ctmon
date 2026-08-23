@@ -1,4 +1,13 @@
-package probe
+// Package resolve provides a caching DNS front end and a dialer that uses it.
+//
+// It is its own package because two unrelated parts of the monitor need the
+// same resolver, and they need it to be the *same* one. Probing saturates DNS:
+// left on the system resolver, a run fetching hundreds of hosts a second
+// starves its own certificate feed of lookups, which surfaces as
+// "get-sth: ... server misbehaving" and stops the feed entirely. Sharing one
+// cache and one in-flight bound between the feed and the probes is what stops
+// that, and neither of them is the right owner of the thing they share.
+package resolve
 
 import (
 	"context"
@@ -25,10 +34,48 @@ import (
 // The cache is also what makes a resolved address available to the dialer, so
 // a probe resolves a name exactly once no matter how many addresses it tries.
 
-// ErrNoAddress reports a name that resolved to nothing this monitor may fetch.
+// ErrNoAddress reports a name that resolved to nothing the caller may dial.
 var ErrNoAddress = errors.New("no usable address")
 
-// transientDNS reports whether a lookup failed for a reason that says nothing
+// Defaults for Options. They are exported so that whoever renders them as
+// command-line flags names one value rather than a second copy of it.
+const (
+	// DefaultTimeout bounds one lookup.
+	DefaultTimeout = 2 * time.Second
+	// DefaultTTL is how long a good answer is kept.
+	DefaultTTL = 5 * time.Minute
+	// DefaultNegativeTTL is how long a failed one is kept.
+	DefaultNegativeTTL = 15 * time.Minute
+	// DefaultMaxEntries is how many answers are held.
+	DefaultMaxEntries = 1 << 17
+	// DefaultMaxInFlight bounds how many lookups run at once. It is
+	// deliberately far below a prober's worker count: the workers wait on
+	// sockets, but their lookups usually land on one local forwarder, and a
+	// forwarder asked several hundred questions at once answers some of them
+	// with failures. Lookups over the bound wait their turn.
+	DefaultMaxInFlight = 64
+	// DefaultDialTimeout bounds the TCP connect of the dialer Dialer builds
+	// when given no base of its own.
+	DefaultDialTimeout = 10 * time.Second
+)
+
+// retryTTL is how long a lookup that got no answer is remembered. It is short
+// on purpose: the point is to stop a burst of names under one parent from
+// re-asking a struggling resolver all at once, not to remember a non-answer.
+const retryTTL = 5 * time.Second
+
+// DialFunc is the shape of net.Dialer's DialContext, which is what an
+// http.Transport wants and what this package hands back.
+type DialFunc func(ctx context.Context, network, addr string) (net.Conn, error)
+
+// Lookuper is the part of a Resolver that Dialer needs. Taking the smaller
+// interface is what lets a caller wrap or fake resolution without also having
+// to answer for the health of a resolver it does not own.
+type Lookuper interface {
+	Lookup(ctx context.Context, host string) ([]netip.Addr, error)
+}
+
+// TransientErr reports whether a lookup failed for a reason that says nothing
 // about the name.
 //
 // The difference matters more than it looks. "No such host" is an answer: the
@@ -39,7 +86,7 @@ var ErrNoAddress = errors.New("no usable address")
 // record would put a claim about the host in the store that nobody ever
 // checked, and caching them would spread it to every name under the same
 // parent.
-func transientDNS(err error) bool {
+func TransientErr(err error) bool {
 	var dns *net.DNSError
 	if errors.As(err, &dns) {
 		return !dns.IsNotFound
@@ -119,24 +166,34 @@ func (h *health) reliable() bool {
 	return h.answered/total >= healthMinRate
 }
 
-// resolver is a caching DNS front end. It is safe for concurrent use.
-type resolver struct {
+// Options configure a Resolver. Every zero field takes the matching Default
+// above.
+type Options struct {
+	// Servers are the nameservers to ask, as host:port. Empty uses the
+	// system's, which on a machine running a local forwarder means every
+	// lookup queues behind one process; naming real upstreams here is what
+	// lets a prober's worker count rise.
+	Servers []string
+	// Timeout bounds one lookup.
+	Timeout time.Duration
+	// TTL is how long a good answer is cached, NegativeTTL how long a failed
+	// one is, and MaxEntries how many are held.
+	TTL         time.Duration
+	NegativeTTL time.Duration
+	MaxEntries  int
+	// MaxInFlight bounds how many lookups run at once.
+	MaxInFlight int
+}
+
+// Resolver is a caching DNS front end. It is safe for concurrent use.
+type Resolver struct {
 	net     *net.Resolver
 	timeout time.Duration
 	ttl     time.Duration // how long a good answer is kept
 	negTTL  time.Duration // how long a failure is kept
-	// retryTTL is how long a lookup that got no answer is remembered. It is
-	// short on purpose: the point is to stop a burst of names under one
-	// parent from re-asking a struggling resolver all at once, not to
-	// remember a non-answer.
-	retryTTL time.Duration
-	// slots bounds how many lookups are in flight. Probing concurrency and
-	// resolver concurrency are different numbers: hundreds of workers can
-	// wait on sockets happily, while the thing answering their DNS is often
-	// one local forwarder that starts returning failures rather than answers
-	// when too many questions arrive at once. Queueing here turns that into
-	// waiting, which costs a moment; the alternative is a timeout recorded
-	// against a host that was never asked about.
+	// slots bounds how many lookups are in flight. Queueing here turns too
+	// much concurrency into waiting, which costs a moment; the alternative is
+	// a timeout recorded against a host that was never asked about.
 	slots chan struct{}
 
 	health health
@@ -152,37 +209,49 @@ type answer struct {
 	expires time.Time
 }
 
-// newResolver builds a caching resolver. servers, when given, are the
-// nameservers to ask, as host:port; empty means the system's own, read from
-// resolv.conf by Go's resolver rather than by libc.
-func newResolver(servers []string, timeout, ttl, negTTL time.Duration, max, inFlight int) *resolver {
+// New builds a caching resolver.
+func New(opts Options) *Resolver {
+	if opts.Timeout <= 0 {
+		opts.Timeout = DefaultTimeout
+	}
+	if opts.TTL <= 0 {
+		opts.TTL = DefaultTTL
+	}
+	if opts.NegativeTTL <= 0 {
+		opts.NegativeTTL = DefaultNegativeTTL
+	}
+	if opts.MaxEntries <= 0 {
+		opts.MaxEntries = DefaultMaxEntries
+	}
+	if opts.MaxInFlight <= 0 {
+		opts.MaxInFlight = DefaultMaxInFlight
+	}
+
+	// PreferGo reads resolv.conf in Go rather than going through libc, which
+	// is what makes Dial below reachable at all.
 	r := &net.Resolver{PreferGo: true}
-	if len(servers) > 0 {
-		// Spread the queries over the configured servers. One local
-		// forwarder answering every lookup is the first thing to fall over
-		// when the worker count goes up.
-		pool := append([]string(nil), servers...)
-		d := &net.Dialer{Timeout: timeout}
+	if len(opts.Servers) > 0 {
+		// Spread the queries over the configured servers. One local forwarder
+		// answering every lookup is the first thing to fall over when the
+		// worker count goes up.
+		pool := append([]string(nil), opts.Servers...)
+		d := &net.Dialer{Timeout: opts.Timeout}
 		r.Dial = func(ctx context.Context, network, _ string) (net.Conn, error) {
 			return d.DialContext(ctx, network, pool[rand.IntN(len(pool))])
 		}
 	}
-	res := &resolver{
-		net:      r,
-		timeout:  timeout,
-		ttl:      ttl,
-		negTTL:   negTTL,
-		retryTTL: 5 * time.Second,
-		entries:  bounded.New[string, *answer](max),
+	return &Resolver{
+		net:     r,
+		timeout: opts.Timeout,
+		ttl:     opts.TTL,
+		negTTL:  opts.NegativeTTL,
+		slots:   make(chan struct{}, opts.MaxInFlight),
+		entries: bounded.New[string, *answer](opts.MaxEntries),
 	}
-	if inFlight > 0 {
-		res.slots = make(chan struct{}, inFlight)
-	}
-	return res
 }
 
-// lookup returns the addresses for host, from the cache when it can.
-func (r *resolver) lookup(ctx context.Context, host string) ([]netip.Addr, error) {
+// Lookup returns the addresses for host, from the cache when it can.
+func (r *Resolver) Lookup(ctx context.Context, host string) ([]netip.Addr, error) {
 	now := time.Now()
 	if a, ok := r.cached(host, now); ok {
 		return a.addrs, a.err
@@ -215,13 +284,13 @@ func (r *resolver) lookup(ctx context.Context, host string) ([]netip.Addr, error
 
 	// "No such host" counts as an answer: the resolver did its job and the
 	// name does not exist.
-	r.health.observe(err == nil || !transientDNS(err))
+	r.health.observe(err == nil || !TransientErr(err))
 
 	ttl := r.ttl
 	switch {
 	case err == nil:
-	case transientDNS(err):
-		ttl = r.retryTTL
+	case TransientErr(err):
+		ttl = retryTTL
 	default:
 		ttl = r.negTTL
 	}
@@ -229,7 +298,13 @@ func (r *resolver) lookup(ctx context.Context, host string) ([]netip.Addr, error
 	return addrs, err
 }
 
-func (r *resolver) cached(host string, now time.Time) (*answer, bool) {
+// Healthy reports whether lookups are coming back with answers often enough to
+// be worth making. It is false when the resolver is failing generally, which is
+// a caller's cue to stop asking for a while rather than to keep feeding work
+// that cannot be done.
+func (r *Resolver) Healthy() bool { return r.health.reliable() }
+
+func (r *Resolver) cached(host string, now time.Time) (*answer, bool) {
 	a, ok := r.entries.Get(host)
 	if !ok || now.After(a.expires) {
 		return nil, false
@@ -239,38 +314,22 @@ func (r *resolver) cached(host string, now time.Time) (*answer, bool) {
 
 // store keeps an answer. The cache sheds work rather than deciding anything,
 // so an entry the table drops on its way past its ceiling costs one lookup.
-func (r *resolver) store(host string, a *answer) {
+func (r *Resolver) store(host string, a *answer) {
 	r.entries.Put(host, a)
 }
 
-// usable filters a lookup down to the addresses this monitor may dial, which
-// unless AllowPrivate is set means the ones out on the public internet.
-func usable(addrs []netip.Addr, allowPrivate bool) []netip.Addr {
-	if allowPrivate {
-		return addrs
-	}
-	out := addrs[:0:0]
-	for _, a := range addrs {
-		if public(a) {
-			out = append(out, a)
-		}
-	}
-	return out
-}
-
-// dialer returns a DialContext that dials the addresses already in the cache
+// Dialer returns a DialContext that dials the addresses already in r's cache
 // rather than resolving the name a second time. A redirect to a host nobody
 // has looked at yet resolves here, and lands in the same cache.
-func (p *Prober) dialer(base func(ctx context.Context, network, addr string) (net.Conn, error)) func(context.Context, string, string) (net.Conn, error) {
-	return p.cachedDialer(base, false)
-}
-
-// trustingDialer is dialer without the public-address filter.
-func (p *Prober) trustingDialer(base func(ctx context.Context, network, addr string) (net.Conn, error)) func(context.Context, string, string) (net.Conn, error) {
-	return p.cachedDialer(base, true)
-}
-
-func (p *Prober) cachedDialer(base func(ctx context.Context, network, addr string) (net.Conn, error), trusted bool) func(context.Context, string, string) (net.Conn, error) {
+//
+// base is what actually opens the connection; nil means an ordinary dialer with
+// a DefaultDialTimeout connect timeout. allow, when non-nil, decides which
+// resolved addresses may be dialled at all — this package has no opinion on
+// that, because who may be dialled depends on where the hostname came from.
+func Dialer(r Lookuper, base DialFunc, allow func(netip.Addr) bool) DialFunc {
+	if base == nil {
+		base = (&net.Dialer{Timeout: DefaultDialTimeout, KeepAlive: 30 * time.Second}).DialContext
+	}
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
 		host, port, err := net.SplitHostPort(addr)
 		if err != nil {
@@ -279,11 +338,11 @@ func (p *Prober) cachedDialer(base func(ctx context.Context, network, addr strin
 		if _, err := netip.ParseAddr(host); err == nil {
 			return base(ctx, network, addr)
 		}
-		addrs, err := p.lookup(ctx, host)
+		addrs, err := r.Lookup(ctx, host)
 		if err != nil {
 			return nil, err
 		}
-		addrs = usable(addrs, p.allowPrivate || trusted)
+		addrs = Allowed(addrs, allow)
 		if len(addrs) == 0 {
 			return nil, fmt.Errorf("%w for %s", ErrNoAddress, host)
 		}
@@ -302,30 +361,17 @@ func (p *Prober) cachedDialer(base func(ctx context.Context, network, addr strin
 	}
 }
 
-// DialContext returns the prober's dialer: the same resolution, cache, and
-// public-address policy the probes use.
-func (p *Prober) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
-	return p.dial(ctx, network, addr)
+// Allowed filters a lookup down to the addresses allow accepts. A nil allow
+// accepts everything.
+func Allowed(addrs []netip.Addr, allow func(netip.Addr) bool) []netip.Addr {
+	if allow == nil {
+		return addrs
+	}
+	out := addrs[:0:0]
+	for _, a := range addrs {
+		if allow(a) {
+			out = append(out, a)
+		}
+	}
+	return out
 }
-
-// TrustedDialContext is DialContext without the public-address refusal, for
-// hosts the operator named rather than hosts a stranger's certificate did.
-//
-// The refusal exists because anyone can get a certificate for a name pointing
-// at 127.0.0.1 and would otherwise aim this monitor at its own machine. That
-// reasoning does not reach a CT log URL from --logs or a log list on the
-// operator's own network: refusing those would break a perfectly ordinary
-// setup to guard against the operator's own configuration.
-//
-// It still shares the resolver and its cache, which is the part the feed
-// actually needs — without it the feed resolves through the system resolver
-// and gets starved by the probing it is supposed to be feeding.
-func (p *Prober) TrustedDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
-	return p.trustedDial(ctx, network, addr)
-}
-
-// ResolverHealthy reports whether lookups are coming back with answers often
-// enough to be worth making. It is false when the resolver is failing
-// generally, which is the monitor's cue to stop asking for a while rather than
-// to keep feeding work that cannot be done.
-func (p *Prober) ResolverHealthy() bool { return p.resolver.health.reliable() }
