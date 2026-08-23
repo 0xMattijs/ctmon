@@ -125,13 +125,20 @@ func runCmd(args []string) error {
 	// store of a couple of million records it runs for the best part of a
 	// minute, and until the handler exists a Ctrl-C during it kills the
 	// process outright.
-	if !cfg.prober.disabled {
+	//
+	// It is skipped outright when nothing sweeps the queue. Seeding is a walk
+	// of every record that writes a queue entry for each one that wants a
+	// probe, and with no sweep to take them out again that is minutes of work
+	// to grow the store by millions of entries nothing will ever read.
+	if pipe.Queuing() {
 		if err := seedPending(ctx, db, pipe, log); err != nil {
 			return err
 		}
 		if ctx.Err() != nil {
 			return nil
 		}
+	} else if !cfg.prober.disabled {
+		log.Info("backfill is off: hosts are probed as they arrive and none are queued")
 	}
 
 	certs := make(chan source.Cert, 1024)

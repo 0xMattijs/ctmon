@@ -587,12 +587,21 @@ queue:
   address's budget comes back in `30s`; a re-probe comes back after
   `--reprobe`. Both are the same mechanism as a first probe, just later.
 - **Nothing is dropped by dying.** Hosts handed to a prober are *leased* rather
-  than deleted: the entry stays, hidden, until `--backfill-lease` (default five
+  than deleted: the entry stays, hidden, until `--backfill-lease` (default 30
   minutes) runs out. Finish the probe and it goes; kill the process mid-probe
   and the host comes back on its own.
 
 `--backfill 0` turns the sweep off, and with it the queue: nothing would ever
-take entries out, so nothing puts them in.
+take entries out, so nothing puts them in. Probing still happens, on names as
+they arrive:
+
+- A discovery is recorded and handed straight to a prober.
+- A probe its address turns away is dropped rather than queued. The `throttled`
+  and `unresolved` counters are the only trace.
+- A re-probe is never scheduled, so `--reprobe` only reaches hosts a later
+  certificate names again.
+- Startup skips filling the queue from existing records, which is otherwise a
+  walk of the whole store.
 
 Re-probing rides on the same queue. A finished probe schedules the next one,
 and because that leaves every host probed before `--reprobe` was set out of the

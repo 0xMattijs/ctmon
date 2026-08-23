@@ -391,7 +391,7 @@ func (p *Pipeline) record(ctx context.Context, n nameSeen, freshQueue chan<- str
 			r.Issuer = n.cert.Issuer
 		}
 		wantProbe = !p.NoProbe && (!r.Probed || p.stale(r))
-		if !wantProbe || !p.queuing() {
+		if !wantProbe || !p.Queuing() {
 			return true, time.Time{}
 		}
 		return true, due
@@ -471,6 +471,12 @@ func (p *Pipeline) probe(ctx context.Context, host string) bool {
 		} else {
 			p.stats.Throttled.Add(1)
 		}
+		if !p.Queuing() {
+			// Nothing drains the queue, so an entry written here would sit
+			// in it for ever. The host is dropped instead; the counter above
+			// is what says so.
+			return false
+		}
 		if err := p.Store.Enqueue(host, time.Now().UTC().Add(p.deferBackoff())); err != nil {
 			p.storeErr("requeue failed", "host", host, "err", err)
 			return false
@@ -488,7 +494,7 @@ func (p *Pipeline) probe(ctx context.Context, host string) bool {
 	// its due time has to be fixed before the transaction for the same reason
 	// record's does.
 	var requeue time.Time
-	if p.Reprobe > 0 && !p.NoProbe {
+	if p.Reprobe > 0 && p.Queuing() {
 		requeue = probedAt.Add(p.Reprobe)
 	}
 	err := p.Store.UpdateWithQueue(host, func(r *store.Record, existed bool) (bool, time.Time) {
@@ -644,11 +650,16 @@ func (p *Pipeline) wantsProbe(items []store.Pending) (map[string]bool, error) {
 	return want, nil
 }
 
-// queuing reports whether the pending queue is in use. Without a sweep nothing
+// Queuing reports whether the pending queue is in use. Without a sweep nothing
 // ever takes entries out of it, so writing them would grow the bucket by every
 // hostname seen, for ever — at live rates some millions a day — while no probe
 // ever came of it.
-func (p *Pipeline) queuing() bool { return p.Backfill > 0 && !p.NoProbe }
+//
+// Every write to the queue goes through this first: recording a discovery,
+// putting off a probe its address turned away, and scheduling a re-probe. It
+// is exported because seeding the queue at startup is the fourth, and that one
+// lives in the command.
+func (p *Pipeline) Queuing() bool { return p.Backfill > 0 && !p.NoProbe }
 
 // sans applies the SAN policy: none when IgnoreSANs is set, otherwise the
 // first MaxSANs of them.
