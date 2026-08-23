@@ -330,7 +330,7 @@ func (p *Pipeline) record(ctx context.Context, n nameSeen, freshQueue chan<- str
 			r.Issuer = n.cert.Issuer
 		}
 		wantProbe = !p.NoProbe && (!r.Probed || p.stale(r))
-		if !wantProbe {
+		if !wantProbe || !p.queuing() {
 			return true, time.Time{}
 		}
 		return true, due
@@ -370,10 +370,17 @@ func (p *Pipeline) record(ctx context.Context, n nameSeen, freshQueue chan<- str
 // point leaves a lease that expires, so the host comes round again rather than
 // going missing.
 func (p *Pipeline) probeQueued(ctx context.Context, item store.Pending) {
-	p.probe(ctx, item.Host)
+	settled := p.probe(ctx, item.Host)
 	if ctx.Err() != nil {
 		// The run is stopping and this host may not have been fetched. Leave
 		// the lease to expire rather than dropping work that was never done.
+		return
+	}
+	if !settled {
+		// The result never reached the store, so the record still says
+		// unprobed. Releasing the lease here would drop the host from the
+		// queue as well, and nothing would ever look at it again. Let the
+		// lease run out instead.
 		return
 	}
 	// A deferred probe has already queued the host afresh, so the lease goes
@@ -388,10 +395,14 @@ func (p *Pipeline) probeQueued(ctx context.Context, item store.Pending) {
 // A host turned away by its address's budget is queued again and nothing is
 // written down: nothing was asked of it, so there is nothing to record, and a
 // probe error would be a claim about the host that is not true.
-func (p *Pipeline) probe(ctx context.Context, host string) {
+//
+// It reports whether the host is settled — either its result is in the store,
+// or it has been queued afresh. A caller holding a lease must keep it when
+// this is false.
+func (p *Pipeline) probe(ctx context.Context, host string) bool {
 	res := p.Prober.Probe(ctx, host)
 	if ctx.Err() != nil {
-		return
+		return false
 	}
 	if res.Deferred {
 		if res.DeferReason == probe.DeferNoAnswer {
@@ -401,8 +412,9 @@ func (p *Pipeline) probe(ctx context.Context, host string) {
 		}
 		if err := p.Store.Enqueue(host, time.Now().UTC().Add(p.deferBackoff())); err != nil {
 			p.Log.Error("requeue failed", "host", host, "err", err)
+			return false
 		}
-		return
+		return true
 	}
 	p.stats.Probed.Add(1)
 	if res.Err != nil {
@@ -444,7 +456,7 @@ func (p *Pipeline) probe(ctx context.Context, host string) {
 	})
 	if err != nil {
 		p.Log.Error("store write failed", "host", host, "err", err)
-		return
+		return false
 	}
 
 	switch {
@@ -457,6 +469,7 @@ func (p *Pipeline) probe(ctx context.Context, host string) {
 		p.Log.Debug("probed", "host", host, "status", res.Status,
 			"size", res.Size, "sha256", res.Hash)
 	}
+	return true
 }
 
 // sweepLoop periodically hands the probers hosts from the store's pending
@@ -526,21 +539,20 @@ func (p *Pipeline) sweep(ctx context.Context, backlog chan<- store.Pending) {
 		return
 	}
 
-	queued, stale := 0, 0
+	// The fast path leaves an entry behind for every discovery it probes
+	// itself, so most of a batch is usually already done. Sort that out in one
+	// read and one delete rather than a transaction per host: a 5,000-host
+	// batch was costing some ten thousand of them every sweep.
+	want, err := p.wantsProbe(pending)
+	if err != nil {
+		p.Log.Error("store read failed", "err", err)
+		return
+	}
+	var done [][]byte
+	queued := 0
 	for _, item := range pending {
-		// The fast path may have probed this host already, and a host that
-		// has been probed and is not yet stale wants nothing. Dropping those
-		// here is what keeps the queue from growing an entry per discovery.
-		want, err := p.wantsProbe(item.Host)
-		if err != nil {
-			p.Log.Error("store read failed", "host", item.Host, "err", err)
-			continue
-		}
-		if !want {
-			stale++
-			if err := p.Store.PendingDone(item.Key); err != nil {
-				p.Log.Error("release pending failed", "host", item.Host, "err", err)
-			}
+		if !want[item.Host] {
+			done = append(done, item.Key)
 			continue
 		}
 		select {
@@ -548,21 +560,43 @@ func (p *Pipeline) sweep(ctx context.Context, backlog chan<- store.Pending) {
 			queued++
 			p.stats.Backfilled.Add(1)
 		case <-ctx.Done():
+			// Hand back what has not been sent. The rest keep their leases
+			// and come round again.
+			if err := p.Store.PendingDone(done...); err != nil {
+				p.Log.Error("release pending failed", "err", err)
+			}
 			return
 		}
 	}
-	p.Log.Info("backfill sweep", "queued", queued, "already_done", stale)
+	if err := p.Store.PendingDone(done...); err != nil {
+		p.Log.Error("release pending failed", "err", err)
+	}
+	p.Log.Info("backfill sweep", "queued", queued, "already_done", len(done))
 }
 
-// wantsProbe reports whether the stored host still needs fetching. A host
-// whose record has gone wants nothing: it was deleted, not forgotten.
-func (p *Pipeline) wantsProbe(host string) (bool, error) {
-	rec, err := p.Store.Get(host)
-	if err != nil || rec == nil {
-		return false, err
+// wantsProbe reports which of these hosts still need fetching. A host whose
+// record has gone wants nothing: it was deleted, not forgotten.
+func (p *Pipeline) wantsProbe(items []store.Pending) (map[string]bool, error) {
+	hosts := make([]string, 0, len(items))
+	for _, it := range items {
+		hosts = append(hosts, it.Host)
 	}
-	return !rec.Probed || p.stale(rec), nil
+	recs, err := p.Store.GetAll(hosts)
+	if err != nil {
+		return nil, err
+	}
+	want := make(map[string]bool, len(recs))
+	for host, rec := range recs {
+		want[host] = !rec.Probed || p.stale(rec)
+	}
+	return want, nil
 }
+
+// queuing reports whether the pending queue is in use. Without a sweep nothing
+// ever takes entries out of it, so writing them would grow the bucket by every
+// hostname seen, for ever — at live rates some millions a day — while no probe
+// ever came of it.
+func (p *Pipeline) queuing() bool { return p.Backfill > 0 && !p.NoProbe }
 
 // deferBackoff is how long a host waits after its address turned it away.
 func (p *Pipeline) deferBackoff() time.Duration {

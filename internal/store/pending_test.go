@@ -1,6 +1,7 @@
 package store
 
 import (
+	"errors"
 	"fmt"
 	"path/filepath"
 	"testing"
@@ -217,7 +218,7 @@ func TestSeedPendingFillsTheQueueOnce(t *testing.T) {
 		}
 		return r.FirstSeen, true
 	}
-	queued, ran, err := db.SeedPending(due, nil)
+	queued, ran, err := db.SeedPending("gen1", due, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -227,7 +228,7 @@ func TestSeedPendingFillsTheQueueOnce(t *testing.T) {
 
 	// Running again does nothing: the queue is now the record of what is
 	// owed, and re-seeding would duplicate every entry still in it.
-	queued, ran, err = db.SeedPending(due, nil)
+	queued, ran, err = db.SeedPending("gen1", due, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -250,7 +251,7 @@ func TestSeedPendingSpansChunks(t *testing.T) {
 		}
 	}
 
-	queued, _, err := db.SeedPending(
+	queued, _, err := db.SeedPending("gen1",
 		func(r *Record) (time.Time, bool) { return r.FirstSeen, true }, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -260,5 +261,102 @@ func TestSeedPendingSpansChunks(t *testing.T) {
 	}
 	if got, _, err := db.PendingStats(); err != nil || got != n {
 		t.Errorf("queue holds %d entries (err %v), want %d", got, err, n)
+	}
+}
+
+// Changing the re-probe policy changes which records belong in the queue, so
+// the store has to be seeded again. Without this, turning --reprobe on never
+// reaches the records that were already there when it was off.
+func TestSeedRunsAgainWhenThePolicyChanges(t *testing.T) {
+	db := openTemp(t)
+	probed := time.Now().UTC().Add(-time.Hour)
+	err := db.Update("done.test", func(r *Record, _ bool) bool {
+		r.Probed, r.ProbedAt, r.FirstSeen = true, probed, probed
+		return true
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// No re-probing: a host already probed wants nothing.
+	noReprobe := func(r *Record) (time.Time, bool) {
+		if r.Probed {
+			return time.Time{}, false
+		}
+		return r.FirstSeen, true
+	}
+	if queued, _, err := db.SeedPending("reprobe=0", noReprobe, nil); err != nil || queued != 0 {
+		t.Fatalf("seed queued %d (err %v), want none", queued, err)
+	}
+
+	// Turn re-probing on, and the same record is now owed one.
+	withReprobe := func(r *Record) (time.Time, bool) {
+		if r.Probed {
+			return r.ProbedAt.Add(time.Minute), true
+		}
+		return r.FirstSeen, true
+	}
+	queued, ran, err := db.SeedPending("reprobe=1m", withReprobe, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ran || queued != 1 {
+		t.Errorf("seed queued %d (ran=%v), want the probed host re-queued", queued, ran)
+	}
+	// And it does not run a third time for the same policy.
+	if _, ran, err := db.SeedPending("reprobe=1m", withReprobe, nil); err != nil || ran {
+		t.Errorf("seed ran again for an unchanged policy (err %v)", err)
+	}
+}
+
+// An interrupted seed picks up where it stopped. Walking from the top again
+// would queue every host the first attempt had already queued.
+func TestSeedResumesFromWhereItStopped(t *testing.T) {
+	db := openTemp(t)
+	defer func(orig int) { seedChunk = orig }(seedChunk)
+	seedChunk = 10
+
+	const n = 30
+	for i := 0; i < n; i++ {
+		host := fmt.Sprintf("h%03d.test", i)
+		if err := db.Update(host, func(r *Record, _ bool) bool { return true }); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Stop part way through, the way a killed process does: the chunks
+	// already committed stay, and so does the cursor.
+	func() {
+		defer func() { _ = recover() }()
+		chunks := 0
+		db.SeedPending("gen1",
+			func(r *Record) (time.Time, bool) { return r.FirstSeen, true },
+			func(int, int) {
+				if chunks++; chunks >= 2 {
+					panic(errors.New("killed"))
+				}
+			})
+	}()
+
+	// Resuming must not re-queue what the first pass already did.
+	before, _, err := db.PendingStats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	queued, ran, err := db.SeedPending("gen1",
+		func(r *Record) (time.Time, bool) { return r.FirstSeen, true }, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ran {
+		t.Fatal("seed did not resume")
+	}
+	total, _, err := db.PendingStats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != n {
+		t.Errorf("queue holds %d entries after resuming (%d before, %d added), want %d with no duplicates",
+			total, before, queued, n)
 	}
 }

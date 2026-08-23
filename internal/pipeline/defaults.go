@@ -31,9 +31,16 @@ const (
 	// by how many sockets and lookups are in flight, not by cores.
 	DefaultWorkers = 256
 	// DefaultBackfillLease is how long a host handed to a prober stays out of
-	// the pending queue. It only has to outlast a probe; the cost of setting
-	// it too short is fetching something twice.
-	DefaultBackfillLease = 5 * time.Minute
+	// the pending queue.
+	//
+	// It has to outlast the whole batch, not one probe: a sweep leases up to
+	// BackfillBatch hosts at once and they wait their turn in memory, so with
+	// 5,000 of them a five-minute lease expired on anything slower than 17
+	// hosts a second and the next sweep handed the same work out again. The
+	// cost of setting it long is that a host lost to a killed process waits
+	// this long to come back; the cost of setting it short is fetching things
+	// twice while already behind.
+	DefaultBackfillLease = 30 * time.Minute
 	// DefaultDeferBackoff is how long a host waits after its address turned
 	// it away for being over budget.
 	DefaultDeferBackoff = 30 * time.Second

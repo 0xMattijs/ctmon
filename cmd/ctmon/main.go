@@ -92,7 +92,7 @@ func runCmd(args []string) error {
 		writers   = fs.Int("writers", 4, "concurrent store writers")
 		backfill  = fs.Duration("backfill", 10*time.Second, "how often to take hosts off the pending queue (0 disables)")
 		bfBatch   = fs.Int("backfill-batch", 5000, "maximum hosts leased per sweep")
-		bfLease   = fs.Duration("backfill-lease", pipeline.DefaultBackfillLease, "how long a host handed to a prober stays off the pending queue")
+		bfLease   = fs.Duration("backfill-lease", pipeline.DefaultBackfillLease, "how long a host handed to a prober stays off the pending queue; must outlast a whole --backfill-batch")
 		reprobe   = fs.Duration("reprobe", 0, "re-probe a known host after this long (0 disables)")
 		skipSfx   = fs.String("skip-suffix", "", "extra parent domains to drop, comma-separated, e.g. workers.dev,pages.dev")
 		skipFile  = fs.String("skip-suffix-file", "", "file of extra parent domains to drop, one per line (# comments allowed)")
@@ -105,7 +105,7 @@ func runCmd(args []string) error {
 		maxSANs   = fs.Int("max-sans", 0, "maximum SANs to read from one certificate (0 = all)")
 		noProbe   = fs.Bool("no-probe", false, "record domains without fetching them")
 		probeRPS  = fs.Float64("probe-rps", 100, "ceiling on HTTPS probes per second across all workers, which is what bounds NAT state on the way out (0 = no limit)")
-		ipRPS     = fs.Float64("probe-rps-per-ip", 32, "HTTPS probes per second to one destination address")
+		ipRPS     = fs.Float64("probe-rps-per-ip", 32, "HTTPS probes per second to one destination address (0 = no per-address limit)")
 		timeout   = fs.Duration("probe-timeout", 6*time.Second, "per-probe timeout, end to end")
 		dialTO    = fs.Duration("dial-timeout", 2*time.Second, "how long to wait for the TCP connect")
 		tlsTO     = fs.Duration("tls-timeout", 3*time.Second, "how long to wait for the TLS handshake")
@@ -167,6 +167,7 @@ func runCmd(args []string) error {
 		MaxBody:           *maxBody,
 		RequestsPerSecond: *probeRPS,
 		PerIPRPS:          *ipRPS,
+		NoPerIPLimit:      *ipRPS == 0,
 		Resolvers:         splitList(*resolves),
 		ResolveTimeout:    *dnsTO,
 		MaxLookups:        *dnsConc,
@@ -178,7 +179,7 @@ func runCmd(args []string) error {
 	})
 
 	feeds, err := buildSources(*sources, *csURL, *logURIs, *listURL, *fromTop,
-		*batch, *maxLag, *poll, *logRPS, *ua, db, log, prober.DialContext)
+		*batch, *maxLag, *poll, *logRPS, *ua, db, log, prober.TrustedDialContext)
 	if err != nil {
 		return err
 	}
@@ -204,14 +205,21 @@ func runCmd(args []string) error {
 		RecentHosts:   *recent,
 	}
 
-	if !*noProbe {
-		if err := seedPending(db, pipe, log); err != nil {
-			return err
-		}
-	}
-
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// Seeding comes after the signal handler is installed, not before: on a
+	// store of a couple of million records it runs for the best part of a
+	// minute, and until the handler exists a Ctrl-C during it kills the
+	// process outright.
+	if !*noProbe {
+		if err := seedPending(ctx, db, pipe, log); err != nil {
+			return err
+		}
+		if ctx.Err() != nil {
+			return nil
+		}
+	}
 
 	certs := make(chan source.Cert, 1024)
 
@@ -688,22 +696,30 @@ func splitList(raw string) []string {
 	return out
 }
 
-// seedPending fills the pending queue from a database written before the queue
-// existed. It runs once per database and walks every record, which on a large
-// store takes a while and is worth saying so.
-func seedPending(db *store.Store, pipe *pipeline.Pipeline, log *slog.Logger) error {
+// seedPending fills the pending queue from records it does not yet know about.
+// It walks every record, which on a large store takes a while and is worth
+// saying so.
+func seedPending(ctx context.Context, db *store.Store, pipe *pipeline.Pipeline, log *slog.Logger) error {
 	start := time.Now()
 	var last time.Time
 	queued, ran, err := db.SeedPending(
+		seedGeneration(pipe.Reprobe),
 		func(r *store.Record) (time.Time, bool) {
-			if r.Probed {
+			if !r.Probed {
+				// Due when it was found, so the backlog comes out oldest
+				// first.
+				return r.FirstSeen, true
+			}
+			if pipe.Reprobe <= 0 {
 				return time.Time{}, false
 			}
-			// Due when it was found, so the backlog comes out oldest first.
-			return r.FirstSeen, true
+			// Without this a host already probed is in no queue at all, so
+			// turning --reprobe on would never reach the records that were
+			// there before it was turned on.
+			return r.ProbedAt.Add(pipe.Reprobe), true
 		},
 		func(scanned, queued int) {
-			if time.Since(last) < 5*time.Second {
+			if ctx.Err() != nil || time.Since(last) < 5*time.Second {
 				return
 			}
 			last = time.Now()
@@ -718,6 +734,13 @@ func seedPending(db *store.Store, pipe *pipeline.Pipeline, log *slog.Logger) err
 			"queued", queued, "took", time.Since(start).Round(time.Second))
 	}
 	return nil
+}
+
+// seedGeneration names the re-probe policy a seed was run for. Changing the
+// policy changes which records belong in the queue, so it has to be seeded
+// again; leaving it alone must not re-walk the store on every start.
+func seedGeneration(reprobe time.Duration) string {
+	return fmt.Sprintf("v1:reprobe=%s", reprobe)
 }
 
 // waited renders how long the oldest queued probe has been due. A backlog is

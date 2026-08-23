@@ -95,7 +95,13 @@ func (s *Store) PendingLease(now time.Time, limit int, lease time.Duration) ([]P
 			host string
 		}
 		var take []held
-		for k, _ := c.First(); k != nil && len(take) < limit; k, _ = c.Next() {
+		// A host can hold more than one entry: record queues it again every
+		// time a certificate names it before the first probe lands. They all
+		// have to go, but the host is handed out once — two leases for one
+		// host collapse onto the same new key, so the second probe would run
+		// against a lease the first had already released.
+		seen := make(map[string]bool)
+		for k, _ := c.First(); k != nil && len(seen) < limit; k, _ = c.Next() {
 			if len(k) <= pendingLeaseKey {
 				// Not a key this package wrote. Leave it alone rather than
 				// guess at what it means.
@@ -106,16 +112,22 @@ func (s *Store) PendingLease(now time.Time, limit int, lease time.Duration) ([]P
 				// the batch.
 				break
 			}
-			take = append(take, held{
-				old:  append([]byte{}, k...),
-				host: string(k[pendingLeaseKey:]),
-			})
+			host := string(k[pendingLeaseKey:])
+			take = append(take, held{old: append([]byte{}, k...), host: host})
+			seen[host] = true
 		}
 		until := now.Add(lease)
+		handed := make(map[string]bool, len(seen))
 		for _, h := range take {
 			if err := b.Delete(h.old); err != nil {
 				return err
 			}
+			if handed[h.host] {
+				// A duplicate of one already leased. Dropping its key is the
+				// whole point; there is nothing more to hand out.
+				continue
+			}
+			handed[h.host] = true
 			key := pendingKey(until, h.host)
 			if err := b.Put(key, nil); err != nil {
 				return err
@@ -169,20 +181,26 @@ func (s *Store) PendingStats() (count int, oldest time.Time, err error) {
 // records to do it.
 var seedChunk = 20000
 
-// SeedPending fills the queue from records written before the queue existed,
-// which is what makes an existing database usable without re-discovering
-// everything. It runs once: the store remembers that it has seeded and does
-// nothing on later calls.
+// SeedPending fills the queue from records the queue does not know about:
+// those written before it existed, and those a change of re-probe policy has
+// brought back into scope.
+//
+// generation names the policy being seeded for. Seeding runs when what the
+// store last finished differs from it, which is what stops "--reprobe 24h"
+// from being ignored on a database first seeded without it.
+//
+// A seed that is interrupted resumes. The cursor is committed with each chunk,
+// so a run killed part way through picks up where it stopped instead of
+// walking the records it has already queued a second time.
 //
 // due decides, per record, whether a probe is wanted and when it is due.
 // progress, if given, is called after each chunk so a long seed can say so.
-func (s *Store) SeedPending(due func(*Record) (time.Time, bool), progress func(scanned, queued int)) (queued int, ran bool, err error) {
-	done, err := s.pendingSeeded()
-	if err != nil || done {
+func (s *Store) SeedPending(generation string, due func(*Record) (time.Time, bool), progress func(scanned, queued int)) (queued int, ran bool, err error) {
+	after, wanted, err := s.seedState(generation)
+	if err != nil || !wanted {
 		return 0, false, err
 	}
 
-	var after []byte
 	scanned := 0
 	for {
 		n := 0
@@ -213,7 +231,10 @@ func (s *Store) SeedPending(due func(*Record) (time.Time, bool), progress func(s
 				}
 				queued++
 			}
-			return nil
+			if n == 0 {
+				return nil
+			}
+			return tx.Bucket(bucketMeta).Put(keySeedAt, seedProgress(generation, after))
 		})
 		if err != nil {
 			return queued, true, fmt.Errorf("seed pending: %w", err)
@@ -226,20 +247,44 @@ func (s *Store) SeedPending(due func(*Record) (time.Time, bool), progress func(s
 			break
 		}
 	}
-	return queued, true, s.markPendingSeeded()
+	return queued, true, s.finishSeed(generation)
 }
 
-func (s *Store) pendingSeeded() (bool, error) {
-	var ok bool
-	err := s.view(func(tx *bolt.Tx) error {
-		ok = tx.Bucket(bucketMeta).Get(keySeeded) != nil
+// seedState reports where a seed for generation should start, and whether one
+// is needed at all.
+func (s *Store) seedState(generation string) (after []byte, wanted bool, err error) {
+	err = s.view(func(tx *bolt.Tx) error {
+		meta := tx.Bucket(bucketMeta)
+		if string(meta.Get(keySeeded)) == generation {
+			return nil
+		}
+		wanted = true
+		// A cursor from an interrupted seed is only good for the generation
+		// that wrote it.
+		if at := meta.Get(keySeedAt); at != nil {
+			if gen, cursor, ok := bytes.Cut(at, []byte{0}); ok && string(gen) == generation {
+				after = append([]byte{}, cursor...)
+			}
+		}
 		return nil
 	})
-	return ok, err
+	return after, wanted, err
 }
 
-func (s *Store) markPendingSeeded() error {
+// seedProgress encodes an in-flight seed's generation and cursor.
+func seedProgress(generation string, after []byte) []byte {
+	out := make([]byte, 0, len(generation)+1+len(after))
+	out = append(out, generation...)
+	out = append(out, 0)
+	return append(out, after...)
+}
+
+func (s *Store) finishSeed(generation string) error {
 	return s.update(func(tx *bolt.Tx) error {
-		return tx.Bucket(bucketMeta).Put(keySeeded, []byte{1})
+		meta := tx.Bucket(bucketMeta)
+		if err := meta.Put(keySeeded, []byte(generation)); err != nil {
+			return err
+		}
+		return meta.Delete(keySeedAt)
 	})
 }

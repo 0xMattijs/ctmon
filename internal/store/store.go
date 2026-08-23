@@ -26,6 +26,7 @@ var (
 
 	keyFormat = []byte("format")
 	keySeeded = []byte("pending_seeded")
+	keySeedAt = []byte("pending_seed_cursor")
 )
 
 // ErrLegacyFormat says the database predates the packed record format.
@@ -457,4 +458,32 @@ func (s *Store) reopen(cause error) error {
 	}
 	s.db = db
 	return cause
+}
+
+// GetAll returns the records for hosts that exist, keyed by hostname, in one
+// read transaction. Hosts with no record are simply absent from the result.
+//
+// It exists for the backfill sweep, which asks about a whole batch at once and
+// was paying for a transaction per host to do it.
+func (s *Store) GetAll(hosts []string) (map[string]*Record, error) {
+	out := make(map[string]*Record, len(hosts))
+	err := s.view(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketDomains)
+		for _, host := range hosts {
+			raw := b.Get([]byte(reverseHost(host)))
+			if raw == nil {
+				continue
+			}
+			rec := &Record{Host: host}
+			if err := s.decode(host, raw, rec); err != nil {
+				return fmt.Errorf("decode %s: %w", host, err)
+			}
+			out[host] = rec
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
 }

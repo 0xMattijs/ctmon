@@ -73,3 +73,23 @@ func TestProbeDefersWhenTheAddressIsOverBudget(t *testing.T) {
 		t.Errorf("dialled %d times, want only the probe that was under budget", dials)
 	}
 }
+
+// Zero means the default everywhere else in Options, so turning the
+// per-address budget off has to be said explicitly.
+func TestPerIPLimitCanBeTurnedOff(t *testing.T) {
+	addr := netip.MustParseAddr("192.0.2.1")
+	p := New(Options{
+		NoPerIPLimit: true,
+		Lookup: func(context.Context, string) ([]netip.Addr, error) {
+			return []netip.Addr{addr}, nil
+		},
+		DialContext: func(context.Context, string, string) (net.Conn, error) {
+			return nil, errors.New("dial refused by the test")
+		},
+	})
+	for i := 0; i < 200; i++ {
+		if res := p.Probe(context.Background(), "busy.test"); res.Deferred {
+			t.Fatalf("probe %d was deferred with the per-address budget off", i)
+		}
+	}
+}

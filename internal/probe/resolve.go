@@ -58,6 +58,8 @@ const (
 	// answer — including "no such host", which is an answer — for the
 	// resolver to be considered to be working.
 	healthMinRate = 0.5
+	// healthStale is how long a judgement survives without fresh evidence.
+	healthStale = 30 * time.Second
 )
 
 // health tracks how often lookups come back with an answer.
@@ -73,6 +75,7 @@ const (
 type health struct {
 	mu               sync.Mutex
 	answered, missed float64
+	last             time.Time
 }
 
 // observe records one lookup outcome. Counts are halved rather than reset when
@@ -80,6 +83,7 @@ type health struct {
 func (h *health) observe(answered bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	h.last = time.Now()
 	if answered {
 		h.answered++
 	} else {
@@ -97,6 +101,15 @@ func (h *health) observe(answered bool) {
 func (h *health) reliable() bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	// A verdict only means anything while lookups are still happening. The
+	// backfill stops when this says no, and if the feed is quiet too then
+	// nothing else is asking — so the counts freeze and the answer stays no
+	// forever, long after the resolver came back. Go stale rather than latch:
+	// forget what we saw and let the next attempt find out.
+	if !h.last.IsZero() && time.Since(h.last) >= healthStale {
+		h.answered, h.missed = 0, 0
+		return true
+	}
 	total := h.answered + h.missed
 	if total < healthMinSamples {
 		return true
@@ -194,6 +207,12 @@ func (r *resolver) lookup(ctx context.Context, host string) ([]netip.Addr, error
 	ctx, cancel := context.WithTimeout(ctx, r.timeout)
 	defer cancel()
 	addrs, err := r.net.LookupNetIP(ctx, "ip", host)
+	// Read the clock again. The one taken before the semaphore wait can be
+	// seconds stale by now, which is exactly the case the retry TTL is meant
+	// to cover: measured from then, a five-second entry is often born already
+	// expired, so the burst it exists to absorb goes straight back to a
+	// resolver that is already struggling.
+	now = time.Now()
 
 	// "No such host" counts as an answer: the resolver did its job and the
 	// name does not exist.
@@ -252,6 +271,15 @@ func usable(addrs []netip.Addr, allowPrivate bool) []netip.Addr {
 // rather than resolving the name a second time. A redirect to a host nobody
 // has looked at yet resolves here, and lands in the same cache.
 func (p *Prober) dialer(base func(ctx context.Context, network, addr string) (net.Conn, error)) func(context.Context, string, string) (net.Conn, error) {
+	return p.cachedDialer(base, false)
+}
+
+// trustingDialer is dialer without the public-address filter.
+func (p *Prober) trustingDialer(base func(ctx context.Context, network, addr string) (net.Conn, error)) func(context.Context, string, string) (net.Conn, error) {
+	return p.cachedDialer(base, true)
+}
+
+func (p *Prober) cachedDialer(base func(ctx context.Context, network, addr string) (net.Conn, error), trusted bool) func(context.Context, string, string) (net.Conn, error) {
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
 		host, port, err := net.SplitHostPort(addr)
 		if err != nil {
@@ -264,7 +292,7 @@ func (p *Prober) dialer(base func(ctx context.Context, network, addr string) (ne
 		if err != nil {
 			return nil, err
 		}
-		addrs = usable(addrs, p.allowPrivate)
+		addrs = usable(addrs, p.allowPrivate || trusted)
 		if len(addrs) == 0 {
 			return nil, fmt.Errorf("%w for %s", ErrNoAddress, host)
 		}
@@ -284,12 +312,25 @@ func (p *Prober) dialer(base func(ctx context.Context, network, addr string) (ne
 }
 
 // DialContext returns the prober's dialer: the same resolution, cache, and
-// public-address policy the probes use. It is exported so the rest of the
-// monitor can reach the network the same way — notably the certificate feed,
-// which otherwise resolves through the system resolver and gets starved by the
-// probing it is supposed to be feeding.
+// public-address policy the probes use.
 func (p *Prober) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
 	return p.dial(ctx, network, addr)
+}
+
+// TrustedDialContext is DialContext without the public-address refusal, for
+// hosts the operator named rather than hosts a stranger's certificate did.
+//
+// The refusal exists because anyone can get a certificate for a name pointing
+// at 127.0.0.1 and would otherwise aim this monitor at its own machine. That
+// reasoning does not reach a CT log URL from --logs or a log list on the
+// operator's own network: refusing those would break a perfectly ordinary
+// setup to guard against the operator's own configuration.
+//
+// It still shares the resolver and its cache, which is the part the feed
+// actually needs — without it the feed resolves through the system resolver
+// and gets starved by the probing it is supposed to be feeding.
+func (p *Prober) TrustedDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	return p.trustedDial(ctx, network, addr)
 }
 
 // ResolverHealthy reports whether lookups are coming back with answers often

@@ -567,12 +567,23 @@ queue:
   minutes) runs out. Finish the probe and it goes; kill the process mid-probe
   and the host comes back on its own.
 
-A database from before the queue is filled in once, at startup:
+`--backfill 0` turns the sweep off, and with it the queue: nothing would ever
+take entries out, so nothing puts them in.
+
+Re-probing rides on the same queue. A finished probe schedules the next one,
+and because that leaves every host probed before `--reprobe` was set out of the
+queue entirely, changing the setting seeds the store again for the new policy.
+
+A database the queue does not yet know about is filled in at startup:
 
 ```console
 INFO filling the probe queue scanned=1640000 queued=1479642
 INFO probe queue filled from existing records queued=1952082 took=37s
 ```
+
+It resumes. The cursor is committed with each chunk, so a run interrupted part
+way through a two-million-record store picks up where it stopped rather than
+queueing everything twice.
 
 `ctmon stats` reports the depth, and how long the host at the head of the queue
 has been waiting — which is the number that says whether probing is keeping up:

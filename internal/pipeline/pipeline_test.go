@@ -62,7 +62,12 @@ func newRig(t *testing.T) *testRig {
 	t.Cleanup(func() { db.Close() })
 
 	return &testRig{
-		pipe: &Pipeline{Store: db, Prober: p, Log: discardLog(), Workers: 4},
+		// Backfill is set because the pending queue only fills when something
+		// is going to drain it, which is the normal configuration.
+		pipe: &Pipeline{
+			Store: db, Prober: p, Log: discardLog(),
+			Workers: 4, Backfill: time.Minute,
+		},
 		db:   db,
 		body: body,
 	}
@@ -487,6 +492,54 @@ func TestProbeSchedulesTheNextOne(t *testing.T) {
 	}
 	if wait := time.Until(oldest); wait < 30*time.Minute {
 		t.Errorf("next probe due in %v, want about the one-hour re-probe interval", wait)
+	}
+}
+
+// Without a sweep nothing takes entries out of the queue, so nothing should
+// put them in: the bucket would otherwise grow by every hostname ever seen.
+func TestNoBackfillMeansNoQueue(t *testing.T) {
+	rig := newRig(t)
+	rig.pipe.Backfill = 0
+
+	rig.pipe.record(context.Background(), nameSeen{
+		name: domain.Name{Host: "unswept.test", From: "unswept.test", Origin: domain.OriginCN},
+		cert: source.Cert{CN: "unswept.test", SeenAt: time.Now().UTC()},
+	}, make(chan string, 1))
+
+	if rec, err := rig.db.Get("unswept.test"); err != nil || rec == nil {
+		t.Fatalf("host = %v, %v; want it recorded regardless", rec, err)
+	}
+	if n, _, err := rig.db.PendingStats(); err != nil {
+		t.Fatal(err)
+	} else if n != 0 {
+		t.Errorf("queue holds %d entries with the sweep off, want none", n)
+	}
+}
+
+// A result that never reached the store leaves the record saying unprobed. The
+// probe reports itself unsettled so the caller keeps the lease: releasing it
+// would drop the host from the queue as well, and nothing would look at it
+// again.
+func TestProbeIsUnsettledWhenTheStoreWriteFails(t *testing.T) {
+	rig := newRig(t)
+	queue(t, rig.db, "host.test", time.Now().UTC().Add(-time.Hour), nil)
+
+	// A closed store fails every write, which is the shape of the case worth
+	// worrying about.
+	if err := rig.db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if rig.pipe.probe(context.Background(), "host.test") {
+		t.Error("probe called itself settled after the store write failed")
+	}
+}
+
+// A record that has been deleted is settled, not failed: it was removed on
+// purpose, so its queue entry should go too rather than come round for ever.
+func TestProbeSettlesAHostWhoseRecordIsGone(t *testing.T) {
+	rig := newRig(t)
+	if !rig.pipe.probe(context.Background(), "never-recorded.test") {
+		t.Error("probe of an absent record was unsettled, want the entry released")
 	}
 }
 

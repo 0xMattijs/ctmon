@@ -54,8 +54,11 @@ type Prober struct {
 	// budget goes with it.
 	lookup func(ctx context.Context, host string) ([]netip.Addr, error)
 	// dial is the transport's dialer, kept so callers outside this package
-	// can reach the network the same way probes do.
+	// can reach the network the same way probes do. trustedDial is the same
+	// but without the public-address refusal, for destinations the operator
+	// configured rather than ones a certificate named.
 	dial         func(ctx context.Context, network, addr string) (net.Conn, error)
+	trustedDial  func(ctx context.Context, network, addr string) (net.Conn, error)
 	resolver     *resolver
 	allowPrivate bool
 	userAgent    string
@@ -125,6 +128,10 @@ type Options struct {
 	PerIPBurst int
 	// MaxIPs bounds the per-address table (default 65536).
 	MaxIPs int
+	// NoPerIPLimit removes the per-address budget entirely. PerIPRPS of zero
+	// means "use the default", the way every other option here does, so
+	// turning the budget off needs to say so.
+	NoPerIPLimit bool
 	// Resolvers are the nameservers to ask, as host:port. Empty uses the
 	// system's, which on a machine running a local forwarder means every
 	// lookup queues behind one process; naming real upstreams here is what
@@ -224,22 +231,26 @@ func New(opts Options) *Prober {
 	}
 
 	base := opts.DialContext
+	trustedBase := opts.DialContext
 	if base == nil {
 		d := &net.Dialer{
 			Timeout:   opts.DialTimeout,
 			KeepAlive: 15 * time.Second,
 		}
+		trusted := *d
 		if !opts.AllowPrivate {
 			d.Control = refusePrivate
 		}
-		base = d.DialContext
+		base, trustedBase = d.DialContext, trusted.DialContext
 	}
 	p := &Prober{
-		ips:          newIPLimiter(opts.PerIPRPS, opts.PerIPBurst, opts.MaxIPs),
 		resolver:     newResolver(opts.Resolvers, opts.ResolveTimeout, opts.DNSTTL, opts.DNSNegativeTTL, opts.MaxDNSEntries, opts.MaxLookups),
 		allowPrivate: opts.AllowPrivate,
 		userAgent:    opts.UserAgent,
 		maxBody:      opts.MaxBody,
+	}
+	if !opts.NoPerIPLimit {
+		p.ips = newIPLimiter(opts.PerIPRPS, opts.PerIPBurst, opts.MaxIPs)
 	}
 	switch {
 	case opts.Lookup != nil:
@@ -269,6 +280,11 @@ func New(opts Options) *Prober {
 		DisableKeepAlives:     true,
 	}
 	p.dial = dial
+	p.trustedDial = trustedBase
+	if p.lookup != nil {
+		// Same cache, same lookups; only the address policy differs.
+		p.trustedDial = p.trustingDialer(trustedBase)
+	}
 	p.client = &http.Client{
 		Transport: tr,
 		Timeout:   opts.Timeout,
@@ -286,13 +302,17 @@ func New(opts Options) *Prober {
 // reported in Result.Err, not as an error return: an unreachable host is a
 // normal outcome worth recording.
 func (p *Prober) Probe(ctx context.Context, host string) Result {
+	// reserve first. The overall ceiling exists to bound what this monitor
+	// puts on the network, and a probe that is handed back undone puts
+	// nothing on it — spending a token on one would let deferrals eat the
+	// budget that real fetches are waiting for.
+	if res, ok := p.reserve(ctx, host); !ok {
+		return res
+	}
 	if p.limiter != nil {
 		if err := p.limiter.Wait(ctx); err != nil {
 			return Result{Err: err}
 		}
-	}
-	if res, ok := p.reserve(ctx, host); !ok {
-		return res
 	}
 
 	url := "https://" + host + "/"
