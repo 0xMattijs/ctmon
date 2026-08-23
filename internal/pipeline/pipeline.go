@@ -106,6 +106,35 @@ type Stats struct {
 // Stats returns a pointer to the live counters.
 func (p *Pipeline) Stats() *Stats { return &p.stats }
 
+// Fields renders the counters as the alternating keys and values slog takes,
+// so the progress line, the live status line, and the final line all read the
+// same.
+//
+// The names live here rather than where they are printed, so that adding a
+// counter above is one edit and not two in two packages.
+func (s *Stats) Fields() []any {
+	return []any{
+		"certs", s.Certs.Load(),
+		"names", s.Names.Load(),
+		"skipped_cn", s.Skipped.Load(),
+		"too_deep", s.TooDeep.Load(),
+		"from_san", s.FromSAN.Load(),
+		"sans_cut", s.SANsCut.Load(),
+		"blocked", s.Blocked.Load(),
+		"capped", s.Capped.Load(),
+		"new", s.New.Load(),
+		"repeat", s.Repeat.Load(),
+		"dup", s.Dup.Load(),
+		"probed", s.Probed.Load(),
+		"probe_failed", s.Failed.Load(),
+		"changed", s.Changed.Load(),
+		"deferred", s.Deferred.Load(),
+		"throttled", s.Throttled.Load(),
+		"unresolved", s.Unresolved.Load(),
+		"backfilled", s.Backfilled.Load(),
+	}
+}
+
 // nameSeen is one hostname to record, with the certificate it came from.
 type nameSeen struct {
 	name domain.Name
