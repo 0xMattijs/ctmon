@@ -505,22 +505,77 @@ func TestProbeSchedulesTheNextOne(t *testing.T) {
 
 // Without a sweep nothing takes entries out of the queue, so nothing should
 // put them in: the bucket would otherwise grow by every hostname ever seen.
+//
+// Three paths write to it and each has to ask first. Recording a discovery
+// asked from the start; the other two did not, so a run with the sweep off
+// wrote an entry per probe and an entry per deferral, for ever.
 func TestNoBackfillMeansNoQueue(t *testing.T) {
+	const host = "unswept.test"
+	for _, tc := range []struct {
+		name string
+		run  func(*testing.T, *testRig)
+	}{
+		{"recording a discovery", func(t *testing.T, rig *testRig) {
+			rig.pipe.record(context.Background(), nameSeen{
+				name: domain.Name{Host: host, From: host, Origin: domain.OriginCN},
+				cert: source.Cert{CN: host, SeenAt: time.Now().UTC()},
+			}, make(chan string, 1))
+		}},
+		{"scheduling a re-probe", func(t *testing.T, rig *testRig) {
+			rig.pipe.Reprobe = time.Hour
+			if err := rig.db.Update(host, func(*store.Record, bool) bool { return true }); err != nil {
+				t.Fatal(err)
+			}
+			rig.pipe.probe(context.Background(), host)
+		}},
+		{"putting off a deferred probe", func(t *testing.T, rig *testRig) {
+			rig.pipe.Prober = deferringProber{}
+			rig.pipe.probe(context.Background(), host)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rig := newRig(t)
+			rig.pipe.Backfill = 0
+			tc.run(t, rig)
+
+			if n, _, err := rig.db.PendingStats(); err != nil {
+				t.Fatal(err)
+			} else if n != 0 {
+				t.Errorf("queue holds %d entries with the sweep off, want none", n)
+			}
+		})
+	}
+}
+
+// Only the queue entry goes when the sweep is off. The discovery itself is
+// still recorded, and still probed as it arrives.
+func TestNoBackfillStillRecordsAndProbes(t *testing.T) {
 	rig := newRig(t)
 	rig.pipe.Backfill = 0
+	rig.feed(t, source.Cert{CN: "unswept.test", SeenAt: time.Now().UTC()})
 
-	rig.pipe.record(context.Background(), nameSeen{
-		name: domain.Name{Host: "unswept.test", From: "unswept.test", Origin: domain.OriginCN},
-		cert: source.Cert{CN: "unswept.test", SeenAt: time.Now().UTC()},
-	}, make(chan string, 1))
-
-	if rec, err := rig.db.Get("unswept.test"); err != nil || rec == nil {
+	rec, err := rig.db.Get("unswept.test")
+	if err != nil || rec == nil {
 		t.Fatalf("host = %v, %v; want it recorded regardless", rec, err)
 	}
-	if n, _, err := rig.db.PendingStats(); err != nil {
-		t.Fatal(err)
-	} else if n != 0 {
-		t.Errorf("queue holds %d entries with the sweep off, want none", n)
+	if !rec.Probed {
+		t.Error("the host was not probed; the fresh queue works without a sweep")
+	}
+}
+
+// With the sweep off a deferred probe has nowhere to go, so it is dropped
+// rather than queued where nothing would find it. The counter is the only
+// trace left, which is why it still has to move.
+func TestDeferredProbeWithoutASweepIsDropped(t *testing.T) {
+	rig := newRig(t)
+	rig.pipe.Backfill = 0
+	rig.pipe.Prober = deferringProber{}
+
+	if rig.pipe.probe(context.Background(), "busy.test") {
+		t.Error("probe called itself settled after dropping the host")
+	}
+	if n := rig.pipe.Stats().Throttled.Load(); n != 1 {
+		t.Errorf("throttled = %d, want the shed probe counted", n)
 	}
 }
 
@@ -903,6 +958,21 @@ func TestBacklogWorkersAlwaysReservesOne(t *testing.T) {
 	for workers, want := range map[int]int{1: 1, 2: 1, 3: 1, 4: 1, 8: 2, 16: 4, 48: 12} {
 		if got := backlogWorkers(workers); got != want {
 			t.Errorf("backlogWorkers(%d) = %d, want %d", workers, got, want)
+		}
+	}
+}
+
+// With no sweep there is no backlog, so pinning a worker to one only parks it
+// on a channel nothing ever sends to. At the default count that would idle 64
+// of 256 workers for the whole run.
+func TestNoWorkerIsPinnedToAQueueNothingFills(t *testing.T) {
+	swept := &Pipeline{Backfill: time.Minute}
+	if got := swept.reservedWorkers(256); got != 64 {
+		t.Errorf("reservedWorkers(256) with a sweep = %d, want 64", got)
+	}
+	for _, p := range []*Pipeline{{Backfill: 0}, {Backfill: time.Minute, NoProbe: true}} {
+		if got := p.reservedWorkers(256); got != 0 {
+			t.Errorf("reservedWorkers(256) with Queuing()=%v = %d, want 0", p.Queuing(), got)
 		}
 	}
 }

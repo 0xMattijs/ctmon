@@ -201,7 +201,7 @@ func (p *Pipeline) Run(ctx context.Context, in <-chan source.Cert) {
 	// Most workers take fresh discoveries first. A few are kept for the
 	// backlog, so a sustained burst of new names cannot starve it completely
 	// the way the backlog used to starve them.
-	reserved := backlogWorkers(workers)
+	reserved := p.reservedWorkers(workers)
 	var probeWG sync.WaitGroup
 	for i := 0; i < workers; i++ {
 		probeWG.Add(1)
@@ -288,6 +288,18 @@ func (p *Pipeline) Run(ctx context.Context, in <-chan source.Cert) {
 	<-sweepDone
 	close(backlog)
 	probeWG.Wait()
+}
+
+// reservedWorkers is how many of the pool are pinned to the backlog for this
+// run. Without a sweep there is no backlog to pin them to, and a worker that
+// waits on one anyway parks on a channel nothing sends to until the run ends:
+// at the default worker count that is 64 goroutines idle while fresh
+// discoveries queue behind the remaining 192.
+func (p *Pipeline) reservedWorkers(workers int) int {
+	if !p.Queuing() {
+		return 0
+	}
+	return backlogWorkers(workers)
 }
 
 // backlogWorkers is how many of the pool are pinned to the backlog. A quarter,
@@ -391,7 +403,7 @@ func (p *Pipeline) record(ctx context.Context, n nameSeen, freshQueue chan<- str
 			r.Issuer = n.cert.Issuer
 		}
 		wantProbe = !p.NoProbe && (!r.Probed || p.stale(r))
-		if !wantProbe || !p.queuing() {
+		if !wantProbe || !p.Queuing() {
 			return true, time.Time{}
 		}
 		return true, due
@@ -455,11 +467,15 @@ func (p *Pipeline) probeQueued(ctx context.Context, item store.Pending) {
 //
 // A host turned away by its address's budget is queued again and nothing is
 // written down: nothing was asked of it, so there is nothing to record, and a
-// probe error would be a claim about the host that is not true.
+// probe error would be a claim about the host that is not true. With no sweep
+// to drain the queue there is nowhere to put it, and the host is dropped
+// instead.
 //
-// It reports whether the host is settled — either its result is in the store,
-// or it has been queued afresh. A caller holding a lease must keep it when
-// this is false.
+// It reports whether the host is settled — its result is in the store, or it
+// has been queued afresh. A caller holding a lease must keep it when this is
+// false, with one exception: a dropped host is not settled and has no lease to
+// keep, because a queue nothing sweeps hands nothing out. Queuing() is what
+// keeps those two facts in step.
 func (p *Pipeline) probe(ctx context.Context, host string) bool {
 	res := p.Prober.Probe(ctx, host)
 	if ctx.Err() != nil {
@@ -470,6 +486,12 @@ func (p *Pipeline) probe(ctx context.Context, host string) bool {
 			p.stats.Unresolved.Add(1)
 		} else {
 			p.stats.Throttled.Add(1)
+		}
+		if !p.Queuing() {
+			// Nothing drains the queue, so an entry written here would sit
+			// in it for ever. The host is dropped instead; the counter above
+			// is what says so.
+			return false
 		}
 		if err := p.Store.Enqueue(host, time.Now().UTC().Add(p.deferBackoff())); err != nil {
 			p.storeErr("requeue failed", "host", host, "err", err)
@@ -488,7 +510,7 @@ func (p *Pipeline) probe(ctx context.Context, host string) bool {
 	// its due time has to be fixed before the transaction for the same reason
 	// record's does.
 	var requeue time.Time
-	if p.Reprobe > 0 && !p.NoProbe {
+	if p.Reprobe > 0 && p.Queuing() {
 		requeue = probedAt.Add(p.Reprobe)
 	}
 	err := p.Store.UpdateWithQueue(host, func(r *store.Record, existed bool) (bool, time.Time) {
@@ -644,11 +666,16 @@ func (p *Pipeline) wantsProbe(items []store.Pending) (map[string]bool, error) {
 	return want, nil
 }
 
-// queuing reports whether the pending queue is in use. Without a sweep nothing
+// Queuing reports whether the pending queue is in use. Without a sweep nothing
 // ever takes entries out of it, so writing them would grow the bucket by every
 // hostname seen, for ever — at live rates some millions a day — while no probe
 // ever came of it.
-func (p *Pipeline) queuing() bool { return p.Backfill > 0 && !p.NoProbe }
+//
+// Every write to the queue goes through this first: recording a discovery,
+// putting off a probe its address turned away, and scheduling a re-probe. It
+// is exported because seeding the queue at startup is the fourth, and that one
+// lives in the command.
+func (p *Pipeline) Queuing() bool { return p.Backfill > 0 && !p.NoProbe }
 
 // sans applies the SAN policy: none when IgnoreSANs is set, otherwise the
 // first MaxSANs of them.
