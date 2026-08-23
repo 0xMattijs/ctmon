@@ -102,6 +102,13 @@ type Stats struct {
 	Throttled  atomic.Int64 // probes put off because their address was over budget
 	Unresolved atomic.Int64 // probes put off because the resolver gave no answer
 	Backfilled atomic.Int64 // probes queued by the sweep
+	// StoreErrors counts reads and writes the store refused. It is the one
+	// counter here that is not about certificates: everything else in this
+	// pipeline logs a failure and carries on, which is right for a monitor
+	// that must not stop for one bad host but leaves a full disk or a broken
+	// database looking exactly like a quiet hour. A non-zero value here means
+	// discoveries are being dropped.
+	StoreErrors atomic.Int64
 }
 
 // Stats returns a pointer to the live counters.
@@ -133,7 +140,17 @@ func (s *Stats) Fields() []any {
 		"throttled", s.Throttled.Load(),
 		"unresolved", s.Unresolved.Load(),
 		"backfilled", s.Backfilled.Load(),
+		"store_errors", s.StoreErrors.Load(),
 	}
+}
+
+// storeErr counts a failed store operation and logs it. Every caller of this
+// carries on afterwards, so the counter is the only lasting trace: a log record
+// scrolls away, and the counter line is what someone watching a run actually
+// reads.
+func (p *Pipeline) storeErr(msg string, args ...any) {
+	p.stats.StoreErrors.Add(1)
+	p.Log.Error(msg, args...)
 }
 
 // nameSeen is one hostname to record, with the certificate it came from.
@@ -316,7 +333,7 @@ func (p *Pipeline) record(ctx context.Context, n nameSeen, freshQueue chan<- str
 	if p.ParentCap > 0 {
 		existing, err := p.Store.Get(host)
 		if err != nil {
-			p.Log.Error("store read failed", "host", host, "err", err)
+			p.storeErr("store read failed", "host", host, "err", err)
 			return
 		}
 		if p.capped(host, existing != nil) {
@@ -357,7 +374,7 @@ func (p *Pipeline) record(ctx context.Context, n nameSeen, freshQueue chan<- str
 		return true, due
 	})
 	if err != nil {
-		p.Log.Error("store write failed", "host", host, "err", err)
+		p.storeErr("store write failed", "host", host, "err", err)
 		return
 	}
 
@@ -407,7 +424,7 @@ func (p *Pipeline) probeQueued(ctx context.Context, item store.Pending) {
 	// A deferred probe has already queued the host afresh, so the lease goes
 	// either way: keeping it would only fetch the host twice.
 	if err := p.Store.PendingDone(item.Key); err != nil {
-		p.Log.Error("release pending failed", "host", item.Host, "err", err)
+		p.storeErr("release pending failed", "host", item.Host, "err", err)
 	}
 }
 
@@ -432,7 +449,7 @@ func (p *Pipeline) probe(ctx context.Context, host string) bool {
 			p.stats.Throttled.Add(1)
 		}
 		if err := p.Store.Enqueue(host, time.Now().UTC().Add(p.deferBackoff())); err != nil {
-			p.Log.Error("requeue failed", "host", host, "err", err)
+			p.storeErr("requeue failed", "host", host, "err", err)
 			return false
 		}
 		return true
@@ -476,7 +493,7 @@ func (p *Pipeline) probe(ctx context.Context, host string) bool {
 		return true, requeue
 	})
 	if err != nil {
-		p.Log.Error("store write failed", "host", host, "err", err)
+		p.storeErr("store write failed", "host", host, "err", err)
 		return false
 	}
 
@@ -544,7 +561,7 @@ func (p *Pipeline) resolverHealthy() bool {
 func (p *Pipeline) sweep(ctx context.Context, backlog chan<- store.Pending) {
 	pending, err := p.Store.PendingLease(time.Now().UTC(), p.backfillBatch(), p.backfillLease())
 	if err != nil {
-		p.Log.Error("backfill sweep failed", "err", err)
+		p.storeErr("backfill sweep failed", "err", err)
 		return
 	}
 	if len(pending) == 0 {
@@ -557,7 +574,7 @@ func (p *Pipeline) sweep(ctx context.Context, backlog chan<- store.Pending) {
 	// batch was costing some ten thousand of them every sweep.
 	want, err := p.wantsProbe(pending)
 	if err != nil {
-		p.Log.Error("store read failed", "err", err)
+		p.storeErr("store read failed", "err", err)
 		return
 	}
 	var done [][]byte
@@ -575,13 +592,13 @@ func (p *Pipeline) sweep(ctx context.Context, backlog chan<- store.Pending) {
 			// Hand back what has not been sent. The rest keep their leases
 			// and come round again.
 			if err := p.Store.PendingDone(done...); err != nil {
-				p.Log.Error("release pending failed", "err", err)
+				p.storeErr("release pending failed", "err", err)
 			}
 			return
 		}
 	}
 	if err := p.Store.PendingDone(done...); err != nil {
-		p.Log.Error("release pending failed", "err", err)
+		p.storeErr("release pending failed", "err", err)
 	}
 	p.Log.Info("backfill sweep", "queued", queued, "already_done", len(done))
 }
