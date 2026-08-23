@@ -4,6 +4,7 @@ import (
 	"flag"
 	"io"
 	"log/slog"
+	"net"
 	"os"
 	"time"
 
@@ -47,6 +48,12 @@ type feedConfig struct {
 	maxLag    uint64
 	poll      time.Duration
 	rps       float64
+	// dialTimeout bounds the TCP connect to a log or to the firehose. It is
+	// separate from the prober's --dial-timeout, which is deliberately harsh:
+	// two seconds is right for shedding a host out of CT that will never
+	// answer, and wrong for a CT log on the other side of the world having a
+	// slow moment, where it costs a reconnect and a backoff.
+	dialTimeout time.Duration
 }
 
 // filterConfig decides which discovered hostnames are worth keeping.
@@ -122,6 +129,7 @@ func (c *runConfig) bind(fs *flag.FlagSet) {
 	fs.Uint64Var(&f.maxLag, "max-lag", 0, "skip a log to its tree head when it falls this many entries behind (0 = never skip)")
 	fs.DurationVar(&f.poll, "poll", 30*time.Second, "how long to wait after catching up with a log")
 	fs.Float64Var(&f.rps, "log-rps", 4, "get-entries requests per second, per log")
+	fs.DurationVar(&f.dialTimeout, "feed-dial-timeout", resolve.DefaultDialTimeout, "how long to wait for a TCP connect to a log or the firehose")
 
 	l := &c.filter
 	fs.StringVar(&l.skipSuffix, "skip-suffix", "", "extra parent domains to drop, comma-separated, e.g. workers.dev,pages.dev")
@@ -195,6 +203,12 @@ func (c *runConfig) logger() (*slog.Logger, *statusLine) {
 		out = line
 	}
 	return slog.New(slog.NewTextHandler(out, &slog.HandlerOptions{Level: level})), line
+}
+
+// dialer is how the feeds open a connection, once the shared resolver has
+// turned the name into addresses.
+func (c feedConfig) dialer() resolve.DialFunc {
+	return (&net.Dialer{Timeout: c.dialTimeout, KeepAlive: 30 * time.Second}).DialContext
 }
 
 // newResolver builds the resolver the probes and the CT feed share.

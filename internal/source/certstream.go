@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"time"
 
@@ -19,7 +20,13 @@ const DefaultCertstreamURL = "wss://certstream.calidog.io/"
 type Certstream struct {
 	URL       string
 	UserAgent string
-	Log       *slog.Logger
+	// Dial overrides how the websocket connection is made. Like CTLog's, it
+	// exists so the monitor can give its own feed the same resolver it gives
+	// the probers: the socket drops and reconnects, and each reconnect
+	// resolves the firehose again — through a system resolver that a run
+	// probing hard enough has already starved.
+	Dial func(ctx context.Context, network, addr string) (net.Conn, error)
+	Log  *slog.Logger
 }
 
 // Name implements Source.
@@ -82,6 +89,9 @@ func (c *Certstream) stream(ctx context.Context, url string, out chan<- Cert) er
 	}
 	dialer := *websocket.DefaultDialer
 	dialer.HandshakeTimeout = 30 * time.Second
+	if c.Dial != nil {
+		dialer.NetDialContext = c.Dial
+	}
 	conn, _, err := dialer.DialContext(ctx, url, hdr)
 	if err != nil {
 		return fmt.Errorf("dial %s: %w", url, err)

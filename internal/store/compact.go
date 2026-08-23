@@ -43,15 +43,19 @@ type CompactResult struct {
 // This is the whole of compaction. Both entry points below are this plus a
 // decision about where the result goes.
 func compactInto(path string, src *bolt.DB) (used int64, err error) {
-	dst, err := bolt.Open(path, 0o600, &bolt.Options{Timeout: 5 * time.Second})
-	if err != nil {
-		return 0, fmt.Errorf("create %s: %w", path, err)
-	}
+	// Installed before the open, not after it: bolt creates the file and can
+	// still fail initializing it — on a full disk, which is when someone is
+	// most likely to be compacting. The stub it leaves behind would then fail
+	// every retry, because CompactTo refuses a destination that exists.
 	defer func() {
 		if err != nil {
 			os.Remove(path)
 		}
 	}()
+	dst, err := bolt.Open(path, 0o600, &bolt.Options{Timeout: 5 * time.Second})
+	if err != nil {
+		return 0, fmt.Errorf("create %s: %w", path, err)
+	}
 	if err = bolt.Compact(dst, src, compactTxSize); err != nil {
 		dst.Close()
 		return 0, fmt.Errorf("compact: %w", err)

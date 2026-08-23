@@ -111,7 +111,8 @@ func runCmd(args []string) error {
 	// would break an ordinary setup to guard against themselves.
 	resolver := cfg.newResolver()
 	prober := cfg.newProber(resolver)
-	feeds, err := buildSources(cfg.feed, cfg.userAgent, db, log, resolve.Dialer(resolver, nil, nil))
+	feedDial := resolve.Dialer(resolver, cfg.feed.dialer(), nil)
+	feeds, err := buildSources(cfg.feed, cfg.userAgent, db, log, feedDial)
 	if err != nil {
 		return err
 	}
@@ -222,7 +223,9 @@ func buildSources(cfg feedConfig, userAgent string, db *store.Store, log *slog.L
 
 	var feeds []source.Source
 	if want["certstream"] {
-		feeds = append(feeds, &source.Certstream{URL: cfg.certURL, UserAgent: userAgent, Log: log})
+		feeds = append(feeds, &source.Certstream{
+			URL: cfg.certURL, UserAgent: userAgent, Dial: dial, Log: log,
+		})
 	}
 	if want["ctlog"] {
 		uris := splitList(cfg.logURIs)

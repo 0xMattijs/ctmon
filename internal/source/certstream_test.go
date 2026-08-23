@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -165,5 +166,44 @@ func TestCertstreamReconnects(t *testing.T) {
 	}
 	if got := conns(); got < 2 {
 		t.Errorf("connections = %d, want at least 2", got)
+	}
+}
+
+// The firehose has to dial through the resolver the monitor gives it. Left on
+// the system resolver it reconnects through the very resolver a run probing
+// hard has already starved — and reconnecting is the one thing a dropped
+// firehose does a lot of.
+func TestCertstreamDialsThroughTheSuppliedDialer(t *testing.T) {
+	url := wsServer(t, sampleUpdate)
+
+	var mu sync.Mutex
+	var dialed []string
+	cs := &Certstream{
+		URL: url,
+		Dial: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			mu.Lock()
+			dialed = append(dialed, addr)
+			mu.Unlock()
+			return (&net.Dialer{}).DialContext(ctx, network, addr)
+		},
+		Log: slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError})),
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	out := make(chan Cert, 4)
+	go cs.Run(ctx, out)
+
+	select {
+	case <-out:
+	case <-ctx.Done():
+		t.Fatal("no certificate arrived")
+	}
+	cancel()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(dialed) == 0 {
+		t.Error("certstream connected without using the dialer it was given")
 	}
 }

@@ -450,10 +450,15 @@ stopping altogether while the probers carry on. That shared resolver is
 `internal/resolve`, built once at startup and handed to both, so neither owns
 the thing they depend on equally.
 
-The two dial it differently. A probe may only reach a public address, because
-anyone can have a certificate issued for a name pointing at `127.0.0.1`. A CT
-log came from `--logs` or from the log list, which is your own configuration,
-so the feed dials whatever the name resolves to.
+Both feeds go through it — the log poller and the certstream websocket, which
+re-resolves the firehose on every reconnect and is therefore exactly the wrong
+thing to leave on a starved resolver.
+
+The feeds and the probes dial it differently. A probe may only reach a public
+address, because anyone can have a certificate issued for a name pointing at
+`127.0.0.1`. A CT log came from `--logs` or from the log list, and the firehose
+from `--certstream-url`, which is your own configuration, so the feeds dial
+whatever the name resolves to.
 
 #### When the resolver gives up
 
@@ -496,6 +501,11 @@ own, larger budget on purpose: a connect either lands quickly or not at all,
 but a handshake is several round trips to a server that has already answered,
 and a budget tight enough for the connect turns slow-but-real sites into
 failures.
+
+These bound probes only. The feeds have their own, `--feed-dial-timeout`
+(10s), because two seconds is right for shedding a host out of CT that will
+never answer and wrong for a CT log on the other side of the world having a
+slow moment — there it costs a reconnect and a backoff.
 
 Raising `--workers` is close to free — goroutines waiting on a socket cost
 almost nothing — which is why the default is 256. It is also not the knob that
