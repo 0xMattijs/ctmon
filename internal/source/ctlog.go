@@ -14,6 +14,7 @@ import (
 	"github.com/google/certificate-transparency-go/client"
 	"github.com/google/certificate-transparency-go/jsonclient"
 	"github.com/google/certificate-transparency-go/loglist3"
+	"github.com/google/certificate-transparency-go/x509"
 	"golang.org/x/time/rate"
 )
 
@@ -327,31 +328,28 @@ func (c *CTLog) parseEntry(uri string, index int64, leaf *ct.LeafEntry) (Cert, b
 		return Cert{}, false
 	}
 
-	var cert Cert
+	// A precertificate carries its names in a TBSCertificate, which ct-go
+	// parses into the same x509.Certificate an ordinary entry holds, so both
+	// kinds are read the same way once the right one is in hand.
+	var x *x509.Certificate
 	switch {
 	case entry.X509Cert != nil:
-		x := entry.X509Cert
-		cert = Cert{
-			CN:        x.Subject.CommonName,
-			SANs:      x.DNSNames,
-			Issuer:    issuerName(x.Issuer.CommonName, x.Issuer.Organization),
-			NotBefore: x.NotBefore.UTC(),
-			NotAfter:  x.NotAfter.UTC(),
-		}
-	case entry.Precert != nil && entry.Precert.TBSCertificate != nil:
-		x := entry.Precert.TBSCertificate
-		cert = Cert{
-			CN:        x.Subject.CommonName,
-			SANs:      x.DNSNames,
-			Issuer:    issuerName(x.Issuer.CommonName, x.Issuer.Organization),
-			NotBefore: x.NotBefore.UTC(),
-			NotAfter:  x.NotAfter.UTC(),
-		}
-	default:
+		x = entry.X509Cert
+	case entry.Precert != nil:
+		x = entry.Precert.TBSCertificate
+	}
+	if x == nil {
 		return Cert{}, false
 	}
-	if cert.CN == "" && len(cert.SANs) == 0 {
+	if x.Subject.CommonName == "" && len(x.DNSNames) == 0 {
 		return Cert{}, false
+	}
+	cert := Cert{
+		CN:        x.Subject.CommonName,
+		SANs:      x.DNSNames,
+		Issuer:    issuerName(x.Issuer.CommonName, x.Issuer.Organization),
+		NotBefore: x.NotBefore.UTC(),
+		NotAfter:  x.NotAfter.UTC(),
 	}
 	cert.SeenAt = time.Now().UTC()
 	cert.Source = uri
