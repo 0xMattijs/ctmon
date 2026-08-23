@@ -135,7 +135,7 @@ func OpenReadOnly(path string) (*Store, error) {
 	// A run holds the write lock for as long as it runs, so waiting on it is
 	// waiting for nothing. The timeout is only long enough to ride out the
 	// moment a compaction swaps one handle for another.
-	db, err := bolt.Open(path, 0o600, &bolt.Options{ReadOnly: true, Timeout: time.Second})
+	db, err := openReadOnly(path, time.Second)
 	if err != nil {
 		if errors.Is(err, bolt.ErrTimeout) {
 			return nil, fmt.Errorf("%s: %w", path, ErrLocked)
@@ -167,6 +167,36 @@ func OpenReadOnly(path string) (*Store, error) {
 		return nil, fmt.Errorf("read %s: %w", path, err)
 	}
 	return s, nil
+}
+
+// openReadOnly opens a database for reading only.
+//
+// PreLoadFreelist is what the size reports need. bolt fills in
+// DB.Stats().FreePageN when it loads the freelist, and a read-only handle
+// loads it only on request; a writable one always does. Without it usedBytes
+// cannot tell an allocated page from a free one. The cost is reading the
+// freelist the file already carries.
+//
+// Reading it during the open is also what the recover is for. bolt reports a
+// freelist page it cannot parse by panicking, and a damaged store has one. A
+// command asked to report on such a file should say it cannot read it, not
+// print a stack trace, and usedBytesAt promises to return 0 rather than fail
+// at all. The half-built handle goes with the panic — one descriptor, on a
+// path that ends in the command reporting the error and exiting.
+//
+// It is a shield, not a guarantee. bolt is not safe against a damaged file
+// generally: a page id past the end of a truncated one is a read into the
+// mapping's hole, which is a SIGBUS no recover can catch, and the reads these
+// commands go on to do would hit the same thing a moment later. What this
+// catches is the case the freelist adds — a page inside the file that is not
+// the freelist bolt was promised.
+func openReadOnly(path string, timeout time.Duration) (db *bolt.DB, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			db, err = nil, fmt.Errorf("unreadable freelist, the file is truncated or corrupt: %v", r)
+		}
+	}()
+	return bolt.Open(path, 0o600, &bolt.Options{ReadOnly: true, PreLoadFreelist: true, Timeout: timeout})
 }
 
 // newStore wraps an open handle. The dictionaries start empty and are filled
@@ -401,12 +431,18 @@ func (s *Store) emit(k, v []byte, fn func(*Record) error) error {
 }
 
 // Stats summarizes the store.
+//
+// Bytes is what the file occupies on disk. Used is what its pages hold: bolt
+// grows the file in large steps and keeps freed pages for reuse, so Bytes is
+// the bigger and lazier number and the gap between the two is slack the store
+// can fill without growing.
 type Stats struct {
 	Domains   int
 	Sources   int
 	Issuers   int
 	ErrorKind int
 	Bytes     int64
+	Used      int64
 	Probed    int
 	WithHash  int
 	Wildcards int
@@ -446,8 +482,24 @@ func (s *Store) Stats() (Stats, error) {
 	if st.Pending, st.Oldest, err = s.PendingStats(); err != nil {
 		return st, err
 	}
+	// Measured outside the transaction below, because usedBytes opens one of
+	// its own and nesting two read transactions on one handle can deadlock
+	// against a writer waiting between them.
+	st.Used = s.usedBytes()
+	// Sized through the path the handle was opened from, which is not quite
+	// the same thing as the file it holds: a snapshot lands by renaming a new
+	// file over that path, and this handle goes on reading the one it opened.
+	// So the stat can describe a different file, or find none at all, and a
+	// size is not worth failing a whole stats run over. The high-water mark is
+	// the closest number left when it fails.
+	if info, err := os.Stat(s.path); err == nil {
+		st.Bytes = info.Size()
+	}
+
 	err = s.view(func(tx *bolt.Tx) error {
-		st.Bytes = tx.Size()
+		if st.Bytes == 0 {
+			st.Bytes = tx.Size()
+		}
 		// Absent only on a database a read-only handle opened without being
 		// able to create it. See OpenReadOnly.
 		b := tx.Bucket(bucketLogPos)

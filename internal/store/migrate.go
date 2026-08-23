@@ -67,9 +67,9 @@ func (l *legacyRecord) record(host string) *Record {
 }
 
 // MigrateResult reports what a migration moved. Bytes come in two flavors:
-// what the pages hold, and what the file occupies. bolt grows its file in
-// large steps and keeps freed pages for reuse, so the file is the bigger and
-// lazier number.
+// the pages holding records, and what the file occupies. bolt grows its file
+// in large steps and keeps freed pages for reuse, so the file is the bigger
+// and lazier number, and neither of them counts the freelist.
 type MigrateResult struct {
 	Records  int
 	Skipped  int
@@ -103,7 +103,7 @@ func Migrate(oldPath, newPath string) (MigrateResult, error) {
 	res.OldBytes = info.Size()
 	res.OldUsed = usedBytesAt(oldPath)
 
-	old, err := bolt.Open(oldPath, 0o600, &bolt.Options{ReadOnly: true, Timeout: 5 * time.Second})
+	old, err := openReadOnly(oldPath, 5*time.Second)
 	if err != nil {
 		return res, fmt.Errorf("open %s: %w", oldPath, err)
 	}

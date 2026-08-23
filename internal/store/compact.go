@@ -27,9 +27,9 @@ import (
 const compactTxSize = 64 << 20
 
 // CompactResult reports what a compaction reclaimed. Bytes come in two
-// flavors: what the pages hold, and what the file occupies. bolt grows its file
-// in large steps and keeps freed pages for reuse, so the file is the bigger and
-// lazier number.
+// flavors: the pages holding records, and what the file occupies. bolt grows
+// its file in large steps and keeps freed pages for reuse, so the file is the
+// bigger and lazier number, and neither of them counts the freelist.
 type CompactResult struct {
 	OldUsed  int64
 	NewUsed  int64
@@ -79,7 +79,7 @@ func (s *Store) CompactInPlace() (CompactResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	res := CompactResult{OldUsed: s.usedBytes()}
+	res := CompactResult{OldUsed: usedBytes(s.db)}
 	if info, err := os.Stat(s.path); err == nil {
 		res.OldBytes = info.Size()
 	}
@@ -139,7 +139,7 @@ func CompactTo(srcPath, dstPath string) (CompactResult, error) {
 	res.OldBytes = info.Size()
 	res.OldUsed = usedBytesAt(srcPath)
 
-	src, err := bolt.Open(srcPath, 0o600, &bolt.Options{ReadOnly: true, Timeout: 5 * time.Second})
+	src, err := openReadOnly(srcPath, 5*time.Second)
 	if err != nil {
 		return res, fmt.Errorf("open %s: %w", srcPath, err)
 	}
@@ -155,22 +155,43 @@ func CompactTo(srcPath, dstPath string) (CompactResult, error) {
 }
 
 // usedBytes reports how many bytes of pages a database holds.
+//
+// tx.Size() alone is not that number. It is the allocation high-water mark,
+// which counts every page below it, including the ones on the freelist —
+// allocated, empty, and waiting to be handed out again. Counting them
+// overstates how full the leaves are, which is the one thing a compaction
+// report exists to say: half-full leaves mean compaction helps, a large
+// freelist means the store already has room and compaction mostly returns
+// disk. Subtract them, pending ones included, since a page freed by a
+// transaction that has not been released yet holds nothing either.
+//
+// The counts come from the handle, not the transaction, and bolt only fills
+// them in once it has loaded the freelist. See readOnlyOptions.
 func usedBytes(db *bolt.DB) int64 {
 	var n int64
 	_ = db.View(func(tx *bolt.Tx) error {
-		n = tx.Size()
+		st := db.Stats()
+		free := int64(st.FreePageN+st.PendingPageN) * int64(tx.DB().Info().PageSize)
+		n = max(tx.Size()-free, 0)
 		return nil
 	})
 	return n
 }
 
-// usedBytes reports how many bytes of pages this store holds.
-func (s *Store) usedBytes() int64 { return usedBytes(s.db) }
+// usedBytes reports how many bytes of pages this store holds. It takes the
+// handle lock, so a compaction cannot swap the file out from under the
+// measurement — CompactInPlace already holds that lock when it measures, and
+// calls the function above directly.
+func (s *Store) usedBytes() int64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return usedBytes(s.db)
+}
 
 // usedBytesAt opens a database read-only just to measure it. It returns 0 if
 // the file cannot be read, since this only ever feeds a progress report.
 func usedBytesAt(path string) int64 {
-	db, err := bolt.Open(path, 0o600, &bolt.Options{ReadOnly: true, Timeout: 5 * time.Second})
+	db, err := openReadOnly(path, 5*time.Second)
 	if err != nil {
 		return 0
 	}
