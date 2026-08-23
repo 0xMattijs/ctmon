@@ -4,12 +4,14 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -60,7 +62,12 @@ func newRig(t *testing.T) *testRig {
 	t.Cleanup(func() { db.Close() })
 
 	return &testRig{
-		pipe: &Pipeline{Store: db, Prober: p, Log: discardLog(), Workers: 4},
+		// Backfill is set because the pending queue only fills when something
+		// is going to drain it, which is the normal configuration.
+		pipe: &Pipeline{
+			Store: db, Prober: p, Log: discardLog(),
+			Workers: 4, Backfill: time.Minute,
+		},
 		db:   db,
 		body: body,
 	}
@@ -252,90 +259,287 @@ func TestDeferredProbeStillStoresTheDomain(t *testing.T) {
 	}
 }
 
-func TestSweepQueuesPendingHosts(t *testing.T) {
-	rig := newRig(t)
-
-	// Two hosts recorded but never probed, one already done.
-	for _, h := range []string{"pending-a.test", "pending-b.test"} {
-		if err := rig.db.Update(h, func(r *store.Record, _ bool) bool { return true }); err != nil {
-			t.Fatal(err)
+// queue records a host and puts it on the pending queue, the way record does.
+func queue(t *testing.T, db *store.Store, host string, at time.Time, fn func(*store.Record)) {
+	t.Helper()
+	err := db.UpdateWithQueue(host, func(r *store.Record, _ bool) (bool, time.Time) {
+		if fn != nil {
+			fn(r)
 		}
-	}
-	err := rig.db.Update("done.test", func(r *store.Record, _ bool) bool {
-		r.Probed = true
-		r.ProbedAt = time.Now().UTC()
-		r.BodyHash = hashOf("abc")
-		return true
+		return true, at
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
+}
 
-	probes := make(chan string, 8)
-	rig.pipe.sweep(context.Background(), probes)
-	close(probes)
-
-	var got []string
-	for h := range probes {
-		got = append(got, h)
+// hosts names the hosts in a batch of queue entries.
+func hosts(items []store.Pending) []string {
+	out := make([]string, len(items))
+	for i, it := range items {
+		out[i] = it.Host
 	}
+	return out
+}
+
+// drain collects the hosts a sweep queued.
+func drain(ch chan store.Pending) []string {
+	close(ch)
+	var got []string
+	for item := range ch {
+		got = append(got, item.Host)
+	}
+	return got
+}
+
+func TestSweepQueuesPendingHosts(t *testing.T) {
+	rig := newRig(t)
+
+	// Two hosts recorded but never probed, one already done. All three are on
+	// the queue: the fast path leaves an entry behind even when it probes the
+	// host itself, and dropping those is the sweep's job.
+	now := time.Now().UTC()
+	queue(t, rig.db, "pending-a.test", now.Add(-2*time.Minute), nil)
+	queue(t, rig.db, "pending-b.test", now.Add(-time.Minute), nil)
+	queue(t, rig.db, "done.test", now.Add(-3*time.Minute), func(r *store.Record) {
+		r.Probed = true
+		r.ProbedAt = now
+		r.BodyHash = hashOf("abc")
+	})
+
+	probes := make(chan store.Pending, 8)
+	rig.pipe.sweep(context.Background(), probes)
+
+	got := drain(probes)
 	if len(got) != 2 || got[0] != "pending-a.test" || got[1] != "pending-b.test" {
 		t.Errorf("sweep queued %v, want the two pending hosts", got)
 	}
 	if n := rig.pipe.Stats().Backfilled.Load(); n != 2 {
 		t.Errorf("backfilled = %d, want 2", n)
 	}
+	// The probed host's entry is gone rather than left to come round again.
+	if n, _, err := rig.db.PendingStats(); err != nil {
+		t.Fatal(err)
+	} else if n != 2 {
+		t.Errorf("queue holds %d entries, want the 2 still owed a probe", n)
+	}
+}
+
+// The old sweep scanned the domain bucket from the top every time, so the
+// backlog drained in reversed-hostname order and names late in that order
+// waited behind every earlier one. The queue is ordered by how long a host has
+// waited, which is the order that has anything to do with the monitor's job.
+func TestSweepTakesTheLongestWaitingFirst(t *testing.T) {
+	rig := newRig(t)
+	now := time.Now().UTC()
+	// Alphabetically first, queued last.
+	queue(t, rig.db, "aaa.test", now.Add(-time.Minute), nil)
+	queue(t, rig.db, "zzz.test", now.Add(-time.Hour), nil)
+	rig.pipe.BackfillBatch = 1
+
+	probes := make(chan store.Pending, 4)
+	rig.pipe.sweep(context.Background(), probes)
+
+	if got := drain(probes); len(got) != 1 || got[0] != "zzz.test" {
+		t.Errorf("sweep queued %v, want the host that has waited longest", got)
+	}
+}
+
+// A host that is not due yet stays put, which is what holds a deferred probe
+// back and what spaces out re-probes.
+func TestSweepLeavesHostsThatAreNotDue(t *testing.T) {
+	rig := newRig(t)
+	queue(t, rig.db, "later.test", time.Now().UTC().Add(time.Hour), nil)
+
+	probes := make(chan store.Pending, 4)
+	rig.pipe.sweep(context.Background(), probes)
+
+	if got := drain(probes); len(got) != 0 {
+		t.Errorf("sweep queued %v, want nothing due yet", got)
+	}
 }
 
 func TestSweepRespectsBatchLimit(t *testing.T) {
 	rig := newRig(t)
-	for _, h := range []string{"a.test", "b.test", "c.test"} {
-		if err := rig.db.Update(h, func(r *store.Record, _ bool) bool { return true }); err != nil {
-			t.Fatal(err)
-		}
+	now := time.Now().UTC()
+	for i, h := range []string{"a.test", "b.test", "c.test"} {
+		queue(t, rig.db, h, now.Add(-time.Duration(i)*time.Minute), nil)
 	}
 	rig.pipe.BackfillBatch = 2
 
-	probes := make(chan string, 8)
+	probes := make(chan store.Pending, 8)
 	rig.pipe.sweep(context.Background(), probes)
-	close(probes)
 
-	n := 0
-	for range probes {
-		n++
-	}
-	if n != 2 {
+	if n := len(drain(probes)); n != 2 {
 		t.Errorf("sweep queued %d hosts, want the 2-host batch limit", n)
 	}
 }
 
 func TestSweepReprobesStaleHosts(t *testing.T) {
 	rig := newRig(t)
-	err := rig.db.Update("old.test", func(r *store.Record, _ bool) bool {
-		r.Probed = true
-		r.ProbedAt = time.Now().Add(-time.Hour).UTC()
-		r.BodyHash = hashOf("abc")
-		return true
+	stale := func() {
+		queue(t, rig.db, "old.test", time.Now().UTC().Add(-time.Minute), func(r *store.Record) {
+			r.Probed = true
+			r.ProbedAt = time.Now().Add(-time.Hour).UTC()
+			r.BodyHash = hashOf("abc")
+		})
+	}
+
+	stale()
+	probes := make(chan store.Pending, 4)
+	rig.pipe.sweep(context.Background(), probes) // Reprobe is 0: nothing is stale
+	if got := drain(probes); len(got) != 0 {
+		t.Fatalf("sweep queued %v with re-probing disabled", got)
+	}
+
+	stale()
+	rig.pipe.Reprobe = time.Minute
+	probes = make(chan store.Pending, 4)
+	rig.pipe.sweep(context.Background(), probes)
+	if got := drain(probes); len(got) != 1 || got[0] != "old.test" {
+		t.Errorf("sweep queued %v, want [old.test]", got)
+	}
+}
+
+// A deferred probe writes nothing about the host and puts it back on the queue
+// for later: nothing was asked, so there is nothing to record.
+func TestDeferredProbeRequeuesInsteadOfRecording(t *testing.T) {
+	rig := newRig(t)
+	rig.pipe.DeferBackoff = time.Millisecond
+	rig.pipe.Prober = probe.New(probe.Options{
+		PerIPRPS:   1,
+		PerIPBurst: 1,
+		Lookup: func(context.Context, string) ([]netip.Addr, error) {
+			return []netip.Addr{netip.MustParseAddr("192.0.2.1")}, nil
+		},
+		DialContext: func(context.Context, string, string) (net.Conn, error) {
+			return nil, errors.New("dial refused by the test")
+		},
 	})
+	queue(t, rig.db, "busy.test", time.Now().UTC().Add(-time.Hour), nil)
+
+	rig.pipe.probe(context.Background(), "busy.test") // spends the burst
+	rig.pipe.probe(context.Background(), "busy.test")
+	if n := rig.pipe.Stats().Throttled.Load(); n != 1 {
+		t.Errorf("throttled = %d, want 1", n)
+	}
+	if n := rig.pipe.Stats().Probed.Load(); n != 1 {
+		t.Errorf("probed = %d, want only the probe that went through", n)
+	}
+	// The deferral left no mark on the record: nothing was asked of the host.
+	rec, err := rig.db.Get("busy.test")
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	probes := make(chan string, 4)
-	rig.pipe.sweep(context.Background(), probes) // Reprobe is 0: nothing is stale
-	if len(probes) != 0 {
-		t.Fatalf("sweep queued %d hosts with re-probing disabled", len(probes))
+	if rec.ProbeCount != 1 {
+		t.Errorf("probe_count = %d, want 1", rec.ProbeCount)
 	}
 
-	rig.pipe.Reprobe = time.Minute
-	rig.pipe.sweep(context.Background(), probes)
-	close(probes)
-	var got []string
-	for h := range probes {
-		got = append(got, h)
+	// The host is back on the queue, and the deferral left no mark on it.
+	time.Sleep(5 * time.Millisecond)
+	got, err := rig.db.PendingLease(time.Now().UTC(), 10, time.Minute)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if len(got) != 1 || got[0] != "old.test" {
-		t.Errorf("sweep queued %v, want [old.test]", got)
+	if len(got) == 0 {
+		t.Fatal("a deferred host was dropped rather than queued again")
+	}
+}
+
+// The record and its queue entry are written together, so a host that wants a
+// probe is always one the queue knows about — whatever happens next.
+func TestRecordQueuesEveryHostThatWantsAProbe(t *testing.T) {
+	rig := newRig(t)
+	// A full fresh queue is the case that used to lose work: the host stayed
+	// unprobed and only a scan of the whole store would find it again.
+	full := make(chan string)
+	rig.pipe.record(context.Background(), nameSeen{
+		name: domain.Name{Host: "shed.test", From: "shed.test", Origin: domain.OriginCN},
+		cert: source.Cert{CN: "shed.test", SeenAt: time.Now().UTC()},
+	}, full)
+
+	if n := rig.pipe.Stats().Deferred.Load(); n != 1 {
+		t.Errorf("deferred = %d, want the shed probe counted", n)
+	}
+	got, err := rig.db.PendingLease(time.Now().UTC().Add(time.Second), 10, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Host != "shed.test" {
+		t.Errorf("queue holds %v, want [shed.test]", hosts(got))
+	}
+}
+
+// With re-probing on, finishing a probe schedules the next one. Nothing else
+// does: without this a host would be fetched once and never looked at again.
+func TestProbeSchedulesTheNextOne(t *testing.T) {
+	rig := newRig(t)
+	rig.pipe.Reprobe = time.Hour
+	// Recorded but not queued, so the only entry afterwards is the one the
+	// probe itself schedules.
+	if err := rig.db.Update("seen.test", func(*store.Record, bool) bool { return true }); err != nil {
+		t.Fatal(err)
+	}
+
+	rig.pipe.probe(context.Background(), "seen.test")
+
+	n, oldest, err := rig.db.PendingStats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("queue holds %d entries after a probe, want the one re-probe", n)
+	}
+	if wait := time.Until(oldest); wait < 30*time.Minute {
+		t.Errorf("next probe due in %v, want about the one-hour re-probe interval", wait)
+	}
+}
+
+// Without a sweep nothing takes entries out of the queue, so nothing should
+// put them in: the bucket would otherwise grow by every hostname ever seen.
+func TestNoBackfillMeansNoQueue(t *testing.T) {
+	rig := newRig(t)
+	rig.pipe.Backfill = 0
+
+	rig.pipe.record(context.Background(), nameSeen{
+		name: domain.Name{Host: "unswept.test", From: "unswept.test", Origin: domain.OriginCN},
+		cert: source.Cert{CN: "unswept.test", SeenAt: time.Now().UTC()},
+	}, make(chan string, 1))
+
+	if rec, err := rig.db.Get("unswept.test"); err != nil || rec == nil {
+		t.Fatalf("host = %v, %v; want it recorded regardless", rec, err)
+	}
+	if n, _, err := rig.db.PendingStats(); err != nil {
+		t.Fatal(err)
+	} else if n != 0 {
+		t.Errorf("queue holds %d entries with the sweep off, want none", n)
+	}
+}
+
+// A result that never reached the store leaves the record saying unprobed. The
+// probe reports itself unsettled so the caller keeps the lease: releasing it
+// would drop the host from the queue as well, and nothing would look at it
+// again.
+func TestProbeIsUnsettledWhenTheStoreWriteFails(t *testing.T) {
+	rig := newRig(t)
+	queue(t, rig.db, "host.test", time.Now().UTC().Add(-time.Hour), nil)
+
+	// A closed store fails every write, which is the shape of the case worth
+	// worrying about.
+	if err := rig.db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if rig.pipe.probe(context.Background(), "host.test") {
+		t.Error("probe called itself settled after the store write failed")
+	}
+}
+
+// A record that has been deleted is settled, not failed: it was removed on
+// purpose, so its queue entry should go too rather than come round for ever.
+func TestProbeSettlesAHostWhoseRecordIsGone(t *testing.T) {
+	rig := newRig(t)
+	if !rig.pipe.probe(context.Background(), "never-recorded.test") {
+		t.Error("probe of an absent record was unsettled, want the entry released")
 	}
 }
 
@@ -630,9 +834,9 @@ func TestFreshDiscoveriesJumpTheBacklog(t *testing.T) {
 		}),
 	}
 
-	backlog := make(chan string, 64)
+	backlog := make(chan store.Pending, 64)
 	for i := 0; i < 20; i++ {
-		backlog <- fmt.Sprintf("old%02d.test", i)
+		backlog <- store.Pending{Host: fmt.Sprintf("old%02d.test", i)}
 	}
 	fresh := make(chan string, 4)
 	fresh <- "brand-new.test"
@@ -669,9 +873,9 @@ func TestProbeFreshFirstDrainsBothQueues(t *testing.T) {
 	}
 
 	fresh := make(chan string, 2)
-	backlog := make(chan string, 2)
+	backlog := make(chan store.Pending, 2)
 	fresh <- "a.test"
-	backlog <- "b.test"
+	backlog <- store.Pending{Host: "b.test"}
 	close(fresh)
 	close(backlog)
 

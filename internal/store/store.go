@@ -18,12 +18,15 @@ var (
 	bucketDomains = []byte("domains")
 	bucketLogPos  = []byte("logpos")
 	bucketMeta    = []byte("meta")
+	bucketPending = []byte("pending")
 
 	bucketSources = "dict_sources"
 	bucketIssuers = "dict_issuers"
 	bucketErrors  = "dict_errors"
 
 	keyFormat = []byte("format")
+	keySeeded = []byte("pending_seeded")
+	keySeedAt = []byte("pending_seed_cursor")
 )
 
 // ErrLegacyFormat says the database predates the packed record format.
@@ -89,7 +92,7 @@ func Open(path string) (*Store, error) {
 		errors:  newDict(bucketErrors),
 	}
 	err = db.Update(func(tx *bolt.Tx) error {
-		for _, b := range [][]byte{bucketDomains, bucketLogPos, bucketMeta} {
+		for _, b := range [][]byte{bucketDomains, bucketLogPos, bucketMeta, bucketPending} {
 			if _, err := tx.CreateBucketIfNotExists(b); err != nil {
 				return err
 			}
@@ -127,6 +130,14 @@ func (s *Store) batch(fn func(*bolt.Tx) error) error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.db.Batch(fn)
+}
+
+// update is batch's uncoalesced sibling, for the writes that are already one
+// big transaction and would gain nothing from being merged with another.
+func (s *Store) update(fn func(*bolt.Tx) error) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.db.Update(fn)
 }
 
 // checkFormat stamps the format version on a new database and refuses one
@@ -179,6 +190,20 @@ func (s *Store) Get(host string) (*Record, error) {
 // Update uses bolt's batching, so concurrent callers coalesce into shared
 // transactions.
 func (s *Store) Update(host string, fn func(rec *Record, existed bool) bool) error {
+	return s.UpdateWithQueue(host, func(rec *Record, existed bool) (bool, time.Time) {
+		return fn(rec, existed), time.Time{}
+	})
+}
+
+// UpdateWithQueue is Update plus a pending-queue entry written in the same
+// transaction: fn returns the time a probe is due, and a zero time queues
+// nothing. Doing both at once is the point — a record that wants a probe and a
+// queue entry that says so cannot come apart, whatever happens next.
+//
+// fn must not read the clock to build that time. bolt may run a batched
+// transaction more than once, and a due time that differs between attempts
+// leaves a duplicate entry in the queue.
+func (s *Store) UpdateWithQueue(host string, fn func(rec *Record, existed bool) (write bool, due time.Time)) error {
 	var fresh []freshID
 	err := s.batch(func(tx *bolt.Tx) error {
 		// bolt may run this more than once if the batch retries, so
@@ -196,7 +221,8 @@ func (s *Store) Update(host string, fn func(rec *Record, existed bool) bool) err
 			}
 			existed = true
 		}
-		if !fn(rec, existed) {
+		write, due := fn(rec, existed)
+		if !write {
 			return nil
 		}
 		raw, ids, err := s.encode(tx, rec)
@@ -204,7 +230,13 @@ func (s *Store) Update(host string, fn func(rec *Record, existed bool) bool) err
 			return fmt.Errorf("encode %s: %w", host, err)
 		}
 		fresh = ids
-		return b.Put(key, raw)
+		if err := b.Put(key, raw); err != nil {
+			return err
+		}
+		if due.IsZero() {
+			return nil
+		}
+		return enqueue(tx, host, due)
 	})
 	if err != nil {
 		return err
@@ -278,6 +310,8 @@ type Stats struct {
 	Wildcards int
 	Errors    int
 	Changed   int
+	Pending   int
+	Oldest    time.Time
 	Logs      map[string]uint64
 }
 
@@ -307,6 +341,9 @@ func (s *Store) Stats() (Stats, error) {
 		return st, err
 	}
 	st.Sources, st.Issuers, st.ErrorKind = s.sources.len(), s.issuers.len(), s.errors.len()
+	if st.Pending, st.Oldest, err = s.PendingStats(); err != nil {
+		return st, err
+	}
 	err = s.view(func(tx *bolt.Tx) error {
 		st.Bytes = tx.Size()
 		return tx.Bucket(bucketLogPos).ForEach(func(k, v []byte) error {
@@ -421,4 +458,32 @@ func (s *Store) reopen(cause error) error {
 	}
 	s.db = db
 	return cause
+}
+
+// GetAll returns the records for hosts that exist, keyed by hostname, in one
+// read transaction. Hosts with no record are simply absent from the result.
+//
+// It exists for the backfill sweep, which asks about a whole batch at once and
+// was paying for a transaction per host to do it.
+func (s *Store) GetAll(hosts []string) (map[string]*Record, error) {
+	out := make(map[string]*Record, len(hosts))
+	err := s.view(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketDomains)
+		for _, host := range hosts {
+			raw := b.Get([]byte(reverseHost(host)))
+			if raw == nil {
+				continue
+			}
+			rec := &Record{Host: host}
+			if err := s.decode(host, raw, rec); err != nil {
+				return fmt.Errorf("decode %s: %w", host, err)
+			}
+			out[host] = rec
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
 }
