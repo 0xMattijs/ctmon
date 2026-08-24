@@ -225,8 +225,8 @@ Two sources feed the same pipeline, and both run by default (`--source both`):
 - **`ctlog`** polls CT logs directly over RFC 6962 (`get-sth`, `get-entries`).
   It depends on nobody but the logs, and it records how far it has read each
   log, so a restart resumes exactly where it stopped. Logs are discovered from
-  Google's v3 log list, filtered to the ones usable and taking certificates
-  now; override with `--logs`.
+  Google's v3 log list — the usable RFC 6962 ones taking certificates now, not
+  the Static CT API ones it also lists; override with `--logs`.
 
 Run just one with `--source certstream` or `--source ctlog`.
 
@@ -280,8 +280,14 @@ bound entirely would give 21, including shards that do not open until late
 
 The default is deliberately the older, longer validity limit. Being late to
 shrink it costs a `get-sth` per poll against a few empty shards; being early to
-shrink it loses certificates. The real cost is that it roughly doubles the
-request load of `--source ctlog`, which is what the flag is there for.
+shrink it loses certificates.
+
+The real cost is that it roughly doubles the request load of `--source ctlog`,
+which is what the flag is there for. `--log-lookahead 0` asks for no lookahead
+and follows only the shards open now — the old behaviour, at half the requests.
+That is a reasonable trade on `--source both`, where the firehose still carries
+what the successor shard is being sent, and a bad one on `--source ctlog`
+alone, where nothing else is watching it.
 
 ### When a log goes bad
 

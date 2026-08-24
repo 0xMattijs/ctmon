@@ -126,9 +126,10 @@ const DefaultShardLookahead = 200 * 24 * time.Hour
 // worth following now: approved for Chrome, and able to be accepting
 // certificates today. Those are the logs where new certificates actually land.
 //
-// lookahead is how far ahead of now a shard may open and still be followed;
-// zero means DefaultShardLookahead. See that constant for why the window is
-// not simply "the interval contains now".
+// lookahead is how far ahead of now a shard may open and still be followed.
+// Zero is no lookahead: only the shards whose interval contains now, which is
+// cheaper and misses the shard being written to. See DefaultShardLookahead for
+// why that is the wrong default.
 func DiscoverLogs(ctx context.Context, hc *http.Client, listURL string, lookahead time.Duration) ([]string, error) {
 	if listURL == "" {
 		listURL = loglist3.LogListURL
@@ -165,12 +166,19 @@ func DiscoverLogs(ctx context.Context, hc *http.Client, listURL string, lookahea
 // now, given the lookahead. It is separate from DiscoverLogs so the rule can
 // be tested against a clock rather than against the calendar.
 //
+// A lookahead of zero asks for no lookahead at all, matching what zero means
+// on every other duration this program takes. It is not quietly promoted to
+// DefaultShardLookahead: the only caller that can pass zero is one that asked
+// for it, and answering an explicit "cheapest" with the widest window there is
+// would double the request load the operator was trying to avoid. Negative is
+// the same as zero — there is no window narrower than none.
+//
 // A log with no temporal interval is not sharded and is always kept.
 func selectLogs(ll *loglist3.LogList, now time.Time, lookahead time.Duration) []string {
-	if lookahead <= 0 {
-		lookahead = DefaultShardLookahead
+	opensBy := now
+	if lookahead > 0 {
+		opensBy = now.Add(lookahead)
 	}
-	opensBy := now.Add(lookahead)
 	usable := ll.SelectByStatus([]loglist3.LogStatus{loglist3.UsableLogStatus})
 	var uris []string
 	for _, op := range usable.Operators {

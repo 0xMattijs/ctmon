@@ -52,6 +52,10 @@ type feedConfig struct {
 	// followed. A shard's interval bounds the certificate's NotAfter, not when
 	// it was submitted, so new certificates land in the shard covering their
 	// expiry — up to a maximum validity period ahead of the clock.
+	//
+	// Zero follows only the shards open now, which is what the feed used to do
+	// and roughly halves its requests. It is a real choice for a run on
+	// --source both, where the firehose covers the shard this stops watching.
 	logLookahead time.Duration
 	fromStart    bool
 	batch        int
@@ -135,7 +139,7 @@ func (c *runConfig) bind(fs *flag.FlagSet) {
 	fs.StringVar(&f.logURIs, "logs", "", "comma-separated CT log URLs (default: discover usable logs)")
 	fs.StringVar(&f.listURL, "log-list-url", "", "CT log list URL (default: Google's v3 list)")
 	fs.DurationVar(&f.logRefresh, "log-refresh", 24*time.Hour, "re-read the log list this often and follow what it now lists (0 disables; ignored with --logs)")
-	fs.DurationVar(&f.logLookahead, "log-lookahead", source.DefaultShardLookahead, "also follow shards that open this far ahead, where certificates issued today are already landing")
+	fs.DurationVar(&f.logLookahead, "log-lookahead", source.DefaultShardLookahead, "also follow shards that open this far ahead, where certificates issued today are already landing (0 follows only the shards open now; ignored with --logs)")
 	fs.BoolVar(&f.fromStart, "from-start", false, "read each new log from index 0 instead of its current tip")
 	fs.IntVar(&f.batch, "batch", 256, "entries per get-entries request (a ceiling: a log that times out gets asked for less)")
 	fs.Uint64Var(&f.maxLag, "max-lag", 0, "skip a log to its tree head when it falls this many entries behind (0 = never skip)")

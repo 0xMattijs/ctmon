@@ -84,10 +84,15 @@ func TestSelectDropsAShardThatEnded(t *testing.T) {
 	}
 }
 
-// TestSelectIsHalfOpenAtBothEnds pins the boundaries the interval names:
-// StartInclusive is in the window and EndExclusive is out of it, so the two
-// shards meeting at an instant are never both live and never both dead.
-func TestSelectIsHalfOpenAtBothEnds(t *testing.T) {
+// TestSelectPinsBothBoundaries fixes which side of each edge is in. A shard
+// whose EndExclusive is exactly now is out, because the interval is half-open
+// and nothing issued now can expire before it. A shard opening exactly at the
+// lookahead is in, because a certificate issued now with the full validity
+// period expires exactly then.
+//
+// Adjacent shards being both live is the point of the lookahead, not a
+// violation of it — see TestSelectFollowsTheShardCertificatesLandIn.
+func TestSelectPinsBothBoundaries(t *testing.T) {
 	now := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
 	boundary := now.Add(200 * day)
 	ll := shardedList(
@@ -134,15 +139,37 @@ func TestSelectSkipsLogsThatAreNotUsable(t *testing.T) {
 	}
 }
 
-// TestSelectDefaultsTheLookahead means a caller passing nothing gets the
-// window the constant describes, not a point filter that misses the successor.
-func TestSelectDefaultsTheLookahead(t *testing.T) {
+// TestSelectTakesZeroLookaheadLiterally keeps zero meaning what it means on
+// every other duration this program takes. Promoting it to the default would
+// answer an operator asking for the cheapest window with the widest one there
+// is, and double the requests they were trying to avoid.
+func TestSelectTakesZeroLookaheadLiterally(t *testing.T) {
 	now := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
-	next := usableLog("https://ct.example/next", now.Add(DefaultShardLookahead-day), now.Add(400*day))
-	ll := shardedList(next)
+	ll := shardedList(
+		usableLog("https://ct.example/open-now", now.Add(-60*day), now.Add(130*day)),
+		usableLog("https://ct.example/next", now.Add(130*day), now.Add(311*day)),
+	)
 
-	if got := selectLogs(ll, now, 0); !slices.Equal(got, []string{"https://ct.example/next"}) {
-		t.Fatalf("selectLogs with no lookahead = %v, want the successor shard", got)
+	for _, lookahead := range []time.Duration{0, -day} {
+		got := selectLogs(ll, now, lookahead)
+		want := []string{"https://ct.example/open-now"}
+		if !slices.Equal(got, want) {
+			t.Errorf("selectLogs with lookahead %v = %v, want %v", lookahead, got, want)
+		}
+	}
+}
+
+// TestSelectAtTheDefaultLookahead is the constant doing its job: at the
+// shipped window the successor shard is followed, which is the whole point of
+// the change.
+func TestSelectAtTheDefaultLookahead(t *testing.T) {
+	now := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
+	ll := shardedList(usableLog("https://ct.example/next",
+		now.Add(DefaultShardLookahead-day), now.Add(400*day)))
+
+	got := selectLogs(ll, now, DefaultShardLookahead)
+	if !slices.Equal(got, []string{"https://ct.example/next"}) {
+		t.Fatalf("selectLogs at the default lookahead = %v, want the successor shard", got)
 	}
 }
 
