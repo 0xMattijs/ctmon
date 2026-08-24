@@ -198,10 +198,15 @@ var seedChunk = 20000
 //
 // A seed that is interrupted resumes. The cursor is committed with each chunk,
 // so a run killed part way through picks up where it stopped instead of
-// walking the records it has already queued a second time. A MarkUnqueued in
-// between drops that cursor and the next seed starts from the top, because
-// what it has to collect is spread over the records the walk had already
-// passed.
+// walking the records it has already queued a second time. A MarkUnqueued
+// between one attempt and the next drops that cursor and the seed starts from
+// the top, because what it then has to collect is spread over the records the
+// walk had already passed.
+//
+// Between attempts is the only place a mark may land. One arriving while a
+// walk is running would be overwritten by that walk's next chunk, and the walk
+// would carry on past the records it was about. A run marks or seeds and never
+// both, and bolt's exclusive lock is what stops two runs from doing one each.
 //
 // due decides, per record, whether a probe is wanted and when it is due.
 // progress, if given, is called after each chunk so a long seed can say so.
@@ -319,6 +324,8 @@ func (s *Store) finishSeed(generation string) error {
 //
 // It is written at the start of such a run rather than the end, because a run
 // killed outright leaves the same records behind as one that exits cleanly.
+// That is also the only safe place for it: marking must not overlap a
+// SeedPending walk, and a run that seeds does not mark.
 func (s *Store) MarkUnqueued() error {
 	return s.update(func(tx *bolt.Tx) error {
 		meta := tx.Bucket(bucketMeta)
