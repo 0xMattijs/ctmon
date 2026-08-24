@@ -1,6 +1,7 @@
 # ctmon — a certificate transparency domain monitor
 
 [![CI](https://github.com/0xMattijs/ctmon/actions/workflows/ci.yml/badge.svg)](https://github.com/0xMattijs/ctmon/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 `ctmon` watches Certificate Transparency logs for newly issued certificates,
 derives hostnames from each certificate's Common Name and subject alternative
@@ -1250,3 +1251,22 @@ key id pinned against a live log's published key, a checkpoint carrying grease
 and witness lines around the log's own, and a follower stopping rather than
 retrying when one does not verify — what the pipeline does when the store
 refuses a write, and the pipeline end to end against a local HTTPS server.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
+
+Everything in this repository is under those terms, including the hosting
+blocklist in `internal/pipeline/skiplist.txt`, which carries no attribution of
+its own.
+
+The eight modules `ctmon` links are all permissive and all compatible with MIT.
+They stay under their own terms:
+
+| | |
+|---|---|
+| `github.com/google/certificate-transparency-go` | Apache-2.0 |
+| `go.etcd.io/bbolt` | MIT |
+| `github.com/gorilla/websocket` | BSD-3-Clause |
+| `golang.org/x/net`, `x/sys`, `x/time`, `x/crypto` | BSD-3-Clause |
+| `google.golang.org/protobuf` | BSD-3-Clause |
