@@ -187,16 +187,26 @@ func (s *Store) PendingStats() (count int, oldest time.Time, err error) {
 var seedChunk = 20000
 
 // SeedPending fills the queue from records the queue does not know about:
-// those written before it existed, and those a change of re-probe policy has
-// brought back into scope.
+// those written before it existed, those a change of re-probe policy has
+// brought back into scope, and those a run with the sweep off recorded without
+// queuing.
 //
 // generation names the policy being seeded for. Seeding runs when what the
 // store last finished differs from it, which is what stops "--reprobe 24h"
-// from being ignored on a database first seeded without it.
+// from being ignored on a database first seeded without it. It also runs when
+// MarkUnqueued has been called since the last seed, whatever the generation.
 //
 // A seed that is interrupted resumes. The cursor is committed with each chunk,
 // so a run killed part way through picks up where it stopped instead of
-// walking the records it has already queued a second time.
+// walking the records it has already queued a second time. A MarkUnqueued
+// between one attempt and the next drops that cursor and the seed starts from
+// the top, because what it then has to collect is spread over the records the
+// walk had already passed.
+//
+// Between attempts is the only place a mark may land. One arriving while a
+// walk is running would be overwritten by that walk's next chunk, and the walk
+// would carry on past the records it was about. A run marks or seeds and never
+// both, and bolt's exclusive lock is what stops two runs from doing one each.
 //
 // due decides, per record, whether a probe is wanted and when it is due.
 // progress, if given, is called after each chunk so a long seed can say so.
@@ -260,12 +270,16 @@ func (s *Store) SeedPending(generation string, due func(*Record) (time.Time, boo
 func (s *Store) seedState(generation string) (after []byte, wanted bool, err error) {
 	err = s.view(func(tx *bolt.Tx) error {
 		meta := tx.Bucket(bucketMeta)
-		if string(meta.Get(keySeeded)) == generation {
+		if meta.Get(keyUnqueued) == nil && string(meta.Get(keySeeded)) == generation {
 			return nil
 		}
 		wanted = true
 		// A cursor from an interrupted seed is only good for the generation
-		// that wrote it.
+		// that wrote it. Whether the walk it belongs to was making up for an
+		// unqueued run does not come into it: MarkUnqueued throws the cursor
+		// away, so a cursor that is still here belongs to a walk that started
+		// after the last mark, and everything that mark is about is still
+		// ahead of it.
 		if at := meta.Get(keySeedAt); at != nil {
 			if gen, cursor, ok := bytes.Cut(at, []byte{0}); ok && string(gen) == generation {
 				after = append([]byte{}, cursor...)
@@ -290,6 +304,54 @@ func (s *Store) finishSeed(generation string) error {
 		if err := meta.Put(keySeeded, []byte(generation)); err != nil {
 			return err
 		}
-		return meta.Delete(keySeedAt)
+		if err := meta.Delete(keySeedAt); err != nil {
+			return err
+		}
+		// The walk that just finished is the one the marker was asking for.
+		return meta.Delete(keyUnqueued)
 	})
+}
+
+// MarkUnqueued records that this run stores discoveries without queuing them,
+// so the next run that sweeps fills the queue from the records again.
+//
+// A run with the sweep off writes records nothing in the queue points at: a
+// host shed because every worker was busy, or turned away by an address
+// budget, is recorded unprobed and never scheduled. The generation names the
+// re-probe policy and nothing else, so a later swept run under the same policy
+// would skip the seed and leave those hosts waiting for a certificate to name
+// them again. The marker is what turns that skip back into a walk, once.
+//
+// It is written at the start of such a run rather than the end, because a run
+// killed outright leaves the same records behind as one that exits cleanly.
+// That is also the only safe place for it: marking must not overlap a
+// SeedPending walk, and a run that seeds does not mark.
+func (s *Store) MarkUnqueued() error {
+	return s.update(func(tx *bolt.Tx) error {
+		meta := tx.Bucket(bucketMeta)
+		// Any interrupted seed's cursor is void from here. The records this
+		// run is about to write are scattered across the whole keyspace, most
+		// of them behind wherever that walk stopped, so resuming it would
+		// step over them — and the walk clears the marker when it finishes,
+		// so nothing would look for them again.
+		if err := meta.Delete(keySeedAt); err != nil {
+			return err
+		}
+		return meta.Put(keyUnqueued, []byte{1})
+	})
+}
+
+// Unqueued reports whether a run left records the queue was never told about.
+// The next seed to finish clears it.
+func (s *Store) Unqueued() (bool, error) {
+	var yes bool
+	err := s.view(func(tx *bolt.Tx) error {
+		// Absent only on a database a read-only handle opened without being
+		// able to create it. See OpenReadOnly.
+		if b := tx.Bucket(bucketMeta); b != nil {
+			yes = b.Get(keyUnqueued) != nil
+		}
+		return nil
+	})
+	return yes, err
 }

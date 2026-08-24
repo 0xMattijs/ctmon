@@ -625,11 +625,19 @@ they arrive:
 
 What that costs is every probe that could not happen the moment the name
 arrived. A host shed because all the workers were busy, or turned away by its
-address's budget, is recorded unprobed and nothing schedules it. Turning the
-sweep back on later does not find it either: the startup seed runs only on a
-store the queue has not been seeded for, so a database that was already seeded
-under the same `--reprobe` setting is left alone. The host comes back when a
-certificate names it again, and not before.
+address's budget, is recorded unprobed and nothing schedules it.
+
+Those hosts are not lost. A run with the sweep off marks the database as
+holding records the queue was never told about, and the next run that does
+sweep fills the queue from the records again — the walk below — so they join
+the backlog then:
+
+```console
+INFO a previous run recorded hosts without queuing them: filling the queue again
+```
+
+What the mode costs is the wait until such a run happens, and one full walk of
+the store when it does.
 
 `--backfill 0` is for a run you want to leave no backlog behind. It is not a
 way to probe less.
@@ -638,7 +646,9 @@ Re-probing rides on the same queue. A finished probe schedules the next one,
 and because that leaves every host probed before `--reprobe` was set out of the
 queue entirely, changing the setting seeds the store again for the new policy.
 
-A database the queue does not yet know about is filled in at startup:
+The queue is filled from the records at startup whenever it may be missing
+some: on a database written before the queue existed, after `--reprobe`
+changes, and after a run with the sweep off:
 
 ```console
 INFO filling the probe queue scanned=1640000 queued=1479642
