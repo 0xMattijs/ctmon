@@ -107,6 +107,17 @@ type throttled struct {
 	reason string
 }
 
+// attrs are the wait and, if the log gave one, the reason, for a log line
+// that already knows which log it is talking about. A log that sends no body
+// gets the line it always got rather than an empty field.
+func (t *throttled) attrs() []any {
+	a := []any{"wait", t.wait}
+	if t.reason != "" {
+		a = append(a, "reason", t.reason)
+	}
+	return a
+}
+
 func (t *throttled) Error() string {
 	if t.reason == "" {
 		return fmt.Sprintf("rate limited, asked to wait %v", t.wait.Round(time.Second))
@@ -116,18 +127,28 @@ func (t *throttled) Error() string {
 
 // maxThrottleReasonBytes caps how much of a 429 body is kept. The body is a
 // sentence meant for a human, not a payload; a log that answers with a page
-// gets the first line of it and nothing more.
+// gets the first 256 bytes of it and nothing more.
 const maxThrottleReasonBytes = 256
 
-// throttleReason reads a 429 body into one line fit for a log field. Anything
-// unreadable leaves the reason empty, because a refusal that cannot be
-// explained is still a refusal and must not become a failure.
+// throttleReason reads a 429 body into one line fit for a log field: the whole
+// of what fits, whitespace collapsed, so a body wrapped across lines stays one
+// field. Anything unreadable leaves the reason empty, because a refusal that
+// cannot be explained is still a refusal and must not become a failure.
+//
+// The cap counts bytes, so a body in any script but Latin can be cut through
+// the middle of a rune; the remains of that rune are dropped rather than
+// written out as the invalid UTF-8 they now are.
+//
+// Reading the body puts the refusal under the client's timeout, where before
+// it returned the moment the status was read. A log that sends 429 headers and
+// then stalls holds the follower for that long instead of the Retry-After it
+// asked for — bounded, and the price of hearing what the log said.
 func throttleReason(r io.Reader) string {
 	body, err := io.ReadAll(io.LimitReader(r, maxThrottleReasonBytes))
 	if err != nil {
 		return ""
 	}
-	return strings.Join(strings.Fields(string(body)), " ")
+	return strings.ToValidUTF8(strings.Join(strings.Fields(string(body)), " "), "")
 }
 
 // maxThrottleWait caps how long a log can send this feed away for. A log is
@@ -261,10 +282,10 @@ func (t *TiledLog) follow(ctx context.Context, lg Log, out chan<- Cert) error {
 			return err
 		}
 		cp, err := t.checkpoint(ctx, hc, uri)
-		if sentAway, ok := askedToWait(err); ok {
-			t.Log.Info("static ct log rate limited; waiting", "log", uri,
-				"wait", sentAway.wait, "reason", sentAway.reason)
-			if err := sleep(ctx, sentAway.wait); err != nil {
+		if refusal, sentAway := askedToWait(err); sentAway {
+			t.Log.Info("static ct log rate limited; waiting",
+				append([]any{"log", uri}, refusal.attrs()...)...)
+			if err := sleep(ctx, refusal.wait); err != nil {
 				return err
 			}
 			continue
@@ -331,11 +352,10 @@ func (t *TiledLog) follow(ctx context.Context, lg Log, out chan<- Cert) error {
 			t.Log.Debug("static ct tile", "log", uri, "tile", path,
 				"position", pos, "tree_size", cp.Size)
 			body, err := t.fetchTile(ctx, hc, uri, path)
-			if sentAway, ok := askedToWait(err); ok {
+			if refusal, sentAway := askedToWait(err); sentAway {
 				t.Log.Info("static ct log rate limited; waiting",
-					"log", uri, "tile", path, "wait", sentAway.wait,
-					"reason", sentAway.reason)
-				if err := sleep(ctx, sentAway.wait); err != nil {
+					append([]any{"log", uri, "tile", path}, refusal.attrs()...)...)
+				if err := sleep(ctx, refusal.wait); err != nil {
 					return err
 				}
 				stopped = wasThrottled

@@ -15,6 +15,7 @@ import (
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -670,11 +671,29 @@ func TestThrottleReasonFitsOneLogLine(t *testing.T) {
 		{"empty", "", ""},
 		{"whitespace only", "\n\n \t", ""},
 		{"a page", strings.Repeat("a", 4096), strings.Repeat("a", maxThrottleReasonBytes)},
+		// 256 bytes falls inside the 86th of these, and two thirds of a rune
+		// is not text. 85 of them is what fits whole.
+		{"cut through a rune", strings.Repeat("\u65e5", 4096), strings.Repeat("\u65e5", 85)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := throttleReason(strings.NewReader(tc.body)); got != tc.want {
 				t.Errorf("kept %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// TestThrottleAttrsLeaveOutWhatWasNotSaid keeps the ordinary rate limit — the
+// common case, and the one that says nothing beyond how long — reading as it
+// did before there was a reason to print. An empty field is worse than no
+// field: it invites the reader to wonder what was lost.
+func TestThrottleAttrsLeaveOutWhatWasNotSaid(t *testing.T) {
+	silent := (&throttled{wait: 30 * time.Second}).attrs()
+	if want := []any{"wait", 30 * time.Second}; !reflect.DeepEqual(silent, want) {
+		t.Errorf("a log that said nothing logs %v, want %v", silent, want)
+	}
+	spoke := (&throttled{wait: time.Second, reason: "no"}).attrs()
+	if want := []any{"wait", time.Second, "reason", "no"}; !reflect.DeepEqual(spoke, want) {
+		t.Errorf("a log that said something logs %v, want %v", spoke, want)
 	}
 }
