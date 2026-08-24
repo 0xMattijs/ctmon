@@ -360,3 +360,69 @@ func TestSeedResumesFromWhereItStopped(t *testing.T) {
 			total, before, queued, n)
 	}
 }
+
+// A run with the sweep off records hosts nothing queues: one shed because
+// every worker was busy is written unprobed with no entry pointing at it. The
+// generation names the re-probe policy alone, so without a marker of its own
+// that run's discoveries would be skipped by the next swept run's seed and
+// wait for a certificate to name them again.
+func TestSeedRunsAgainAfterAnUnqueuedRun(t *testing.T) {
+	db := openTemp(t)
+	seen := time.Now().UTC().Add(-time.Hour)
+	write := func(host string, probed bool) {
+		t.Helper()
+		err := db.Update(host, func(r *Record, _ bool) bool {
+			r.FirstSeen, r.Probed, r.ProbedAt = seen, probed, seen
+			return true
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	due := func(r *Record) (time.Time, bool) {
+		if r.Probed {
+			return time.Time{}, false
+		}
+		return r.FirstSeen, true
+	}
+
+	write("done.test", true)
+	if _, ran, err := db.SeedPending("gen1", due, nil); err != nil || !ran {
+		t.Fatalf("first seed did not run (ran=%v, err %v)", ran, err)
+	}
+
+	// The run with the sweep off: a record, no queue entry, and the marker
+	// that says so.
+	write("shed.test", false)
+	if err := db.MarkUnqueued(); err != nil {
+		t.Fatal(err)
+	}
+	if unqueued, err := db.Unqueued(); err != nil || !unqueued {
+		t.Fatalf("marker not set (unqueued=%v, err %v)", unqueued, err)
+	}
+
+	// Same policy as the first seed, so only the marker can bring the walk
+	// back.
+	queued, ran, err := db.SeedPending("gen1", due, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ran || queued != 1 {
+		t.Errorf("seed queued %d hosts (ran=%v), want the shed host queued", queued, ran)
+	}
+	got, err := db.PendingLease(time.Now().UTC(), 10, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Host != "shed.test" {
+		t.Errorf("queued %v, want only [shed.test]", hosts(got))
+	}
+
+	// And the walk it asked for clears it, so the next start is cheap again.
+	if unqueued, err := db.Unqueued(); err != nil || unqueued {
+		t.Errorf("marker survived the seed (unqueued=%v, err %v)", unqueued, err)
+	}
+	if _, ran, err := db.SeedPending("gen1", due, nil); err != nil || ran {
+		t.Errorf("seed ran again with nothing asking for it (err %v)", err)
+	}
+}

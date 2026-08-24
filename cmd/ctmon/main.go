@@ -137,8 +137,16 @@ func runCmd(args []string) error {
 		if ctx.Err() != nil {
 			return nil
 		}
-	} else if !pipe.NoProbe {
-		log.Info("backfill is off: hosts are probed as they arrive and none are queued")
+	} else {
+		// Everything this run records gets no queue entry, including the hosts
+		// it could not probe on arrival. Mark the store so the next run that
+		// does sweep seeds the queue and picks them up.
+		if err := db.MarkUnqueued(); err != nil {
+			return err
+		}
+		if !pipe.NoProbe {
+			log.Info("backfill is off: hosts are probed as they arrive and none are queued")
+		}
 	}
 
 	certs := make(chan source.Cert, 1024)
@@ -605,6 +613,15 @@ func splitList(raw string) []string {
 func seedPending(ctx context.Context, db *store.Store, pipe *pipeline.Pipeline, log *slog.Logger) error {
 	start := time.Now()
 	var last time.Time
+	// Worth saying which of the two reasons a walk is happening for: an
+	// unchanged --reprobe on an already seeded store otherwise says nothing.
+	unqueued, err := db.Unqueued()
+	if err != nil {
+		return err
+	}
+	if unqueued {
+		log.Info("a previous run recorded hosts without queuing them: filling the queue again")
+	}
 	queued, ran, err := db.SeedPending(
 		seedGeneration(pipe.Reprobe),
 		func(r *store.Record) (time.Time, bool) {
@@ -641,7 +658,9 @@ func seedPending(ctx context.Context, db *store.Store, pipe *pipeline.Pipeline, 
 
 // seedGeneration names the re-probe policy a seed was run for. Changing the
 // policy changes which records belong in the queue, so it has to be seeded
-// again; leaving it alone must not re-walk the store on every start.
+// again; leaving it alone must not re-walk the store on every start. A run
+// with the sweep off leaves records the queue never learned about whatever the
+// policy was, and says so with a marker of its own rather than through this.
 func seedGeneration(reprobe time.Duration) string {
 	return fmt.Sprintf("v1:reprobe=%s", reprobe)
 }

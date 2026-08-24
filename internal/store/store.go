@@ -28,6 +28,9 @@ var (
 	keyFormat = []byte("format")
 	keySeeded = []byte("pending_seeded")
 	keySeedAt = []byte("pending_seed_cursor")
+	// Set by a run that stores discoveries without queuing them, and cleared
+	// by the next seed. See MarkUnqueued.
+	keyUnqueued = []byte("pending_unqueued")
 )
 
 // ErrLegacyFormat says the database predates the packed record format.
