@@ -37,6 +37,20 @@ type runConfig struct {
 	output   outputConfig
 }
 
+// defaultUserAgent is what goes out when --user-agent is not given. The
+// parenthesis holds a contact rather than a description, because at least one
+// operator on the list reads it: Geomys answers a tile request whose
+// User-Agent names nobody with 429 and a body saying so, and a 429 is a wait,
+// so the follower waits out a refusal that waiting does not fix.
+//
+// It points at this project because that is the address that is true for a
+// build nobody has configured. Run your own and it should point at you:
+//
+//	go build -ldflags '-X "main.defaultUserAgent=ctmon/1.0 (+you@example.com)"' ./cmd/ctmon
+//
+// or pass --user-agent, which overrides it either way.
+var defaultUserAgent = "ctmon/1.0 (+https://github.com/0xMattijs/ctmon)"
+
 // feedConfig selects and paces the certificate sources.
 type feedConfig struct {
 	sources string
@@ -134,7 +148,7 @@ type outputConfig struct {
 // generated.
 func (c *runConfig) bind(fs *flag.FlagSet) {
 	fs.StringVar(&c.dbPath, "db", "ct.db", "path to the bbolt database")
-	fs.StringVar(&c.userAgent, "user-agent", "ctmon/1.0 (+domain discovery)", "User-Agent for probes and CT requests")
+	fs.StringVar(&c.userAgent, "user-agent", defaultUserAgent, "User-Agent for probes and CT requests (some log operators require a contact address in it)")
 	fs.DurationVar(&c.compactEvery, "compact-every", 24*time.Hour, "rewrite the database into full pages this often (0 disables)")
 	fs.StringVar(&c.snapshot, "snapshot", "", "where SIGUSR1 writes a readable copy of the database (default: <db>.snap)")
 

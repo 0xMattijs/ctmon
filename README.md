@@ -302,10 +302,37 @@ Three answers from a tiled log are not failures, and are not treated as any:
   several operators rate-limit it. Geomys answers with a `Retry-After` naming
   the instant the bucket refills; the reader waits exactly that long, capped at
   ten minutes, and keeps the follower alive. Backing the follower off instead
-  would wait without knowing what for, and double past it.
+  would wait without knowing what for, and double past it. Whatever the log put
+  in the body is printed with the wait, because not every 429 is about rate:
+
+  ```
+  INFO msg="static ct log rate limited; waiting" log=https://tuscolo2026h2.skylight.geomys.org
+       tile=tile/data/x001/x849/572 wait=30s reason="Please add an email address to your User-Agent."
+  ```
 
 Anything else — a broken tile, a tile that reframes entries already read, an
 unreadable checkpoint — fails the follower and earns the ordinary backoff.
+
+### Who the requests say they are
+
+`--user-agent` sets what goes out on CT requests and on probes alike. It
+defaults to `ctmon/1.0 (+https://github.com/0xMattijs/ctmon)`, and the address
+in the parenthesis is the point: some operators require a contact and refuse
+without one. Geomys refuses with a 429, which is a wait, so a run that names
+nobody waits out a refusal that no amount of waiting clears — its checkpoints
+still arrive, so discovery looks healthy while every tile is turned away.
+
+Run this against real logs and the address should be yours, not this project's:
+
+```console
+$ ctmon run --user-agent 'ctmon/1.0 (+you@example.com)'
+```
+
+or, to make it the default for your build:
+
+```console
+$ go build -ldflags '-X "main.defaultUserAgent=ctmon/1.0 (+you@example.com)"' ./cmd/ctmon
+```
 
 ### What a log is taken at its word for
 

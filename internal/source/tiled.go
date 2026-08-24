@@ -97,10 +97,37 @@ const missesBeforeWarning = 5
 // alive and reads the log again the moment it is welcome to, where treating
 // the refusal as a failure would put the whole follower into a backoff that
 // has no idea what it is waiting for and doubles past it.
-type throttled struct{ wait time.Duration }
+type throttled struct {
+	wait time.Duration
+	// reason is whatever the log put in the 429 body, which is the one place
+	// a refusal says anything beyond how long. Geomys answers a User-Agent
+	// naming no contact with "Please add an email address to your
+	// User-Agent." — a refusal no amount of waiting clears, and one that
+	// reads as an ordinary rate limit with the body thrown away.
+	reason string
+}
 
 func (t *throttled) Error() string {
-	return fmt.Sprintf("rate limited, asked to wait %v", t.wait.Round(time.Second))
+	if t.reason == "" {
+		return fmt.Sprintf("rate limited, asked to wait %v", t.wait.Round(time.Second))
+	}
+	return fmt.Sprintf("rate limited, asked to wait %v: %s", t.wait.Round(time.Second), t.reason)
+}
+
+// maxThrottleReasonBytes caps how much of a 429 body is kept. The body is a
+// sentence meant for a human, not a payload; a log that answers with a page
+// gets the first line of it and nothing more.
+const maxThrottleReasonBytes = 256
+
+// throttleReason reads a 429 body into one line fit for a log field. Anything
+// unreadable leaves the reason empty, because a refusal that cannot be
+// explained is still a refusal and must not become a failure.
+func throttleReason(r io.Reader) string {
+	body, err := io.ReadAll(io.LimitReader(r, maxThrottleReasonBytes))
+	if err != nil {
+		return ""
+	}
+	return strings.Join(strings.Fields(string(body)), " ")
 }
 
 // maxThrottleWait caps how long a log can send this feed away for. A log is
@@ -234,9 +261,10 @@ func (t *TiledLog) follow(ctx context.Context, lg Log, out chan<- Cert) error {
 			return err
 		}
 		cp, err := t.checkpoint(ctx, hc, uri)
-		if wait, sentAway := askedToWait(err); sentAway {
-			t.Log.Info("static ct log rate limited; waiting", "log", uri, "wait", wait)
-			if err := sleep(ctx, wait); err != nil {
+		if sentAway, ok := askedToWait(err); ok {
+			t.Log.Info("static ct log rate limited; waiting", "log", uri,
+				"wait", sentAway.wait, "reason", sentAway.reason)
+			if err := sleep(ctx, sentAway.wait); err != nil {
 				return err
 			}
 			continue
@@ -303,10 +331,11 @@ func (t *TiledLog) follow(ctx context.Context, lg Log, out chan<- Cert) error {
 			t.Log.Debug("static ct tile", "log", uri, "tile", path,
 				"position", pos, "tree_size", cp.Size)
 			body, err := t.fetchTile(ctx, hc, uri, path)
-			if wait, sentAway := askedToWait(err); sentAway {
+			if sentAway, ok := askedToWait(err); ok {
 				t.Log.Info("static ct log rate limited; waiting",
-					"log", uri, "tile", path, "wait", wait)
-				if err := sleep(ctx, wait); err != nil {
+					"log", uri, "tile", path, "wait", sentAway.wait,
+					"reason", sentAway.reason)
+				if err := sleep(ctx, sentAway.wait); err != nil {
 					return err
 				}
 				stopped = wasThrottled
@@ -393,14 +422,14 @@ const (
 	wasThrottled                   // the log asked to be left alone, and was
 )
 
-// askedToWait reports whether err is a log asking to be left alone, and for
-// how long.
-func askedToWait(err error) (time.Duration, bool) {
+// askedToWait reports whether err is a log asking to be left alone, and hands
+// back what it said: how long, and why if it gave a reason.
+func askedToWait(err error) (*throttled, bool) {
 	var t *throttled
 	if errors.As(err, &t) {
-		return t.wait, true
+		return t, true
 	}
-	return 0, false
+	return nil, false
 }
 
 // pollEvery is how long to wait after catching up with a log.
@@ -451,7 +480,10 @@ func (t *TiledLog) get(ctx context.Context, hc *http.Client, url string) ([]byte
 	case http.StatusNotFound, http.StatusForbidden:
 		return nil, fmt.Errorf("%s: %w", resp.Status, errTileMissing)
 	case http.StatusTooManyRequests:
-		return nil, &throttled{wait: retryAfter(resp.Header.Get("Retry-After"), t.pollEvery())}
+		return nil, &throttled{
+			wait:   retryAfter(resp.Header.Get("Retry-After"), t.pollEvery()),
+			reason: throttleReason(resp.Body),
+		}
 	default:
 		return nil, fmt.Errorf("%s", resp.Status)
 	}
