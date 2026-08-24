@@ -257,12 +257,22 @@ func (s *Store) update(fn func(*bolt.Tx) error) error {
 
 // checkFormat stamps the format version on a new database and refuses one
 // written by an older version rather than misreading it.
+//
+// The stamp is formatOldest, not formatVersion, and the difference is the
+// whole point of the stamp being separate from the per-record version byte. It
+// says which builds can open the file at all, and every build back to
+// formatOldest can: records carry their own version, so one too old to
+// understand a record says so about that record rather than refusing the file.
+// Stamping formatVersion on a new database would make it unopenable by the
+// previous build — its formatOf accepts only its own version and would report
+// "unknown record format" — which is the one-way upgrade codec.go says this
+// design exists to avoid.
 func checkFormat(tx *bolt.Tx) error {
 	stamped, err := formatOf(tx)
 	if err != nil || stamped {
 		return err
 	}
-	return tx.Bucket(bucketMeta).Put(keyFormat, []byte{formatVersion})
+	return tx.Bucket(bucketMeta).Put(keyFormat, []byte{formatOldest})
 }
 
 // formatOf refuses a database this build would misread, and reports whether

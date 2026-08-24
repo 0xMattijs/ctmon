@@ -91,6 +91,44 @@ func TestProbeErrorRoundTrips(t *testing.T) {
 			host: "www.example.com",
 			err:  `Get "https://www.example.com/": dial tcp [::ffff:1.2.3.4]:443: i/o timeout`,
 		},
+		// The marks are ordinary bytes, and an error can carry one. An x509
+		// failure quotes the names out of the certificate it rejected, and
+		// those come from the server being probed — so these are bytes
+		// somebody else chose, and getting them wrong is a record that is
+		// silently wrong rather than one that fails.
+		{
+			name: "an argMark the probed server put in the message",
+			host: "h.example",
+			err:  "x509: certificate is valid for a\x02b, not h.example (dial tcp 1.2.3.4:443)",
+			args: 1, // the real address, and only the real address
+		},
+		{
+			name: "a hostMark in the message",
+			host: "h.example",
+			err:  "control \x01 and \x02 bytes",
+		},
+		{
+			name: "an escMark in the message",
+			host: "h.example",
+			err:  "plain \x03 escape byte 1.2.3.4",
+			args: 1,
+		},
+		{
+			name: "every mark at once, with an address to lift",
+			host: "h.example",
+			err:  "\x01\x02\x03 h.example \x03\x02\x01 dial tcp 10.0.0.1:443",
+			args: 1,
+		},
+		{
+			name: "a message that is nothing but marks",
+			host: "h.example",
+			err:  "\x01\x02\x03",
+		},
+		{
+			name: "a message ending in an escMark",
+			host: "h.example",
+			err:  "trailing \x03",
+		},
 	}
 
 	for _, c := range cases {
@@ -309,5 +347,35 @@ func TestDecodeRejectsAnArgumentLengthThatTruncates(t *testing.T) {
 	if err := s.decode("example.com", raw, &rec); err == nil {
 		t.Errorf("decode accepted an argument length of %d, reading %q",
 			uint64(1<<32|5), rec.ProbeError)
+	}
+}
+
+// A database this build creates has to be one the previous build will still
+// open. That is the whole reason the meta stamp is separate from the version
+// byte on each record: the stamp says which builds may open the file, and the
+// record byte says which records they will understand.
+//
+// Stamping formatVersion instead would make the upgrade one-way. The previous
+// build accepts only its own version — formatOldest here — and reports
+// "unknown record format" for anything above it, so it would refuse the file
+// outright rather than reading what it can and saying so about the rest.
+func TestANewDatabaseOpensOnTheOlderBuild(t *testing.T) {
+	s := open(t)
+
+	var stamp []byte
+	if err := s.view(func(tx *bolt.Tx) error {
+		stamp = append([]byte(nil), tx.Bucket(bucketMeta).Get(keyFormat)...)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(stamp) != 1 {
+		t.Fatalf("format stamp is %v, want one byte", stamp)
+	}
+	// The rule the previous build applies, written out rather than named, so
+	// that raising formatVersion again cannot quietly satisfy it.
+	if stamp[0] != formatOldest {
+		t.Errorf("format stamp is %d; a build whose newest format is %d refuses that outright",
+			stamp[0], formatOldest)
 	}
 }

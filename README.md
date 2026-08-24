@@ -880,6 +880,14 @@ remains is the smaller tail: an error naming some *other* host, like a redirect
 target that failed to resolve, still interns that name. That is 2,391 shapes
 rather than the 622 a full masking would give.
 
+The markers that stand in for the host and for an address are single bytes,
+and an error can carry one of its own: an `x509:` failure quotes the names out
+of the certificate it rejected, and those come from the server being probed. So
+a marker in the message is escaped on the way in and unescaped on the way out.
+Without that, a probe error holding a `0x02` gets the address spliced in where
+that byte was and a `?` where the address belonged — a record silently wrong,
+from bytes somebody else chose.
+
 This is record format 3. Version 2 records are read exactly as they stand —
 every record carries its own version byte, so the two layouts coexist in one
 file and nothing has to be migrated. The stamp in the meta bucket is left

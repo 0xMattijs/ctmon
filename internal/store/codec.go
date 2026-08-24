@@ -120,10 +120,45 @@ const (
 // and is put back on the way out — but only where putting it back reproduces
 // the text exactly, so an address the prober wrote in a form net.IP.String
 // does not produce keeps its own entry. See templatize.
+//
+// escMark is what keeps that reversible. The marks are ordinary bytes, and
+// nothing stops an error carrying one: an x509 failure quotes the names in the
+// certificate it rejected, and those come from the server being probed. Left
+// alone, a message holding a 0x02 gets an address spliced into the wrong place
+// and a "?" where the address belonged — a record silently wrong, from bytes
+// somebody else chose. So a mark in the message is escaped on the way in and
+// unescaped on the way out, and the round trip stays exact.
 const (
 	hostMark = "\x01"
 	argMark  = "\x02"
+	escMark  = "\x03"
 )
+
+// marks are the bytes a template gives a meaning to, and so the bytes a
+// message has to have escaped before it can become one.
+const marks = hostMark + argMark + escMark
+
+// escapeMarks puts an escMark in front of every byte in msg that a template
+// would otherwise read as a marker, so that a message carrying one comes back
+// as itself.
+//
+// Almost nothing takes the slow path. Go quotes control bytes in most of the
+// error text it produces, so the check is a scan that finds nothing.
+func escapeMarks(msg string) string {
+	if !strings.ContainsAny(msg, marks) {
+		return msg
+	}
+	var b strings.Builder
+	b.Grow(len(msg) + 8)
+	for i := 0; i < len(msg); i++ {
+		switch msg[i] {
+		case hostMark[0], argMark[0], escMark[0]:
+			b.WriteString(escMark)
+		}
+		b.WriteByte(msg[i])
+	}
+	return b.String()
+}
 
 // ipCandidate matches what an address looks like. It is deliberately loose —
 // net.ParseIP decides — because the cost of a false positive here is a
@@ -444,6 +479,10 @@ func derivedURL(host string) string { return "https://" + host + "/" }
 // leaves through hostMark rather than being mistaken for one of the addresses
 // this then lifts out.
 func templatize(host, msg string) (string, [][]byte) {
+	// Before anything else, so that a mark the message brought with it cannot
+	// be confused with one this puts there. A hostname holds no control
+	// bytes, so escaping never disturbs the occurrences masked next.
+	msg = escapeMarks(msg)
 	if host != "" {
 		msg = strings.ReplaceAll(msg, host, hostMark)
 	}
@@ -495,11 +534,12 @@ func templatize(host, msg string) (string, [][]byte) {
 // the values that were lifted out of it.
 //
 // A record whose arguments do not match its template gets a question mark
-// rather than a panic or a silent splice. That can only happen to a record
-// written by something other than encode, and saying so in the text is more
-// use than failing the whole read of a record whose other fields are fine.
+// rather than a panic or a silent splice. Now that templatize escapes the
+// marks a message brought with it, that can only happen to a record written by
+// something other than encode, and saying so in the text is more use than
+// failing the whole read of a record whose other fields are fine.
 func expand(host, tmpl string, args [][]byte) string {
-	if !strings.ContainsAny(tmpl, hostMark+argMark) {
+	if !strings.ContainsAny(tmpl, marks) {
 		return tmpl
 	}
 	var b strings.Builder
@@ -507,6 +547,13 @@ func expand(host, tmpl string, args [][]byte) string {
 	next := 0
 	for i := 0; i < len(tmpl); i++ {
 		switch tmpl[i] {
+		case escMark[0]:
+			// The escaped byte is whatever follows, taken literally. A
+			// trailing escape has nothing to escape and is dropped; only a
+			// template this package did not write can end that way.
+			if i++; i < len(tmpl) {
+				b.WriteByte(tmpl[i])
+			}
 		case hostMark[0]:
 			b.WriteString(host)
 		case argMark[0]:
