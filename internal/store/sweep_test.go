@@ -170,6 +170,87 @@ func TestSweepRewritesAForgottenNameOnReuse(t *testing.T) {
 	}
 }
 
+// encode can intern a name and then fail on a later field, leaving the name in
+// the tables with no bucket entry behind it. The sweep has to forget such a
+// phantom from all three tables, or it inflates the count stats prints — the
+// number this whole sweep exists to make honest.
+func TestSweepForgetsAPhantomFromARolledBackWrite(t *testing.T) {
+	s := open(t)
+	now := time.Now().UTC().Truncate(time.Second)
+	withError(t, s, "keep.example.com", "good-source", "Good CA", "read body: unexpected EOF", now)
+
+	before := s.sources.len()
+	// A body hash of the wrong length fails encode after the source has been
+	// interned, so the transaction rolls back with the name still in memory.
+	err := s.Update("doomed.example.com", func(r *Record, existed bool) bool {
+		r.FirstSeen, r.LastSeen = now, now
+		r.Source = "phantom-source"
+		r.Probed, r.BodyHash = true, "too-short"
+		return true
+	})
+	if err == nil {
+		t.Fatal("a short body hash should have failed the write")
+	}
+	if s.sources.len() != before+1 {
+		t.Fatalf("expected the rolled-back name to linger in memory: len=%d, before=%d",
+			s.sources.len(), before)
+	}
+	if id, ok := s.sources.ids["phantom-source"]; !ok {
+		t.Fatal("phantom-source is not in the table")
+	} else if s.sources.persisted[id] {
+		t.Fatal("phantom-source should not be marked durable")
+	}
+
+	if _, err := s.SweepDicts(); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if got := s.sources.len(); got != before {
+		t.Errorf("sources count = %d after the sweep; want %d, the phantom forgotten", got, before)
+	}
+	if _, ok := s.sources.ids["phantom-source"]; ok {
+		t.Error("phantom-source survived in ids")
+	}
+	// The record that was fine must still read back.
+	rec, err := s.Get("keep.example.com")
+	if err != nil || rec == nil || rec.Source != "good-source" {
+		t.Errorf("the surviving record reads back as %+v (%v)", rec, err)
+	}
+}
+
+// A sweep runs on every applying prune, not only one that deleted something.
+// A prune interrupted after its record walk leaves orphans that the re-run
+// must still be able to reach — by then there are no records left to delete.
+func TestSweepRunsWhenThereIsNothingLeftToDelete(t *testing.T) {
+	s := open(t)
+	now := time.Now().UTC().Truncate(time.Second)
+	withError(t, s, "a.example.com", "src", "CA", "lookup a.example.com: no such host", now)
+
+	// Delete the record directly, the way an interrupted prune's committed
+	// chunks would have, leaving the vocabulary behind.
+	if _, err := s.Prune(PruneOptions{Under: "a.example.com"}); err != nil {
+		t.Fatal(err)
+	}
+	if s.errors.len() != 1 {
+		t.Fatalf("expected the orphaned shape to still be there: %d", s.errors.len())
+	}
+
+	// The re-run deletes no records at all.
+	res, err := s.Prune(PruneOptions{Match: Unseen(now.Add(-90 * 24 * time.Hour))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Deleted != 0 {
+		t.Fatalf("expected nothing left to delete, got %d", res.Deleted)
+	}
+	sweep, err := s.SweepDicts()
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if sweep.Errors != 1 || sweep.Sources != 1 || sweep.Issuers != 1 {
+		t.Errorf("sweep = %+v; want the orphans of the interrupted run", sweep)
+	}
+}
+
 func TestSweepOnAnUntouchedStoreDropsNothing(t *testing.T) {
 	s := open(t)
 	now := time.Now().UTC().Truncate(time.Second)

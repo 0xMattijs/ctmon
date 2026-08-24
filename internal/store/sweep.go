@@ -78,19 +78,29 @@ func (s *Store) SweepDicts() (SweepResult, error) {
 		return res, fmt.Errorf("sweep dictionaries: %w", err)
 	}
 
+	// Collected under the transaction, applied to memory only once it has
+	// committed. intern/confirm splits the same way and for the same reason: a
+	// write that rolls back must not leave the tables describing a file that
+	// does not agree with them. Getting it wrong here is worse than there —
+	// a name forgotten in memory but still in the file decodes as empty on
+	// every surviving record that points at it, and re-interning allocates a
+	// second id for a name that already has one.
+	forgotten := map[*dict][]uint32{}
 	err = s.update(func(tx *bolt.Tx) error {
+		clear(forgotten)
 		for _, d := range []*dict{s.sources, s.issuers, s.errors} {
-			dropped, bytes, err := d.forget(tx, keep[d])
+			ids, bytes, err := d.forget(tx, keep[d])
 			if err != nil {
 				return err
 			}
+			forgotten[d] = ids
 			switch d {
 			case s.sources:
-				res.Sources = dropped
+				res.Sources = len(ids)
 			case s.issuers:
-				res.Issuers = dropped
+				res.Issuers = len(ids)
 			case s.errors:
-				res.Errors = dropped
+				res.Errors = len(ids)
 			}
 			res.Bytes += bytes
 		}
@@ -98,6 +108,9 @@ func (s *Store) SweepDicts() (SweepResult, error) {
 	})
 	if err != nil {
 		return SweepResult{}, fmt.Errorf("sweep dictionaries: %w", err)
+	}
+	for d, ids := range forgotten {
+		d.forgotten(ids)
 	}
 	return res, nil
 }
@@ -116,52 +129,62 @@ func mark(keep map[uint32]bool, d *dict, name string) {
 	}
 }
 
-// forget drops every entry whose id is not in keep, from the bucket and from
-// the in-memory tables together.
+// forget deletes the bucket entries whose id is not in keep, and reports which
+// ids went so the caller can drop them from the tables once the transaction
+// has committed.
+//
+// The walk is over the in-memory names rather than the bucket, so that the two
+// cannot drift apart. They can already disagree: encode interns a name and may
+// then fail on a later field, and the rolled-back transaction leaves the name
+// in the tables with no bucket entry behind it. Walking the bucket would miss
+// such an id — it has no key to find — while still dropping it from ids, and
+// the phantom left in names would inflate the count stats prints, which is the
+// number this whole sweep exists to make honest.
 //
 // next is deliberately left where it is. Lowering it would hand the next new
 // name an id that was just freed, which is safe but pointlessly confusing to
 // anyone reading the bucket; a reopened database recomputes it from what
 // survived anyway.
-func (d *dict) forget(tx *bolt.Tx, keep map[uint32]bool) (dropped int, bytes int64, err error) {
-	b := tx.Bucket(d.bucket)
-	if b == nil {
-		return 0, 0, nil
-	}
+func (d *dict) forget(tx *bolt.Tx, keep map[uint32]bool) (doomed []uint32, bytes int64, err error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	// Collected first and deleted afterwards, because rewriting keys while the
-	// cursor walks them is undefined.
-	var doomed [][]byte
-	c := b.Cursor()
-	for k, v := c.First(); k != nil; k, v = c.Next() {
-		if len(k) != 4 {
-			// Not a key this package wrote. Leave it alone rather than guess
-			// at what it means.
+	b := tx.Bucket(d.bucket)
+	var key [4]byte
+	for id := range d.names {
+		if keep[id] {
 			continue
 		}
-		if keep[binary.BigEndian.Uint32(k)] {
+		doomed = append(doomed, id)
+		if b == nil {
 			continue
 		}
-		doomed = append(doomed, append([]byte{}, k...))
-		bytes += int64(len(k) + len(v))
-	}
-	for _, k := range doomed {
-		if err := b.Delete(k); err != nil {
-			return dropped, bytes, err
+		binary.BigEndian.PutUint32(key[:], id)
+		v := b.Get(key[:])
+		if v == nil {
+			// In the tables but never durable — an interning whose
+			// transaction rolled back. There is nothing to delete, and the
+			// caller still has to forget it.
+			continue
 		}
-		id := binary.BigEndian.Uint32(k)
-		delete(d.names, id)
-		delete(d.persisted, id)
-		dropped++
+		bytes += int64(len(key) + len(v))
+		if err := b.Delete(key[:]); err != nil {
+			return nil, bytes, err
+		}
 	}
-	// ids is keyed by name, so it is cleared by walking what is left rather
-	// than by looking each dropped id up backwards.
-	for name, id := range d.ids {
-		if name != "" && !keep[id] {
+	return doomed, bytes, nil
+}
+
+// forgotten drops ids from the in-memory tables, after the transaction that
+// removed them from the file has committed.
+func (d *dict) forgotten(ids []uint32) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for _, id := range ids {
+		if name, ok := d.names[id]; ok {
 			delete(d.ids, name)
 		}
+		delete(d.names, id)
+		delete(d.persisted, id)
 	}
-	return dropped, bytes, nil
 }
