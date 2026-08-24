@@ -55,27 +55,35 @@ func (r SweepResult) Total() int { return r.Sources + r.Issuers + r.Errors }
 func (s *Store) SweepDicts() (SweepResult, error) {
 	var res SweepResult
 
-	// Collected as ids rather than names, because that is what the records
-	// hold and what the buckets are keyed by. A name is only needed to look
-	// the id up, and the in-memory tables already have that map.
+	// The ids come from the decoder rather than from re-interning what it
+	// produced. Asking which entry a record's text "would" intern to today is
+	// the wrong question, and dangerously so: a record written under an older
+	// layout expands from a differently-shaped template, so the lookup misses,
+	// the entry it actually points at looks unused, and the sweep deletes the
+	// only copy of its error. Reading the id the record holds cannot be wrong
+	// about that, whatever the layout was.
 	keep := map[*dict]map[uint32]bool{
 		s.sources: {0: true},
 		s.issuers: {0: true},
 		s.errors:  {0: true},
 	}
-	err := s.ForEach(func(r *Record) error {
-		mark(keep[s.sources], s.sources, r.Source)
-		mark(keep[s.issuers], s.issuers, r.Issuer)
-		// The record carries the error rebuilt from its template, so it has to
-		// be templatized again to name the entry it came from — the same call
-		// encode makes on the way in. The arguments are discarded: they live
-		// on the record, not in the dictionary, and it is the template whose
-		// entry is being held down.
-		if r.ProbeError != "" {
-			tmpl, _ := templatize(r.Host, r.ProbeError)
-			mark(keep[s.errors], s.errors, tmpl)
-		}
-		return nil
+	err := s.view(func(tx *bolt.Tx) error {
+		return tx.Bucket(bucketDomains).ForEach(func(k, v []byte) error {
+			host := reverseHost(string(k))
+			var (
+				rec Record
+				ids recordIDs
+			)
+			if err := s.decodeIDs(host, v, &rec, &ids); err != nil {
+				return fmt.Errorf("decode %s: %w", host, err)
+			}
+			keep[s.sources][ids.source] = true
+			keep[s.issuers][ids.issuer] = true
+			if ids.hasErr {
+				keep[s.errors][ids.errShape] = true
+			}
+			return nil
+		})
 	})
 	if err != nil {
 		return res, fmt.Errorf("sweep dictionaries: %w", err)
@@ -116,20 +124,6 @@ func (s *Store) SweepDicts() (SweepResult, error) {
 		d.forgotten(ids)
 	}
 	return res, nil
-}
-
-// mark notes the id a name interns to, if the dictionary knows it. A name it
-// does not know cannot be holding an entry down.
-func mark(keep map[uint32]bool, d *dict, name string) {
-	if name == "" {
-		return
-	}
-	d.mu.Lock()
-	id, ok := d.ids[name]
-	d.mu.Unlock()
-	if ok {
-		keep[id] = true
-	}
 }
 
 // forget deletes the bucket entries whose id is not in keep, and reports which

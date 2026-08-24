@@ -261,9 +261,34 @@ func (s *Store) encode(tx *bolt.Tx, rec *Record) ([]byte, []freshID, error) {
 	return out, fresh, nil
 }
 
+// recordIDs are the dictionary ids a record was found to hold. Reading them
+// back out of the decoder is the only exact way to know which entries a record
+// keeps alive: the decoded strings cannot answer it, because a record written
+// under an older layout expands from a differently-shaped template and asking
+// which entry it "would" intern to today gives the wrong one.
+type recordIDs struct {
+	source uint32
+	issuer uint32
+	// errShape is meaningful only when hasErr is set. A record with no probe
+	// error holds no error entry, which is not the same as holding entry 0.
+	hasErr   bool
+	errShape uint32
+}
+
 // decode unpacks a stored record. host comes from the key, and everything
 // derived from it is rebuilt here.
 func (s *Store) decode(host string, raw []byte, rec *Record) error {
+	return s.decodeIDs(host, raw, rec, nil)
+}
+
+// decodeIDs is decode, additionally reporting the dictionary ids it read.
+//
+// It is one decoder rather than two so that the ids and the strings can never
+// disagree about what a record says. A second parser walking the same bytes to
+// pick out the ids is a parser that has to be kept in step with this one
+// forever, and the first time it fell behind it would quietly report the wrong
+// entries as unused.
+func (s *Store) decodeIDs(host string, raw []byte, rec *Record, ids *recordIDs) error {
 	r := reader{b: raw}
 	version := r.byte()
 	if version < formatOldest || version > formatVersion {
@@ -276,8 +301,12 @@ func (s *Store) decode(host string, raw []byte, rec *Record) error {
 	rec.Origin = originName(int(flags1>>originShift) & originMask)
 	rec.Probed = flags1&flagProbed != 0
 
-	rec.Source = s.sources.name(uint32(r.uvarint()))
-	rec.Issuer = s.issuers.name(uint32(r.uvarint()))
+	srcID, issID := uint32(r.uvarint()), uint32(r.uvarint())
+	rec.Source = s.sources.name(srcID)
+	rec.Issuer = s.issuers.name(issID)
+	if ids != nil {
+		ids.source, ids.issuer = srcID, issID
+	}
 	first := r.uint32()
 	rec.FirstSeen = fromUnix(first)
 	rec.LastSeen = fromUnix(first + uint32(r.uvarint()))
@@ -309,7 +338,11 @@ func (s *Store) decode(host string, raw []byte, rec *Record) error {
 		rec.ChangedAt = fromUnix(first + uint32(r.uvarint()))
 	}
 	if flags2&flagProbeErr != 0 {
-		tmpl := s.errors.name(uint32(r.uvarint()))
+		errID := uint32(r.uvarint())
+		if ids != nil {
+			ids.hasErr, ids.errShape = true, errID
+		}
+		tmpl := s.errors.name(errID)
 		var args [][]byte
 		if flags2&flagErrArgs != 0 {
 			// Compared as a uint64 before it is narrowed, and against the

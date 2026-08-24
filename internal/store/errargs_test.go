@@ -151,6 +151,51 @@ func TestDecodeReadsAVersionTwoRecord(t *testing.T) {
 	}
 }
 
+// The sweep must not mistake a version 2 record's entry for an unused one.
+//
+// Its error interns as the whole string, address included, because that is how
+// version 2 wrote it. Asking what that text would intern to today gives the
+// masked template instead, which the dictionary has never heard of — so the
+// entry the record actually points at looks unreferenced, and sweeping it
+// leaves the record with no error at all. That is silent data loss on every
+// pre-existing record, reachable by running prune once.
+func TestSweepKeepsAVersionTwoErrorEntry(t *testing.T) {
+	s := open(t)
+	now := time.Now().UTC().Truncate(time.Second)
+	host := "old.example.com"
+	whole := `Get "https://` + host + `/": dial tcp 178.142.12.95:443: connect: connection refused`
+
+	var id uint32
+	if err := s.update(func(tx *bolt.Tx) error {
+		var err error
+		id, _, err = s.errors.intern(tx, strings.ReplaceAll(whole, host, hostMark))
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	s.errors.confirm(id)
+	if err := s.update(func(tx *bolt.Tx) error {
+		return tx.Bucket(bucketDomains).Put([]byte(reverseHost(host)), buildV2Record(id, now))
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := s.SweepDicts()
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if res.Errors != 0 {
+		t.Errorf("sweep dropped %d error shapes; the version 2 record still uses its own", res.Errors)
+	}
+	rec, err := s.Get(host)
+	if err != nil || rec == nil {
+		t.Fatalf("get: %v, %v", rec, err)
+	}
+	if rec.ProbeError != whole {
+		t.Errorf("version 2 record lost its error:\n got %q\nwant %q", rec.ProbeError, whole)
+	}
+}
+
 // A record naming a version this build does not know is refused, not guessed
 // at. That is what keeps an older build from misreading a version 3 record.
 func TestDecodeRefusesAnUnknownVersion(t *testing.T) {
