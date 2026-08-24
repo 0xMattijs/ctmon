@@ -9,6 +9,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"maps"
 	"net"
@@ -499,15 +500,15 @@ func humanBytes(n int64) string {
 // printSizes reports a size change both ways: the pages actually used, and the
 // file on disk. bolt grows its file in large steps and never shrinks it, so
 // the file alone can hide a real win.
-func printSizes(indent string, oldUsed, newUsed, oldFile, newFile int64, records int) {
-	fmt.Printf("%sin use:  %s -> %s", indent, humanBytes(oldUsed), humanBytes(newUsed))
+func printSizes(w io.Writer, indent string, oldUsed, newUsed, oldFile, newFile int64, records int) {
+	fmt.Fprintf(w, "%sin use:  %s -> %s", indent, humanBytes(oldUsed), humanBytes(newUsed))
 	if newUsed > 0 {
-		fmt.Printf("  (%.1fx smaller)", float64(oldUsed)/float64(newUsed))
+		fmt.Fprintf(w, "  (%.1fx smaller)", float64(oldUsed)/float64(newUsed))
 	}
-	fmt.Println()
-	fmt.Printf("%son disk: %s -> %s\n", indent, humanBytes(oldFile), humanBytes(newFile))
+	fmt.Fprintln(w)
+	fmt.Fprintf(w, "%son disk: %s -> %s\n", indent, humanBytes(oldFile), humanBytes(newFile))
 	if records > 0 && newUsed > 0 {
-		fmt.Printf("%s%d B/record -> %d B/record\n", indent,
+		fmt.Fprintf(w, "%s%d B/record -> %d B/record\n", indent,
 			oldUsed/int64(records), newUsed/int64(records))
 	}
 }
@@ -537,7 +538,7 @@ func migrateCmd(args []string) error {
 	if res.Skipped > 0 {
 		fmt.Printf("skipped %d unreadable records\n", res.Skipped)
 	}
-	printSizes("  ", res.OldUsed, res.NewUsed, res.OldBytes, res.NewBytes, res.Records)
+	printSizes(os.Stdout, "  ", res.OldUsed, res.NewUsed, res.OldBytes, res.NewBytes, res.Records)
 	fmt.Printf("\nThe original is untouched. To use the new file:\n  mv %s %s\n", dst, *dbPath)
 	return nil
 }
@@ -562,7 +563,7 @@ func compactCmd(args []string) error {
 		return err
 	}
 	fmt.Printf("compacted in %s\n", time.Since(start).Round(time.Millisecond))
-	printSizes("  ", res.OldUsed, res.NewUsed, res.OldBytes, res.NewBytes, 0)
+	printSizes(os.Stdout, "  ", res.OldUsed, res.NewUsed, res.OldBytes, res.NewBytes, 0)
 	fmt.Printf("\nThe original is untouched. To use the new file:\n  mv %s %s\n", dst, *dbPath)
 	return nil
 }
