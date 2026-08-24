@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -39,6 +40,11 @@ type followSet struct {
 	// its own: returning is how it says the run is over, not how it reports a
 	// failure.
 	follow func(ctx context.Context, lg Log)
+	// live counts the followers still running. It exists because a follower
+	// can now stop for good — a log whose signatures do not check out is not
+	// retried — and a feed with none left goes quiet in exactly the way a feed
+	// with nothing to report does.
+	live atomic.Int64
 }
 
 // run follows every log in the set until ctx is cancelled, and returns
@@ -60,9 +66,11 @@ func (s *followSet) run(ctx context.Context) error {
 		f := &follower{lg: lg, cancel: cancel, done: make(chan struct{})}
 		following[lg.URI] = f
 		wg.Add(1)
+		s.live.Add(1)
 		go func() {
 			defer wg.Done()
 			defer close(f.done)
+			defer s.left(fctx, lg)
 			s.follow(fctx, lg)
 		}()
 	}
@@ -93,6 +101,13 @@ func (s *followSet) refreshForever(ctx context.Context, following map[string]*fo
 		case <-ctx.Done():
 			return
 		case <-t.C:
+		}
+		if s.live.Load() == 0 {
+			// Said again on every refresh, not only when the last follower
+			// left. A run that is following nothing is the one state worth
+			// repeating: it looks exactly like a run whose logs have gone
+			// quiet, and it does not fix itself unless the list changes.
+			s.log.Error(s.kind + " is following no logs at all")
 		}
 		logs, err := s.discover(ctx)
 		if ctx.Err() != nil {
@@ -166,6 +181,22 @@ func (s *followSet) reconcile(logs []Log, following map[string]*follower, start 
 			s.log.Info(s.kind+" joined the log list; following", "log", lg.URI)
 		}
 		start(lg)
+	}
+}
+
+// left records a follower going away, and says so if it was the last one.
+//
+// The check is on fctx rather than on the parent, because a follower stopped
+// by a refresh or by shutdown is not news: reconcile already logs the one and
+// the other is the run ending. What is news is a follower that returned on its
+// own — which now happens, for a log whose signatures do not check out — and
+// left nothing behind it. A feed following no logs reports nothing, which is
+// indistinguishable from a feed following quiet ones, and the single error at
+// the moment it happened has long since scrolled away.
+func (s *followSet) left(fctx context.Context, lg Log) {
+	if s.live.Add(-1) == 0 && fctx.Err() == nil {
+		s.log.Error(s.kind+" stopped following its last log; this feed is now reading nothing",
+			"log", lg.URI)
 	}
 }
 

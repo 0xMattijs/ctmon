@@ -342,6 +342,16 @@ and asking a fourth time changes nothing:
 ERROR static ct log signature did not verify; no longer following it log=https://mon.example/2026h2 err="checkpoint: signature did not verify: no signature from key id aee62413"
 ```
 
+Stopping is right; going quiet about it is not. A feed that has lost its last
+log reports nothing, which is exactly what a feed following quiet logs reports,
+so it says so when it happens and again on every list refresh for as long as it
+lasts:
+
+```console
+ERROR static ct log stopped following its last log; this feed is now reading nothing log=https://mon.example/2026h2
+ERROR static ct log is following no logs at all
+```
+
 Logs named with `--logs` or `--tiled-logs` come with a URL and nothing else.
 There is nowhere to get a key from — the log's own `get-sth` or `/checkpoint`
 would be the log vouching for itself — so they are followed on the strength of

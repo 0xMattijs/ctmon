@@ -133,6 +133,14 @@ func verifyCheckpoint(v *ct.SignatureVerifier, cp checkpoint, origin string, key
 	if v == nil {
 		return nil
 	}
+	if origin == "" {
+		// Reachable from a log list that carries a key for a tiled log and no
+		// submission URL to derive the origin from. Nothing can be checked
+		// without it, and it is worth saying that rather than reporting the
+		// empty string as the origin that was wanted.
+		return fmt.Errorf("%w: the log list gave no submission URL to derive %q's origin from",
+			errUntrusted, cp.Origin)
+	}
 	if cp.Origin != origin {
 		return fmt.Errorf("%w: checkpoint is for %q, want %q", errUntrusted, cp.Origin, origin)
 	}

@@ -11,6 +11,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"log/slog"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
@@ -544,4 +545,86 @@ func TestTiledRefusesACheckpointForAnotherLog(t *testing.T) {
 	if now := log.checkpointsAsked(); now != asked {
 		t.Errorf("checkpoint fetched %d more times; the follower is still running", now-asked)
 	}
+}
+
+// TestTiledSaysWhenItIsFollowingNothing is the other half of not retrying a
+// log that cannot be believed. Stopping is right; going quiet about it is not.
+// A feed following no logs reports nothing, which is exactly what a feed
+// following quiet logs reports, and the error at the moment the last follower
+// left has scrolled away by the time anyone wonders.
+func TestTiledSaysWhenItIsFollowingNothing(t *testing.T) {
+	// No signer, so neither log's checkpoint verifies and both followers stop.
+	first, second := &fakeTiled{leaves: tileOf(t, 300)}, &fakeTiled{leaves: tileOf(t, 300)}
+	a, b := first.serve(t), second.serve(t)
+
+	var lines lockedBuffer
+	feed := tiledOf(a, newPositions())
+	feed.Log = slog.New(slog.NewTextHandler(&lines, &slog.HandlerOptions{Level: slog.LevelError}))
+	feed.Logs = []Log{
+		newTestLog(t, "log.example/a").entry(a),
+		newTestLog(t, "log.example/b").entry(b),
+	}
+	runTiled(t, feed)
+
+	waitFor(t, "the feed to report that it is following nothing", func() bool {
+		return strings.Contains(lines.String(), "now reading nothing")
+	})
+	// Said once, when the last one left — not once per follower.
+	if n := strings.Count(lines.String(), "now reading nothing"); n != 1 {
+		t.Errorf("reported %d times, want once: the first follower to leave was not the last", n)
+	}
+}
+
+// TestTiledStaysQuietWhenTheRunEnds is the other side of that. Shutdown takes
+// every follower with it, and a run being stopped is not a feed that has lost
+// its logs.
+func TestTiledStaysQuietWhenTheRunEnds(t *testing.T) {
+	signer := newTestLog(t, "log.example/2026h2")
+	log := &fakeTiled{leaves: tileOf(t, 300), signer: signer}
+	uri := log.serve(t)
+
+	var lines lockedBuffer
+	pos := newPositions()
+	feed := tiledOf(uri, pos)
+	feed.Log = slog.New(slog.NewTextHandler(&lines, &slog.HandlerOptions{Level: slog.LevelError}))
+	feed.Logs = []Log{signer.entry(uri)}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	out := make(chan Cert, 4096)
+	go func() {
+		for range out {
+		}
+	}()
+	done := make(chan error, 1)
+	go func() { done <- feed.Run(ctx, out) }()
+
+	waitFor(t, "the log to be read", func() bool { return pos.seen(uri) })
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run did not return after cancellation")
+	}
+
+	if got := lines.String(); got != "" {
+		t.Errorf("shutdown logged an error:\n%s", got)
+	}
+}
+
+// lockedBuffer collects log output written from the followers' goroutines.
+type lockedBuffer struct {
+	mu sync.Mutex
+	b  strings.Builder
+}
+
+func (l *lockedBuffer) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
+
+func (l *lockedBuffer) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.String()
 }

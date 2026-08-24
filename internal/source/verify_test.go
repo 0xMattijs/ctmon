@@ -357,3 +357,21 @@ func parsed(t *testing.T, note string) checkpoint {
 	}
 	return cp
 }
+
+// TestVerifyCheckpointNamesAMissingOrigin covers a log list that carries a key
+// for a tiled log and no submission URL to derive the origin from. Nothing can
+// be checked without it, and the refusal is permanent, so the line that
+// reports it has to point at the list rather than at the log — "want \"\"" sends
+// whoever reads it looking at the checkpoint.
+func TestVerifyCheckpointNamesAMissingOrigin(t *testing.T) {
+	lg := newTestLog(t, "log.example/2026h2")
+	cp := parsed(t, lg.checkpointOf(4321, testRoot))
+
+	err := verifyCheckpoint(lg.verifier(t), cp, "", lg.key)
+	if !errors.Is(err, errUntrusted) {
+		t.Fatalf("verifyCheckpoint = %v, want errUntrusted", err)
+	}
+	if !strings.Contains(err.Error(), "submission URL") {
+		t.Errorf("error is %q; it does not say the log list is what is missing something", err)
+	}
+}
