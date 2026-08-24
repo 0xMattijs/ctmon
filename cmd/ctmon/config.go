@@ -197,13 +197,18 @@ func (c *runConfig) bind(fs *flag.FlagSet) {
 	fs.BoolVar(&o.verbose, "v", false, "debug logging")
 }
 
+// snapshotSuffix is what a snapshot is called when nothing says otherwise: the
+// database path with this on the end. prune reads it too, to turn away a path
+// that names the copy rather than the database.
+const snapshotSuffix = ".snap"
+
 // snapshotPath is where a SIGUSR1 snapshot is written, defaulting to a file
 // beside the database.
 func (c *runConfig) snapshotPath() string {
 	if c.snapshot != "" {
 		return c.snapshot
 	}
-	return c.dbPath + ".snap"
+	return c.dbPath + snapshotSuffix
 }
 
 // logger builds the run's logger, and the status line it writes through when
