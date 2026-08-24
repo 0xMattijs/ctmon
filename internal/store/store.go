@@ -449,11 +449,31 @@ func (r hostRange) test(k []byte) (in, past bool) {
 	}
 }
 
+// scopeUnder builds the range covering parent, and refuses one that names no
+// domain.
+//
+// The distinction it draws is between a caller who passed nothing, meaning the
+// whole store, and one who passed something that trimmed away to nothing. Both
+// reach rangeUnder as the empty scope, and the empty scope is everything — so
+// a value like "." asks to narrow and would widen instead. Every entry point
+// that takes a parent has to tell the two apart, not just the one that
+// deletes: a list that silently prints the whole store is a wrong answer too.
+func scopeUnder(parent string) (hostRange, error) {
+	r := rangeUnder(parent)
+	if parent != "" && r.prefix == nil {
+		return r, fmt.Errorf("%q names no domain", parent)
+	}
+	return r, nil
+}
+
 // ForEachUnder calls fn for parent and every host beneath it. Reversed keys
 // make this a range scan over one contiguous run of the tree rather than a
 // walk of the whole store.
 func (s *Store) ForEachUnder(parent string, fn func(*Record) error) error {
-	r := rangeUnder(parent)
+	r, err := scopeUnder(parent)
+	if err != nil {
+		return err
+	}
 	if r.prefix == nil {
 		return s.ForEach(fn)
 	}

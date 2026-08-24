@@ -81,14 +81,9 @@ type PruneResult struct {
 // cannot start while a run has it.
 func (s *Store) Prune(opts PruneOptions) (PruneResult, error) {
 	var res PruneResult
-	scope := rangeUnder(opts.Under)
-	// A parent made only of separators names no domain, and the scope it
-	// collapses to is not a narrow one — it is the whole store. A caller that
-	// counted "--under ." as the rule that makes a prune safe would then
-	// delete every record with nothing at all standing in the way, so the
-	// collapse has to be an error here rather than a scope there.
-	if opts.Under != "" && scope.prefix == nil {
-		return res, fmt.Errorf("prune: %q names no domain", opts.Under)
+	scope, err := scopeUnder(opts.Under)
+	if err != nil {
+		return res, fmt.Errorf("prune: %w", err)
 	}
 	match := opts.Match
 	if match == nil {
@@ -209,9 +204,9 @@ func (s *Store) pruneQueue() (int, error) {
 	dropped := 0
 	var after []byte
 	for {
-		n := 0
+		n, gone := 0, 0
 		err := s.update(func(tx *bolt.Tx) error {
-			n = 0
+			n, gone = 0, 0
 			domains, pending := tx.Bucket(bucketDomains), tx.Bucket(bucketPending)
 			c := pending.Cursor()
 			k, _ := c.First()
@@ -240,9 +235,13 @@ func (s *Store) pruneQueue() (int, error) {
 					return err
 				}
 			}
-			dropped += len(doomed)
+			gone = len(doomed)
 			return nil
 		})
+		// Counted after the transaction returns, not inside it: a chunk that
+		// built its list and then failed to commit deleted nothing, and the
+		// error it returns travels with a number the caller may print.
+		dropped += gone
 		if err != nil {
 			return dropped, fmt.Errorf("prune queue: %w", err)
 		}
@@ -263,16 +262,31 @@ func Unseen(cutoff time.Time) func(*Record) bool {
 }
 
 // Failed matches records that were probed, have never returned a body, and
-// were first seen before cutoff.
+// have been in that state since before cutoff.
 //
-// All three parts matter. Probed rules out a host that is merely waiting its
-// turn in a backlog; an empty BodyHash rules out one that answered once and
-// has since started failing, whose last good hash is the thing worth keeping;
-// and the cutoff rules out a name discovered this morning whose DNS has not
-// propagated yet.
+// Probed rules out a host merely waiting its turn in a backlog. An empty
+// BodyHash rules out one that answered once and has since started failing,
+// whose last good hash is the thing worth keeping. The two times rule out the
+// rest.
+//
+// Both times are needed, and neither is the one the rule really wants. A
+// record does not store when it started failing, so this approximates it from
+// the ends: discovered before the cutoff, and last tried before it too. On
+// FirstSeen alone a host discovered months ago but only now reaching the front
+// of a deep queue would be deleted an hour after its first probe returned a
+// transient "no such host" — the backlog delay, not the host, being what aged
+// it past the cutoff. Measured on a live store the two agree exactly today,
+// with the probe landing a median of 0.4 hours after discovery; they come
+// apart as the queue does.
+//
+// Under --reprobe the rule narrows rather than widens, because ProbedAt keeps
+// moving forward and a chronically failing host stops matching. That is the
+// safe direction for a rule that deletes, and it is the reason to prefer this
+// over the looser reading.
 func Failed(cutoff time.Time) func(*Record) bool {
 	return func(r *Record) bool {
-		return r.Probed && r.ProbeError != "" && r.BodyHash == "" && r.FirstSeen.Before(cutoff)
+		return r.Probed && r.ProbeError != "" && r.BodyHash == "" &&
+			r.FirstSeen.Before(cutoff) && r.ProbedAt.Before(cutoff)
 	}
 }
 

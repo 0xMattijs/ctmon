@@ -125,16 +125,24 @@ func TestPruneFailed(t *testing.T) {
 
 	// Probed, still failing, never returned a body: the case prune is for.
 	probed(t, s, "dead.example.com", old, func(r *Record) {
-		r.Probed, r.ProbeError = true, "no such host"
+		r.Probed, r.ProbedAt, r.ProbeError = true, old, "no such host"
 	})
 	// Answered once and has started failing since. Its hash is the thing
 	// worth keeping.
 	probed(t, s, "was-up.example.com", old, func(r *Record) {
-		r.Probed, r.ProbeError, r.BodyHash = true, "connection refused", digest("hi")
+		r.Probed, r.ProbedAt = true, old
+		r.ProbeError, r.BodyHash = "connection refused", digest("hi")
 	})
 	// Failing, but only discovered this morning.
 	probed(t, s, "new.example.com", now.Add(-time.Hour), func(r *Record) {
-		r.Probed, r.ProbeError = true, "no such host"
+		r.Probed, r.ProbedAt, r.ProbeError = true, now.Add(-time.Hour), "no such host"
+	})
+	// Discovered long ago but only now reaching the front of the queue, and
+	// its very first probe has just failed. The backlog delay is what aged it
+	// past the cutoff, not the host, so it is not a host that has been failing
+	// for 30 days.
+	probed(t, s, "just-tried.example.com", old, func(r *Record) {
+		r.Probed, r.ProbedAt, r.ProbeError = true, now.Add(-time.Hour), "no such host"
 	})
 	// Never probed at all, just waiting its turn.
 	seen(t, s, "queued.example.com", old, old)
@@ -149,7 +157,10 @@ func TestPruneFailed(t *testing.T) {
 	if mustGet(t, s, "dead.example.com") != nil {
 		t.Error("dead.example.com survived")
 	}
-	for _, host := range []string{"was-up.example.com", "new.example.com", "queued.example.com"} {
+	for _, host := range []string{
+		"was-up.example.com", "new.example.com", "queued.example.com",
+		"just-tried.example.com",
+	} {
 		if mustGet(t, s, host) == nil {
 			t.Errorf("%s was deleted and should not have been", host)
 		}
@@ -449,6 +460,36 @@ func TestPruneDryRunSkipsReconciliation(t *testing.T) {
 	}
 	if got := len(queuedHosts(t, s)); got != 1 {
 		t.Errorf("dry run dropped queue entries: %d left, want 1", got)
+	}
+}
+
+// A scope that names no domain must not widen the read path either. Before
+// this was shared, ForEachUnder collapsed "." to the empty prefix and walked
+// the whole store.
+func TestForEachUnderRefusesAScopeThatCollapses(t *testing.T) {
+	s := open(t)
+	now := time.Now().UTC().Truncate(time.Second)
+	seen(t, s, "a.example.com", now, now)
+	seen(t, s, "b.other.org", now, now)
+
+	for _, under := range []string{".", "..", " . ", "  "} {
+		n := 0
+		err := s.ForEachUnder(under, func(*Record) error { n++; return nil })
+		if err == nil {
+			t.Errorf("ForEachUnder(%q) = nil after visiting %d records; want a refusal", under, n)
+		}
+		if n != 0 {
+			t.Errorf("ForEachUnder(%q) visited %d records before refusing", under, n)
+		}
+	}
+	// An empty parent still means the whole store, which is a thing a caller
+	// is allowed to ask for.
+	n := 0
+	if err := s.ForEachUnder("", func(*Record) error { n++; return nil }); err != nil {
+		t.Errorf("ForEachUnder(\"\"): %v", err)
+	}
+	if n != 2 {
+		t.Errorf("ForEachUnder(\"\") visited %d records; want 2", n)
 	}
 }
 

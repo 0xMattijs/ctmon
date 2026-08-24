@@ -896,6 +896,16 @@ The last one is the case with no other workaround. `--skip-suffix` mutes a
 hosting platform going forward and leaves however many thousand of its tenants
 already recorded; this is how you clear them out afterwards.
 
+`--failed-since` means "has been failing this long", and asks two things of a
+record: that it was discovered before the cutoff, and that its last probe was
+too. A record does not store when it *started* failing, so the rule
+approximates it from both ends. On FirstSeen alone, a host discovered months
+ago that only now reaches the front of a deep queue would be deleted an hour
+after its first probe returned a transient failure — the backlog delay, not
+the host, being what aged it past the cutoff. Under `--reprobe` the rule
+narrows instead, since a host tried this morning stops matching; that is the
+safe direction for a rule that deletes.
+
 **Nothing is deleted without `--apply`.** Without it prune runs the same walk
 and reports what matched, so what it prints is what `--apply` would remove and
 not an estimate of it:
@@ -954,15 +964,26 @@ $ ctmon prune --db ct.db --unseen-for 90d --apply
 error: ct.db: database is held by another process; prune writes to the database, so stop the run first
 ```
 
-And a snapshot itself, which is the path an operator is likeliest to have in
-hand while a run is going. Pruning it would appear to work and change nothing
-they want, since the next `SIGUSR1` overwrites it from the live database:
+And a snapshot itself, when asked to delete from it. Pruning a snapshot would
+appear to work and change nothing, since the next `SIGUSR1` overwrites it from
+the live database:
 
 ```console
-$ ctmon prune --db ct.db.snap --unseen-for 90d
+$ ctmon prune --db ct.db.snap --unseen-for 90d --apply
 error: ct.db.snap is a snapshot, and pruning it would change nothing: the next
 snapshot overwrites it from the live database. Stop the run and prune ct.db instead
 ```
+
+Counting against a snapshot is allowed, and is the useful thing to do with
+one: while a run holds the live database the snapshot is the only readable
+copy, and "how many records would this rule remove?" is exactly the question
+worth asking of it. A counting run takes a read-only handle, so it cannot
+write to the copy even by accident.
+
+That guard recognizes a snapshot by its `.snap` name, which is all it has to go
+on — prune cannot see the flags the run was started with. A run using
+`--snapshot /var/backup/ct.copy` produces a snapshot prune will delete from
+quite happily, so keep the default suffix if you want the guard.
 
 A prune that is interrupted leaves the store consistent — it has simply
 deleted fewer records than it was asked to, because the walk commits in chunks

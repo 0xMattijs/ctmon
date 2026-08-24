@@ -248,8 +248,9 @@ func TestPruneRefusesAScopeThatNamesNoDomain(t *testing.T) {
 	}
 }
 
-// Prune writes, so a run holding the database blocks it outright and the
-// snapshot route readErr offers is no help.
+// A run holding the database blocks a prune that deletes, and the snapshot
+// route the reading commands offer is no help to it. A prune that only counts
+// is a reading command, and gets that advice because it can act on it.
 func TestPruneReportsALockedDatabase(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "ct.db")
 	held, err := store.Open(path)
@@ -258,12 +259,53 @@ func TestPruneReportsALockedDatabase(t *testing.T) {
 	}
 	defer held.Close()
 
-	err = pruneCmd([]string{"--db", path, "--under", "example.com"})
+	err = pruneCmd([]string{"--db", path, "--under", "example.com", "--apply"})
 	if !errors.Is(err, store.ErrLocked) {
-		t.Fatalf("prune against a held database = %v; want ErrLocked", err)
+		t.Fatalf("apply against a held database = %v; want ErrLocked", err)
 	}
 	if !strings.Contains(err.Error(), "stop the run first") {
-		t.Errorf("error does not say what to do: %v", err)
+		t.Errorf("apply error does not say what to do: %v", err)
+	}
+
+	err = pruneCmd([]string{"--db", path, "--under", "example.com"})
+	if !errors.Is(err, store.ErrLocked) {
+		t.Fatalf("count against a held database = %v; want ErrLocked", err)
+	}
+	if !strings.Contains(err.Error(), "snapshot") {
+		t.Errorf("counting error should point at the snapshot: %v", err)
+	}
+}
+
+// The snapshot is the only readable copy while a run holds the database, so
+// counting against it is the one useful thing an operator can do. Only the
+// deleting run refuses it.
+func TestPruneCountsAgainstASnapshot(t *testing.T) {
+	dir := t.TempDir()
+	live := filepath.Join(dir, "ct.db")
+	db, err := store.Open(live)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().UTC().Add(-100 * 24 * time.Hour)
+	if err := db.Update("stale.example.com", func(r *store.Record, existed bool) bool {
+		r.FirstSeen, r.LastSeen = old, old
+		return true
+	}); err != nil {
+		t.Fatal(err)
+	}
+	snap := live + snapshotSuffix
+	if _, err := db.Snapshot(snap); err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close() // the run keeps holding the live database
+
+	if err := pruneCmd([]string{"--db", snap, "--unseen-for", "90d"}); err != nil {
+		t.Fatalf("counting against a snapshot: %v", err)
+	}
+	if err := pruneCmd([]string{"--db", snap, "--unseen-for", "90d", "--apply"}); err == nil {
+		t.Fatal("apply against a snapshot = nil; want a refusal")
+	} else if !strings.Contains(err.Error(), "is a snapshot") {
+		t.Errorf("refusal does not say why: %v", err)
 	}
 }
 
@@ -293,6 +335,48 @@ func TestPruneCountsWithoutApply(t *testing.T) {
 	defer db.Close()
 	if rec, err := db.Get("stale.example.com"); err != nil || rec == nil {
 		t.Fatalf("counting deleted the record: %v, %v", rec, err)
+	}
+}
+
+// Re-running an interrupted prune deletes no records — the first run took
+// them — but drops the entries it orphaned. That still freed pages, so the
+// command must not return before it says so.
+func TestPruneReportsQueueOnlyWork(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ct.db")
+	db, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if err := db.Update("live.example.com", func(r *store.Record, existed bool) bool {
+		r.FirstSeen, r.LastSeen = now, now
+		return true
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// What an interrupted prune leaves behind.
+	for _, host := range []string{"gone.example.com", "also-gone.example.com"} {
+		if err := db.Enqueue(host, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	db.Close()
+
+	if err := pruneCmd([]string{"--db", path, "--unseen-for", "90d", "--apply", "--compact"}); err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+
+	db, err = store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	count, _, err := db.PendingStats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Errorf("%d queue entries left; want the orphans gone", count)
 	}
 }
 

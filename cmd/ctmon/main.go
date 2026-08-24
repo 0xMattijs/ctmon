@@ -580,30 +580,25 @@ func pruneCmd(args []string) error {
 	}
 	opts.DryRun = !*apply
 
-	if err := refuseSnapshot(*dbPath); err != nil {
-		return err
-	}
-	if err := refuseMissing(*dbPath); err != nil {
-		return err
-	}
-	db, err := store.Open(*dbPath)
+	db, err := openForPrune(*dbPath, *apply)
 	if err != nil {
-		if errors.Is(err, store.ErrLocked) {
-			// Not the advice readErr gives. A snapshot is no use here: prune
-			// writes, and writing to the copy leaves the database it was
-			// copied from exactly as it was.
-			return fmt.Errorf("%w; prune writes to the database, so stop the run first", err)
-		}
 		return err
 	}
 	defer db.Close()
 
 	start := time.Now()
 	res, err := db.Prune(opts)
+	took := time.Since(start).Round(time.Millisecond)
 	if err != nil {
+		// The record walk commits as it goes, so a failure in the queue pass
+		// that follows it arrives with records already deleted. Saying only
+		// what went wrong would leave an operator not knowing that.
+		if res.Deleted > 0 {
+			fmt.Printf("deleted %d of %d records in %s before failing\n",
+				res.Deleted, res.Scanned, took)
+		}
 		return err
 	}
-	took := time.Since(start).Round(time.Millisecond)
 
 	if opts.DryRun {
 		fmt.Printf("%d of %d records match, and their queue entries with them (%s)\n",
@@ -616,7 +611,10 @@ func pruneCmd(args []string) error {
 
 	fmt.Printf("deleted %d of %d records and %d queue entries in %s\n",
 		res.Deleted, res.Scanned, res.Pending, took)
-	if res.Deleted == 0 {
+	// Queue entries count toward whether anything was freed. Re-running an
+	// interrupted prune is the case: the records went the first time, so this
+	// run deletes none of them and drops the entries the first one orphaned.
+	if res.Deleted == 0 && res.Pending == 0 {
 		return nil
 	}
 	if !*compact {
@@ -635,6 +633,42 @@ func pruneCmd(args []string) error {
 	fmt.Println("compacted:")
 	printSizes(os.Stdout, "  ", cres.OldUsed, cres.NewUsed, cres.OldBytes, cres.NewBytes, 0)
 	return nil
+}
+
+// openForPrune opens the database the way this run needs it.
+//
+// A counting run writes nothing, so it takes a handle that cannot write. That
+// is not only tidiness: it is what lets prune answer a question about a
+// snapshot. While a run holds the live database the snapshot is the only
+// readable copy an operator has, and "how many records would this rule
+// remove?" is exactly the question they can usefully ask of it. Only the
+// deleting run has to refuse one, because only its work would be thrown away
+// by the next SIGUSR1.
+func openForPrune(path string, apply bool) (*store.Store, error) {
+	if err := refuseMissing(path); err != nil {
+		return nil, err
+	}
+	if !apply {
+		db, err := store.OpenReadOnly(path)
+		if err != nil {
+			return nil, readErr(path, err)
+		}
+		return db, nil
+	}
+	if err := refuseSnapshot(path); err != nil {
+		return nil, err
+	}
+	db, err := store.Open(path)
+	if err != nil {
+		if errors.Is(err, store.ErrLocked) {
+			// Not the advice readErr gives. A snapshot is no use to a run that
+			// deletes: writing to the copy leaves the database it was copied
+			// from exactly as it was.
+			return nil, fmt.Errorf("%w; prune writes to the database, so stop the run first", err)
+		}
+		return nil, err
+	}
+	return db, nil
 }
 
 // pruneOptions turns the retention flags into a scope and a predicate.
