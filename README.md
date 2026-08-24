@@ -826,8 +826,9 @@ distinct values), 29.9% on timestamps written as RFC 3339 strings, 11.4% on
 booleans. So the packed format:
 
 - **Interns** the log URI, the issuing CA, and the shape of a probe error into
-  dictionaries. A probe error keeps its host substituted back in on read, so
-  thousands of "no such host" failures share one entry.
+  dictionaries. A probe error is stored as its shape, with the hostname and any
+  addresses lifted out and put back on read, so thousands of failures that
+  differ only in where they were aimed share one entry.
 - **Derives** `cert_name` from the host where it is the host, `*.host`, or the
   wildcard over the apex a `www` host sits under, and derives `final_url`
   where it is just `https://<host>/`.
@@ -837,6 +838,45 @@ booleans. So the packed format:
 
 Body hashes stay full SHA-256. Timestamps lose sub-second precision, which is
 the one thing the format gives up.
+
+#### The shape of an error
+
+Masking the hostname alone was not enough. The thing errors carry most is the
+address, and it varies far more than the hostname does:
+
+```
+Get "https://<host>/": dial tcp 178.142.12.95:443: connect: connection refused
+Get "https://<host>/": dial tcp 46.29.238.201:443: connect: connection refused
+```
+
+Interned whole, those are two entries, and the dictionary grew with the number
+of addresses the prober had failed against rather than with the number of
+things that can go wrong. On a live store that had reached 7,239 shapes in a
+few days, of which 5,873 were used by exactly one record.
+
+So an address is lifted out of the template and stored on the record, packed —
+four bytes for IPv4, sixteen for IPv6 — and put back on read. Nothing is lost:
+`ctmon get` still tells you which address a probe failed against. Measured over
+all 170,410 error records on that store:
+
+| | shapes | bytes |
+|---|---|---|
+| dictionary before | 7,239 | 621 KB |
+| dictionary after | 2,391 | 228 KiB |
+| addresses moved onto records | — | +680 KiB |
+| **net** | | **+302 KiB** |
+
+Space was never the point — that is 0.09% of a 313 MiB store either way. The
+point is that the dictionary no longer grows with every address seen. What
+remains is the smaller tail: an error naming some *other* host, like a redirect
+target that failed to resolve, still interns that name. That is 2,391 shapes
+rather than the 622 a full masking would give.
+
+This is record format 3. Version 2 records are read exactly as they stand —
+every record carries its own version byte, so the two layouts coexist in one
+file and nothing has to be migrated. The stamp in the meta bucket is left
+alone, so an older build still opens the database; it will refuse the records
+it does not understand, loudly and one at a time, rather than misreading them.
 
 ### Reading the store while it runs
 

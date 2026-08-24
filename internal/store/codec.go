@@ -4,6 +4,8 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"net"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -11,8 +13,24 @@ import (
 	bolt "go.etcd.io/bbolt"
 )
 
-// formatVersion is the on-disk record format. Version 1 was JSON.
-const formatVersion = 2
+// formatVersion is the on-disk record format this build writes. Version 1 was
+// JSON; 2 was the packed record; 3 adds the probe-error argument list.
+//
+// formatOldest is the oldest layout it still reads. Every record carries its
+// own version byte, so the two versions coexist in one file: a database
+// written by an older build is read as it stands and its records are rewritten
+// as version 3 when something touches them. Nothing has to be migrated.
+//
+// The stamp in the meta bucket is not raised to match. It does not need to be
+// — a record's own version byte is what stops an older build misreading it,
+// and it does that loudly, per record, rather than by refusing the file. Not
+// raising it also keeps the upgrade from being one-way: a database this build
+// has opened is still one an older build will open, and the records it will
+// not understand are the ones it says so about.
+const (
+	formatVersion = 3
+	formatOldest  = 2
+)
 
 // Record layout, version 2. Every field that can be derived from the key is
 // derived, every value drawn from a small vocabulary is interned, and
@@ -55,6 +73,10 @@ const (
 	flagProbeErr   = 1 << 3
 	flagURLLit     = 1 << 4
 	flagURLAbsent  = 1 << 5
+	// flagErrArgs says the probe error carries an argument list after its
+	// dictionary id. Version 2 records never set it, which is what lets the
+	// two layouts share a decoder.
+	flagErrArgs = 1 << 6
 )
 
 // Cert-name shapes. Most records need no bytes at all for the certificate name
@@ -82,7 +104,31 @@ const (
 
 // hostMark stands in for the hostname inside an interned probe error, so the
 // thousands of "no such host" messages collapse to one dictionary entry.
-const hostMark = "\x01"
+//
+// argMark stands in for a value lifted out of the error and stored on the
+// record instead. The hostname is not the only thing that varies between two
+// otherwise identical errors — the address is, and it varies far more:
+//
+//	Get "https://<host>/": dial tcp 178.142.12.95:443: connect: connection refused
+//	Get "https://<host>/": dial tcp 46.29.238.201:443: connect: connection refused
+//
+// Interned whole, those are two entries, and the dictionary grows with the
+// number of addresses a prober has failed against rather than with the number
+// of things that can go wrong. Measured on a live store, 6,021 of 7,250 error
+// shapes carried a literal address, and masking them takes the vocabulary to
+// 2,401. The address itself is not thrown away: it goes on the record, packed,
+// and is put back on the way out.
+const (
+	hostMark = "\x01"
+	argMark  = "\x02"
+)
+
+// ipCandidate matches what an address looks like. It is deliberately loose —
+// net.ParseIP decides — because the cost of a false positive here is a
+// template that happens to hold a version number in a slot, which round-trips
+// exactly the same, and the cost of a false negative is a dictionary entry
+// that never collapses.
+var ipCandidate = regexp.MustCompile(`\[[0-9A-Fa-f:.]+\]|\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b`)
 
 // encode packs rec into its stored form. It interns strings through tx and
 // returns the dictionary ids that still need confirming once the write commits.
@@ -152,13 +198,19 @@ func (s *Store) encode(tx *bolt.Tx, rec *Record) ([]byte, []freshID, error) {
 	if !rec.ChangedAt.IsZero() {
 		flags2 |= flagChanged
 	}
+	var errArgs [][]byte
 	if rec.ProbeError != "" {
 		flags2 |= flagProbeErr
-		errID, f, err = s.errors.intern(tx, templatize(rec.Host, rec.ProbeError))
+		var tmpl string
+		tmpl, errArgs = templatize(rec.Host, rec.ProbeError)
+		errID, f, err = s.errors.intern(tx, tmpl)
 		if err != nil {
 			return nil, nil, err
 		}
 		fresh = appendFresh(fresh, s.errors, errID, f)
+		if len(errArgs) > 0 {
+			flags2 |= flagErrArgs
+		}
 	}
 	switch {
 	case rec.FinalURL == "":
@@ -192,6 +244,17 @@ func (s *Store) encode(tx *bolt.Tx, rec *Record) ([]byte, []freshID, error) {
 	if flags2&flagProbeErr != 0 {
 		out = binary.AppendUvarint(out, uint64(errID))
 	}
+	if flags2&flagErrArgs != 0 {
+		// The count is written even though the template's markers imply it.
+		// Deriving it from the template would make the rest of the record
+		// unreadable whenever the dictionary entry is missing, which is a
+		// failure the reader should not inherit from a different bucket.
+		out = binary.AppendUvarint(out, uint64(len(errArgs)))
+		for _, a := range errArgs {
+			out = binary.AppendUvarint(out, uint64(len(a)))
+			out = append(out, a...)
+		}
+	}
 	if flags2&flagURLLit != 0 {
 		out = appendString(out, rec.FinalURL)
 	}
@@ -203,8 +266,8 @@ func (s *Store) encode(tx *bolt.Tx, rec *Record) ([]byte, []freshID, error) {
 func (s *Store) decode(host string, raw []byte, rec *Record) error {
 	r := reader{b: raw}
 	version := r.byte()
-	if version != formatVersion {
-		return fmt.Errorf("record format %d, want %d", version, formatVersion)
+	if version < formatOldest || version > formatVersion {
+		return fmt.Errorf("record format %d, want %d to %d", version, formatOldest, formatVersion)
 	}
 	flags1 := r.byte()
 
@@ -246,7 +309,24 @@ func (s *Store) decode(host string, raw []byte, rec *Record) error {
 		rec.ChangedAt = fromUnix(first + uint32(r.uvarint()))
 	}
 	if flags2&flagProbeErr != 0 {
-		rec.ProbeError = expand(host, s.errors.name(uint32(r.uvarint())))
+		tmpl := s.errors.name(uint32(r.uvarint()))
+		var args [][]byte
+		if flags2&flagErrArgs != 0 {
+			// Compared as a uint64 before it is narrowed, and against the
+			// bytes left rather than a fixed cap: every argument costs at
+			// least its own length byte, so a count past what remains is
+			// corrupt whatever the arguments turn out to be. See string().
+			n := r.uvarint()
+			if n > uint64(len(r.b)-r.i) {
+				r.fail()
+				return r.err
+			}
+			args = make([][]byte, 0, n)
+			for range n {
+				args = append(args, r.take(int(r.uvarint())))
+			}
+		}
+		rec.ProbeError = expand(host, tmpl, args)
 	}
 	switch {
 	case flags2&flagURLLit != 0:
@@ -322,17 +402,70 @@ func originName(code int) string {
 
 func derivedURL(host string) string { return "https://" + host + "/" }
 
-// templatize replaces the hostname inside a probe error with a marker, so
-// errors that differ only by host share one dictionary entry.
-func templatize(host, msg string) string {
-	if host == "" {
-		return msg
+// templatize splits a probe error into the shape that gets interned and the
+// values that go on the record.
+//
+// The host is masked first, so a certificate issued for a literal address
+// leaves through hostMark rather than being mistaken for one of the addresses
+// this then lifts out.
+func templatize(host, msg string) (string, [][]byte) {
+	if host != "" {
+		msg = strings.ReplaceAll(msg, host, hostMark)
 	}
-	return strings.ReplaceAll(msg, host, hostMark)
+	if !strings.ContainsAny(msg, "0123456789") {
+		// No digits, so no address. Most errors take this path.
+		return msg, nil
+	}
+	var args [][]byte
+	tmpl := ipCandidate.ReplaceAllStringFunc(msg, func(m string) string {
+		bracketed := strings.HasPrefix(m, "[")
+		ip := net.ParseIP(strings.Trim(m, "[]"))
+		if ip == nil {
+			return m
+		}
+		if v4 := ip.To4(); v4 != nil {
+			args = append(args, v4)
+		} else {
+			args = append(args, ip.To16())
+		}
+		if bracketed {
+			return "[" + argMark + "]"
+		}
+		return argMark
+	})
+	return tmpl, args
 }
 
-func expand(host, tmpl string) string {
-	return strings.ReplaceAll(tmpl, hostMark, host)
+// expand rebuilds a probe error from its template, the host it belongs to, and
+// the values that were lifted out of it.
+//
+// A record whose arguments do not match its template gets a question mark
+// rather than a panic or a silent splice. That can only happen to a record
+// written by something other than encode, and saying so in the text is more
+// use than failing the whole read of a record whose other fields are fine.
+func expand(host, tmpl string, args [][]byte) string {
+	if !strings.ContainsAny(tmpl, hostMark+argMark) {
+		return tmpl
+	}
+	var b strings.Builder
+	b.Grow(len(tmpl) + len(host))
+	next := 0
+	for i := 0; i < len(tmpl); i++ {
+		switch tmpl[i] {
+		case hostMark[0]:
+			b.WriteString(host)
+		case argMark[0]:
+			if next >= len(args) {
+				b.WriteString("?")
+				continue
+			}
+			b.WriteString(net.IP(args[next]).String())
+			next++
+		default:
+			b.WriteByte(tmpl[i])
+		}
+	}
+	return b.String()
 }
 
 // unixSec clamps a time to the uint32 unix range. Zero times stay zero.

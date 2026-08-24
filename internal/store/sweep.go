@@ -66,11 +66,14 @@ func (s *Store) SweepDicts() (SweepResult, error) {
 	err := s.ForEach(func(r *Record) error {
 		mark(keep[s.sources], s.sources, r.Source)
 		mark(keep[s.issuers], s.issuers, r.Issuer)
-		// The record carries the error with its host substituted back in, so
-		// it has to be templatized again to name the entry it came from — the
-		// same call encode makes on the way in.
+		// The record carries the error rebuilt from its template, so it has to
+		// be templatized again to name the entry it came from — the same call
+		// encode makes on the way in. The arguments are discarded: they live
+		// on the record, not in the dictionary, and it is the template whose
+		// entry is being held down.
 		if r.ProbeError != "" {
-			mark(keep[s.errors], s.errors, templatize(r.Host, r.ProbeError))
+			tmpl, _ := templatize(r.Host, r.ProbeError)
+			mark(keep[s.errors], s.errors, tmpl)
 		}
 		return nil
 	})

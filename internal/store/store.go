@@ -286,9 +286,14 @@ func formatOf(tx *bolt.Tx) (stamped bool, err error) {
 			return false, ErrLegacyFormat
 		}
 		return false, nil
-	case len(v) == 1 && v[0] == formatVersion:
+	case len(v) == 1 && v[0] >= formatOldest && v[0] <= formatVersion:
+		// A stamp anywhere in the range this build reads is fine, and is left
+		// as it is. Records carry their own version, so a file holding both
+		// layouts is ordinary rather than a state to be resolved, and raising
+		// the stamp would only stop an older build opening a database it can
+		// still read most of.
 		return true, nil
-	case len(v) == 1 && v[0] < formatVersion:
+	case len(v) == 1 && v[0] < formatOldest:
 		return false, ErrLegacyFormat
 	default:
 		return false, fmt.Errorf("unknown record format %v", v)

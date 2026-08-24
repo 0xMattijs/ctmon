@@ -1,0 +1,210 @@
+package store
+
+import (
+	"encoding/binary"
+	"strings"
+	"testing"
+	"time"
+
+	bolt "go.etcd.io/bbolt"
+)
+
+// Every error a prober actually produces has to come back out exactly as it
+// went in, whatever was lifted out of it on the way.
+func TestProbeErrorRoundTrips(t *testing.T) {
+	cases := []struct {
+		name string
+		host string
+		err  string
+		args int // values expected to move onto the record
+	}{
+		{
+			name: "no address at all",
+			host: "www.example.com",
+			err:  `Get "https://www.example.com/": EOF`,
+		},
+		{
+			name: "one ipv4",
+			host: "www.example.com",
+			err:  `Get "https://www.example.com/": dial tcp 178.142.12.95:443: connect: connection refused`,
+			args: 1,
+		},
+		{
+			name: "ipv6 in brackets",
+			host: "www.example.com",
+			err:  `Get "https://www.example.com/": dial tcp [2606:4700:4700::1111]:443: i/o timeout`,
+			args: 1,
+		},
+		{
+			name: "two addresses",
+			host: "www.example.com",
+			err:  `dial tcp 10.0.0.1:443 -> 192.168.1.1:80: no route`,
+			args: 2,
+		},
+		{
+			name: "a foreign hostname stays in the template",
+			host: "www.example.com",
+			err:  `dial tcp: lookup acisji.com.br: i/o timeout`,
+		},
+		{
+			name: "host that is itself an address",
+			host: "93.184.216.34",
+			err:  `Get "https://93.184.216.34/": dial tcp 93.184.216.34:443: connect: connection refused`,
+			args: 0, // both occurrences leave through hostMark, not argMark
+		},
+		{
+			name: "something that only looks like an address",
+			host: "www.example.com",
+			err:  `unsupported protocol version 1.2.3.4 reported`,
+			args: 1, // ParseIP accepts it; it round-trips regardless
+		},
+		{
+			name: "digits but no address",
+			host: "www.example.com",
+			err:  `Get "https://www.example.com/": unexpected status 502`,
+		},
+		{
+			name: "utf-8 survives the byte walk",
+			host: "www.example.com",
+			err:  `Get "https://www.example.com/": ünexpected — 10.0.0.9:443 · EOF`,
+			args: 1,
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			tmpl, args := templatize(c.host, c.err)
+			if len(args) != c.args {
+				t.Errorf("lifted %d values, want %d (template %q)", len(args), c.args, tmpl)
+			}
+			if got := expand(c.host, tmpl, args); got != c.err {
+				t.Errorf("round trip:\n got %q\nwant %q\n via %q", got, c.err, tmpl)
+			}
+		})
+	}
+}
+
+// The point of lifting the address out: errors that differ only by address
+// become one dictionary entry instead of one each.
+func TestErrorsDifferingOnlyByAddressShareAnEntry(t *testing.T) {
+	s := open(t)
+	now := time.Now().UTC().Truncate(time.Second)
+	addrs := []string{"178.142.12.95", "46.29.238.201", "38.207.187.34", "10.0.0.1"}
+	for i, addr := range addrs {
+		host := string(rune('a'+i)) + ".example.com"
+		withError(t, s, host, "src", "CA",
+			`Get "https://`+host+`/": dial tcp `+addr+`:443: connect: connection refused`, now)
+	}
+	if got := s.errors.len(); got != 1 {
+		t.Errorf("%d error shapes for %d addresses; want 1", got, len(addrs))
+	}
+	// And each record still reports the address it actually failed against.
+	for i, addr := range addrs {
+		host := string(rune('a'+i)) + ".example.com"
+		rec, err := s.Get(host)
+		if err != nil || rec == nil {
+			t.Fatalf("get %s: %v", host, err)
+		}
+		if !strings.Contains(rec.ProbeError, addr) {
+			t.Errorf("%s lost its address: %q does not mention %s", host, rec.ProbeError, addr)
+		}
+	}
+}
+
+// A version-2 record has no argument list and must still read. This is the
+// whole reason the version byte is per record.
+func TestDecodeReadsAVersionTwoRecord(t *testing.T) {
+	s := open(t)
+	now := time.Now().UTC().Truncate(time.Second)
+	host := "old.example.com"
+
+	// Version 2 interned the error whole, address and all, and set no
+	// flagErrArgs. Build that by hand.
+	whole := `Get "https://` + host + `/": dial tcp 178.142.12.95:443: connect: connection refused`
+	var id uint32
+	err := s.update(func(tx *bolt.Tx) error {
+		var err error
+		id, _, err = s.errors.intern(tx, strings.ReplaceAll(whole, host, hostMark))
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.errors.confirm(id)
+
+	raw := buildV2Record(id, now)
+	if err := s.update(func(tx *bolt.Tx) error {
+		return tx.Bucket(bucketDomains).Put([]byte(reverseHost(host)), raw)
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	rec, err := s.Get(host)
+	if err != nil {
+		t.Fatalf("decoding a version 2 record: %v", err)
+	}
+	if rec.ProbeError != whole {
+		t.Errorf("version 2 error = %q; want %q", rec.ProbeError, whole)
+	}
+	if !rec.Probed {
+		t.Error("version 2 record lost its probed flag")
+	}
+}
+
+// A record naming a version this build does not know is refused, not guessed
+// at. That is what keeps an older build from misreading a version 3 record.
+func TestDecodeRefusesAnUnknownVersion(t *testing.T) {
+	s := open(t)
+	for _, v := range []byte{formatOldest - 1, formatVersion + 1} {
+		raw := []byte{v, 0}
+		var rec Record
+		if err := s.decode("x.example.com", raw, &rec); err == nil {
+			t.Errorf("decode of version %d = nil; want a refusal", v)
+		}
+	}
+}
+
+// A corrupt argument count must not be believed.
+func TestDecodeSurvivesACorruptArgumentCount(t *testing.T) {
+	s := open(t)
+	now := time.Now().UTC().Truncate(time.Second)
+	withError(t, s, "a.example.com", "src", "CA",
+		`Get "https://a.example.com/": dial tcp 10.0.0.1:443: refused`, now)
+
+	var raw []byte
+	if err := s.view(func(tx *bolt.Tx) error {
+		v := tx.Bucket(bucketDomains).Get([]byte(reverseHost("a.example.com")))
+		raw = append([]byte{}, v...)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Truncating mid-argument is what a damaged page looks like.
+	for _, cut := range []int{len(raw) - 1, len(raw) - 3, len(raw) / 2} {
+		if cut <= 2 {
+			continue
+		}
+		var rec Record
+		if err := s.decode("a.example.com", raw[:cut], &rec); err == nil {
+			t.Errorf("decode of a record cut to %d bytes = nil; want a refusal", cut)
+		}
+	}
+}
+
+// buildV2Record hand-assembles the version 2 layout: no argument list, and the
+// error interned whole.
+func buildV2Record(errID uint32, now time.Time) []byte {
+	first := unixSec(now)
+	out := []byte{formatOldest, flagProbed | flagProbeBlock}
+	out = binary.AppendUvarint(out, 0) // source
+	out = binary.AppendUvarint(out, 0) // issuer
+	out = binary.BigEndian.AppendUint32(out, first)
+	out = binary.AppendUvarint(out, 0) // last seen delta
+	out = binary.AppendUvarint(out, 1) // seen count
+	out = append(out, flagProbeErr|flagURLAbsent)
+	out = binary.AppendUvarint(out, 0) // probed at delta
+	out = binary.AppendUvarint(out, 0) // status
+	out = binary.AppendUvarint(out, 1) // probe count
+	out = binary.AppendUvarint(out, 0) // body size
+	return binary.AppendUvarint(out, uint64(errID))
+}
