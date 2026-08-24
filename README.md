@@ -1,5 +1,7 @@
 # ctmon — a certificate transparency domain monitor
 
+[![CI](https://github.com/0xMattijs/ctmon/actions/workflows/ci.yml/badge.svg)](https://github.com/0xMattijs/ctmon/actions/workflows/ci.yml)
+
 `ctmon` watches Certificate Transparency logs for newly issued certificates,
 derives hostnames from each certificate's Common Name and subject alternative
 names, and records every hostname together with a SHA-256 hash of the HTML it
@@ -882,6 +884,10 @@ internal/pipeline    wiring: filters, record, probe, backfill
 ```bash
 go test -race ./...
 ```
+
+GitHub Actions runs the same suite, plus `go build`, `go vet`, and a `gofmt`
+check, on every push to `main` and on every pull request. The workflow reads
+its Go version from `go.mod`, so the two cannot drift.
 
 The suite covers CN and SAN expansion, subdomain depth against the public
 suffix list, the suffix blocklist and parent cap, record round-trips through
