@@ -611,6 +611,21 @@ func pruneCmd(args []string) error {
 
 	fmt.Printf("deleted %d of %d records and %d queue entries in %s\n",
 		res.Deleted, res.Scanned, res.Pending, took)
+
+	// The dictionaries are the third thing a deletion leaves behind. They are
+	// swept whenever records went, because a vocabulary is only held down by
+	// the records using it and prune has just removed some.
+	if res.Deleted > 0 {
+		sweep, err := db.SweepDicts()
+		if err != nil {
+			return err
+		}
+		if n := sweep.Total(); n > 0 {
+			fmt.Printf("forgot %d interned values no record still uses (%s): %d sources, %d issuers, %d error shapes\n",
+				n, humanBytes(sweep.Bytes), sweep.Sources, sweep.Issuers, sweep.Errors)
+		}
+	}
+
 	// Queue entries count toward whether anything was freed. Re-running an
 	// interrupted prune is the case: the records went the first time, so this
 	// run deletes none of them and drops the entries the first one orphaned.
