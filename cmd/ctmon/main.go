@@ -250,12 +250,18 @@ func buildSources(cfg feedConfig, userAgent string, db *store.Store, log *slog.L
 			// continues: which logs are current changes underneath a long
 			// run. --logs names a set explicitly, and an explicit set is not
 			// second-guessed.
-			discover = logDiscoverer(cfg.listURL, dial)
+			// Clamped once, here, so the number logged is the number
+			// applied. An operator who has to reason about coverage reads
+			// this line to learn which shards the run decided to follow, and
+			// a line reporting a window the filter did not use would send
+			// them looking in the wrong place.
+			lookahead := max(cfg.logLookahead, 0)
+			discover = logDiscoverer(cfg.listURL, lookahead, dial)
 			var err error
 			if uris, err = discover(context.Background()); err != nil {
 				return nil, err
 			}
-			log.Info("discovered ct logs", "count", len(uris))
+			log.Info("discovered ct logs", "count", len(uris), "lookahead", lookahead)
 			if cfg.logRefresh <= 0 {
 				discover = nil
 			}
@@ -289,7 +295,7 @@ func buildSources(cfg feedConfig, userAgent string, db *store.Store, log *slog.L
 // one. A NAT or proxy that dropped it in the meantime says nothing — the
 // request goes into a dead connection, waits out the 30s timeout, and costs a
 // refresh that is not tried again for another day.
-func logDiscoverer(listURL string, dial func(ctx context.Context, network, addr string) (net.Conn, error)) func(context.Context) ([]string, error) {
+func logDiscoverer(listURL string, lookahead time.Duration, dial func(ctx context.Context, network, addr string) (net.Conn, error)) func(context.Context) ([]string, error) {
 	hc := &http.Client{Timeout: 30 * time.Second}
 	if dial != nil {
 		hc.Transport = &http.Transport{
@@ -301,7 +307,7 @@ func logDiscoverer(listURL string, dial func(ctx context.Context, network, addr 
 	return func(ctx context.Context) ([]string, error) {
 		ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		defer cancel()
-		return source.DiscoverLogs(ctx, hc, listURL)
+		return source.DiscoverLogs(ctx, hc, listURL, lookahead)
 	}
 }
 

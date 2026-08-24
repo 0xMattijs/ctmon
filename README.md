@@ -225,8 +225,8 @@ Two sources feed the same pipeline, and both run by default (`--source both`):
 - **`ctlog`** polls CT logs directly over RFC 6962 (`get-sth`, `get-entries`).
   It depends on nobody but the logs, and it records how far it has read each
   log, so a restart resumes exactly where it stopped. Logs are discovered from
-  Google's v3 log list, filtered to the ones usable and current; override with
-  `--logs`.
+  Google's v3 log list — the usable RFC 6962 ones taking certificates now, not
+  the Static CT API ones it also lists; override with `--logs`.
 
 Run just one with `--source certstream` or `--source ctlog`.
 
@@ -258,12 +258,36 @@ nothing reads unless the list brings it back.
 `--logs` names a set explicitly and is never second-guessed: no discovery at
 startup, and no refresh after it.
 
-What this does not fix: a shard's temporal interval bounds the certificate's
-`NotAfter`, not when it was submitted, and the list is filtered to shards whose
-interval contains *now*. A certificate issued today with 200 days to run is
-logged to the shard covering early 2027 — usable, listed, and not followed. So
-the `ctlog` feed sees less of each shard's tail as its successor fills up,
-refresh or no refresh.
+### Shards run ahead of the clock
+
+A shard's temporal interval bounds the certificate's `NotAfter`, not when it
+was submitted. A certificate is logged to the shard covering its expiry, so the
+shard new certificates land in runs ahead of the calendar by up to the maximum
+validity period — 200 days from March 2026, 100 from March 2027.
+
+Filtering the list to shards whose interval contains *now* therefore misses the
+one being written to. A certificate issued today with 200 days to run has a
+`NotAfter` in March 2027 and goes to `argon2027h1`: usable, listed, and, under
+that rule, not followed. It is wrong for most of each shard's life rather than
+just at the boundary, and worst in the months before a rollover.
+
+So the window is a lookahead, not a point. A shard is followed when it has not
+ended *and* it opens within `--log-lookahead` (200 days by default) of now.
+Against today's list that is 17 logs where the point rule gives 9, and each of
+the extra 8 is one certificates are genuinely being written to. Dropping the
+bound entirely would give 21, including shards that do not open until late
+2027 and answer every poll with nothing.
+
+The default is deliberately the older, longer validity limit. Being late to
+shrink it costs a `get-sth` per poll against a few empty shards; being early to
+shrink it loses certificates.
+
+The real cost is that it roughly doubles the request load of `--source ctlog`,
+which is what the flag is there for. `--log-lookahead 0` asks for no lookahead
+and follows only the shards open now — the old behaviour, at half the requests.
+That is a reasonable trade on `--source both`, where the firehose still carries
+what the successor shard is being sent, and a bad one on `--source ctlog`
+alone, where nothing else is watching it.
 
 ### When a log goes bad
 
