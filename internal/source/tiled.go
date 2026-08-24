@@ -79,7 +79,7 @@ const maxTileBytes = 32 << 20
 // a tile the checkpoint has already counted may be a moment away from the
 // edge serving it, and a partial tile stops existing entirely the moment the
 // tree grows past it.
-var errTileMissing = errors.New("no such tile")
+var errTileMissing = errors.New("not published")
 
 // missesBeforeWarning is how many tiles a log may fail to publish in a row
 // before the wait is worth saying out loud. Below it the wait is the protocol
@@ -311,6 +311,14 @@ func (t *TiledLog) follow(ctx context.Context, uri string, out chan<- Cert) erro
 			if err != nil {
 				return fmt.Errorf("tile %s: %w", path, err)
 			}
+			// A tile that holds more than was asked for is a log serving the
+			// full tile for a partial request, which is allowed to happen and
+			// must not be taken at face value: reading it whole would put pos
+			// past the size the checkpoint gave, and the next pass would read
+			// that as the tree having shrunk and rewind.
+			if len(entries) > width {
+				entries = entries[:width]
+			}
 			// A tile is only ever read forwards, so one that holds fewer
 			// entries than the position already reached leaves nowhere to go:
 			// advancing would skip the gap and staying would fetch it again.
@@ -338,6 +346,11 @@ func (t *TiledLog) follow(ctx context.Context, uri string, out chan<- Cert) erro
 		}
 
 		switch {
+		case stopped == caughtUp:
+			// Caught up, so whatever was missing has been served. Leaving the
+			// count standing would spend the next genuine race's fast re-check
+			// on a miss that is long over.
+			misses = 0
 		case stopped == wasThrottled:
 			// Already waited exactly as long as the log asked to be left for.
 			continue
@@ -424,9 +437,16 @@ func (t *TiledLog) get(ctx context.Context, hc *http.Client, url string) ([]byte
 	default:
 		return nil, fmt.Errorf("%s", resp.Status)
 	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxTileBytes))
+	// One byte past the cap, so a body that reaches it is reported rather
+	// than quietly truncated. A truncated tile parses as a framing error,
+	// which would send whoever reads that line looking at the log's encoder
+	// instead of at this limit.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxTileBytes+1))
 	if err != nil {
 		return nil, err
+	}
+	if len(body) > maxTileBytes {
+		return nil, fmt.Errorf("body is larger than the %d byte limit", maxTileBytes)
 	}
 	return body, nil
 }

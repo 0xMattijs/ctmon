@@ -69,6 +69,13 @@ type fakeTiled struct {
 	withheld map[string]bool
 	// throttle is how many more tile requests to refuse with 429.
 	throttle int
+	// size overrides what the checkpoint reports, so a test can have leaves
+	// the log has not counted yet.
+	size uint64
+	// overserve answers every tile with everything it holds, ignoring the
+	// width that was asked for, as a log serving a full tile for a partial
+	// request does.
+	overserve bool
 	// checkpoints and tiles count what was asked for.
 	checkpoints int
 	tiles       []string
@@ -81,8 +88,12 @@ func (f *fakeTiled) serve(t *testing.T) string {
 		f.mu.Lock()
 		defer f.mu.Unlock()
 		f.checkpoints++
+		size := f.size
+		if size == 0 {
+			size = uint64(len(f.leaves))
+		}
 		fmt.Fprintf(w, "log.example/test\n%d\n%s\n\n— log.example/test AAAA\n",
-			len(f.leaves), base64.StdEncoding.EncodeToString(make([]byte, 32)))
+			size, base64.StdEncoding.EncodeToString(make([]byte, 32)))
 	})
 	mux.HandleFunc("/tile/data/", func(w http.ResponseWriter, r *http.Request) {
 		path := strings.TrimPrefix(r.URL.Path, "/")
@@ -110,7 +121,11 @@ func (f *fakeTiled) serve(t *testing.T) string {
 			http.Error(w, "past the tree", http.StatusNotFound)
 			return
 		}
-		for _, leaf := range f.leaves[base : base+uint64(width)] {
+		end := base + uint64(width)
+		if f.overserve {
+			end = min(base+tileWidth, uint64(len(f.leaves)))
+		}
+		for _, leaf := range f.leaves[base:end] {
 			w.Write(leaf)
 		}
 	})
@@ -406,5 +421,34 @@ func TestTiledRefusesToStartWithoutWhatItNeeds(t *testing.T) {
 	}
 	if err := (&TiledLog{Positions: newPositions()}).Run(context.Background(), out); err == nil {
 		t.Error("ran without any logs")
+	}
+}
+
+// TestTiledIgnoresWhatTheCheckpointDidNotCount covers a log answering a
+// partial-tile request with the whole tile, which is a thing logs do and is
+// not an error.
+//
+// Reading it whole would put the position past the size the checkpoint gave,
+// and the next pass reads a position past the tree as the tree having shrunk:
+// it warns, rewinds to the tip, and does it again on every poll. The entries
+// beyond the checkpoint are real, but taking them costs a permanent false
+// alarm on a log that is behaving.
+func TestTiledIgnoresWhatTheCheckpointDidNotCount(t *testing.T) {
+	log := &fakeTiled{leaves: tileOf(t, 300), size: 280, overserve: true}
+	uri := log.serve(t)
+	pos := newPositions()
+
+	feed := tiledOf(uri, pos)
+	feed.FromStart = true
+	got := runTiled(t, feed)
+
+	waitFor(t, "the counted entries to be read", func() bool { return pos.get(uri) == 280 })
+	// Long enough for a rewind-and-reread cycle to show up as extra entries.
+	time.Sleep(100 * time.Millisecond)
+	if p := pos.get(uri); p != 280 {
+		t.Errorf("position = %d, want the 280 the checkpoint counted", p)
+	}
+	if n := got.len(); n != 280 {
+		t.Errorf("emitted %d certificates, want the 280 the checkpoint counted", n)
 	}
 }
