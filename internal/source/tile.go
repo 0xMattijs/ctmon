@@ -29,25 +29,34 @@ const (
 	entryTypePrecert = 1
 )
 
-// checkpoint is a Static CT log's head: which log it is and how many entries
-// it has. It is the tiled equivalent of an STH, and read for the same reason —
-// to learn where the log ends before walking towards it.
+// checkpoint is a Static CT log's head: which log it is, how many entries it
+// has, what its tree hashes to, and who says so. It is the tiled equivalent of
+// an STH, and read for the same reason — to learn where the log ends before
+// walking towards it.
 //
-// The signature lines are parsed far enough to know they are there and no
-// further. Verifying them would mean carrying each log's public key from the
-// list and implementing the RFC6962NoteSignature scheme, and it would put this
-// feed ahead of the RFC 6962 one, which asks for an STH without a public key
-// and so does not verify either. Both trust HTTPS to the log's own name for
-// the same reason: this monitor is looking for hostnames, and a log that lied
-// about its tree could only make it look at more of them.
+// Every field of it is needed to check the signature, which is why the root
+// hash and the signature block are carried rather than glanced at. The
+// checking itself is in verify.go: this file is the wire format and holds no
+// opinion about whether the bytes it read can be believed.
 type checkpoint struct {
 	// Origin identifies the log, and is its submission prefix as a
 	// schema-less URL — "log.sycamore.ct.letsencrypt.org/2026h2". It is not
 	// the monitoring URL this was fetched from and is not derivable from it,
-	// so it is kept for logging rather than checked against anything.
+	// so it is checked against the origin the log list gave rather than
+	// against anything here.
 	Origin string
 	// Size is the number of entries in the tree.
 	Size uint64
+	// RootHash is what the tree of that size hashes to. Nothing read out of
+	// the log is checked against it yet — that needs the level-0 tiles hashed
+	// up to the root — but it is what the log signed, so verifying the
+	// signature needs it.
+	RootHash [32]byte
+	// Sigs is the signature block verbatim: everything after the blank line,
+	// one signature per line. It is kept whole rather than parsed here
+	// because which line matters depends on a key the wire format knows
+	// nothing about.
+	Sigs string
 }
 
 // parseCheckpoint reads the signed note a Static CT log serves at /checkpoint.
@@ -86,7 +95,9 @@ func parseCheckpoint(body []byte) (checkpoint, error) {
 	if lines[0] == "" {
 		return checkpoint{}, fmt.Errorf("checkpoint: empty origin line")
 	}
-	return checkpoint{Origin: lines[0], Size: size}, nil
+	cp := checkpoint{Origin: lines[0], Size: size, Sigs: sigs}
+	copy(cp.RootHash[:], hash)
+	return cp, nil
 }
 
 // dataTilePath is where the entries numbered [n*tileWidth, n*tileWidth+width)

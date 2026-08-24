@@ -1,6 +1,7 @@
 package source
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -45,8 +46,8 @@ func TestSelectFollowsTheShardCertificatesLandIn(t *testing.T) {
 
 	got := selectLogs(ll, now, 200*day)
 	want := []string{"https://ct.example/2026h2", "https://ct.example/2027h1"}
-	if !slices.Equal(got.RFC6962, want) {
-		t.Fatalf("selectLogs = %v, want %v", got.RFC6962, want)
+	if !slices.Equal(LogURIs(got.RFC6962), want) {
+		t.Fatalf("selectLogs = %v, want %v", LogURIs(got.RFC6962), want)
 	}
 }
 
@@ -63,8 +64,8 @@ func TestSelectStopsAtTheLookahead(t *testing.T) {
 
 	got := selectLogs(ll, now, 200*day)
 	want := []string{"https://ct.example/2027h1"}
-	if !slices.Equal(got.RFC6962, want) {
-		t.Fatalf("selectLogs = %v, want %v", got.RFC6962, want)
+	if !slices.Equal(LogURIs(got.RFC6962), want) {
+		t.Fatalf("selectLogs = %v, want %v", LogURIs(got.RFC6962), want)
 	}
 }
 
@@ -79,8 +80,8 @@ func TestSelectDropsAShardThatEnded(t *testing.T) {
 
 	got := selectLogs(ll, now, 200*day)
 	want := []string{"https://ct.example/2026h2"}
-	if !slices.Equal(got.RFC6962, want) {
-		t.Fatalf("selectLogs = %v, want %v", got.RFC6962, want)
+	if !slices.Equal(LogURIs(got.RFC6962), want) {
+		t.Fatalf("selectLogs = %v, want %v", LogURIs(got.RFC6962), want)
 	}
 }
 
@@ -102,8 +103,8 @@ func TestSelectPinsBothBoundaries(t *testing.T) {
 
 	got := selectLogs(ll, now, 200*day)
 	want := []string{"https://ct.example/opens-at-the-edge"}
-	if !slices.Equal(got.RFC6962, want) {
-		t.Fatalf("selectLogs = %v, want %v", got.RFC6962, want)
+	if !slices.Equal(LogURIs(got.RFC6962), want) {
+		t.Fatalf("selectLogs = %v, want %v", LogURIs(got.RFC6962), want)
 	}
 }
 
@@ -118,8 +119,8 @@ func TestSelectKeepsAnUnshardedLog(t *testing.T) {
 
 	got := selectLogs(ll, now, 200*day)
 	want := []string{"https://ct.example/all"}
-	if !slices.Equal(got.RFC6962, want) {
-		t.Fatalf("selectLogs = %v, want %v", got.RFC6962, want)
+	if !slices.Equal(LogURIs(got.RFC6962), want) {
+		t.Fatalf("selectLogs = %v, want %v", LogURIs(got.RFC6962), want)
 	}
 }
 
@@ -134,8 +135,8 @@ func TestSelectSkipsLogsThatAreNotUsable(t *testing.T) {
 
 	got := selectLogs(ll, now, 200*day)
 	want := []string{"https://ct.example/2026h2"}
-	if !slices.Equal(got.RFC6962, want) {
-		t.Fatalf("selectLogs = %v, want %v", got.RFC6962, want)
+	if !slices.Equal(LogURIs(got.RFC6962), want) {
+		t.Fatalf("selectLogs = %v, want %v", LogURIs(got.RFC6962), want)
 	}
 }
 
@@ -153,8 +154,8 @@ func TestSelectTakesZeroLookaheadLiterally(t *testing.T) {
 	for _, lookahead := range []time.Duration{0, -day} {
 		got := selectLogs(ll, now, lookahead)
 		want := []string{"https://ct.example/open-now"}
-		if !slices.Equal(got.RFC6962, want) {
-			t.Errorf("selectLogs with lookahead %v = %v, want %v", lookahead, got.RFC6962, want)
+		if !slices.Equal(LogURIs(got.RFC6962), want) {
+			t.Errorf("selectLogs with lookahead %v = %v, want %v", lookahead, LogURIs(got.RFC6962), want)
 		}
 	}
 }
@@ -168,8 +169,8 @@ func TestSelectAtTheDefaultLookahead(t *testing.T) {
 		now.Add(DefaultShardLookahead-day), now.Add(400*day)))
 
 	got := selectLogs(ll, now, DefaultShardLookahead)
-	if !slices.Equal(got.RFC6962, []string{"https://ct.example/next"}) {
-		t.Fatalf("selectLogs at the default lookahead = %v, want the successor shard", got.RFC6962)
+	if !slices.Equal(LogURIs(got.RFC6962), []string{"https://ct.example/next"}) {
+		t.Fatalf("selectLogs at the default lookahead = %v, want the successor shard", LogURIs(got.RFC6962))
 	}
 }
 
@@ -193,8 +194,8 @@ func TestDiscoverLogsReadsTheList(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Equal(got.RFC6962, []string{"https://ct.example/current"}) {
-		t.Fatalf("DiscoverLogs = %v, want the current shard only", got.RFC6962)
+	if !slices.Equal(LogURIs(got.RFC6962), []string{"https://ct.example/current"}) {
+		t.Fatalf("DiscoverLogs = %v, want the current shard only", LogURIs(got.RFC6962))
 	}
 }
 
@@ -260,11 +261,11 @@ func TestSelectReadsTiledLogsToo(t *testing.T) {
 	}}}
 
 	got := selectLogs(ll, now, 200*day)
-	if !slices.Equal(got.RFC6962, []string{"https://ct.example/2026h2"}) {
-		t.Errorf("RFC6962 = %v", got.RFC6962)
+	if !slices.Equal(LogURIs(got.RFC6962), []string{"https://ct.example/2026h2"}) {
+		t.Errorf("RFC6962 = %v", LogURIs(got.RFC6962))
 	}
-	if !slices.Equal(got.Tiled, []string{"https://mon.ct.example/2026h2/"}) {
-		t.Errorf("Tiled = %v, want the monitoring URL", got.Tiled)
+	if !slices.Equal(LogURIs(got.Tiled), []string{"https://mon.ct.example/2026h2/"}) {
+		t.Errorf("Tiled = %v, want the monitoring URL", LogURIs(got.Tiled))
 	}
 }
 
@@ -286,8 +287,8 @@ func TestSelectJudgesTiledLogsByTheSameRule(t *testing.T) {
 	}}}
 
 	got := selectLogs(ll, now, 200*day)
-	if !slices.Equal(got.Tiled, []string{"https://mon.ct.example/2027h1/"}) {
-		t.Errorf("Tiled = %v, want only the shard that is live and usable", got.Tiled)
+	if !slices.Equal(LogURIs(got.Tiled), []string{"https://mon.ct.example/2027h1/"}) {
+		t.Errorf("Tiled = %v, want only the shard that is live and usable", LogURIs(got.Tiled))
 	}
 }
 
@@ -307,8 +308,8 @@ func TestSelectKeepsAnOperatorWithOnlyTiledLogs(t *testing.T) {
 	}}}
 
 	got := selectLogs(ll, now, 200*day)
-	if !slices.Equal(got.Tiled, []string{"https://mon.ct.example/2026h2/"}) {
-		t.Errorf("Tiled = %v, want the operator's log", got.Tiled)
+	if !slices.Equal(LogURIs(got.Tiled), []string{"https://mon.ct.example/2026h2/"}) {
+		t.Errorf("Tiled = %v, want the operator's log", LogURIs(got.Tiled))
 	}
 }
 
@@ -337,9 +338,51 @@ func TestDiscoverLogsAcceptsATiledOnlyList(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(got.RFC6962) != 0 {
-		t.Errorf("RFC6962 = %v, want none", got.RFC6962)
+		t.Errorf("RFC6962 = %v, want none", LogURIs(got.RFC6962))
 	}
-	if !slices.Equal(got.Tiled, []string{"https://mon.ct.example/2026h2/"}) {
-		t.Errorf("Tiled = %v", got.Tiled)
+	if !slices.Equal(LogURIs(got.Tiled), []string{"https://mon.ct.example/2026h2/"}) {
+		t.Errorf("Tiled = %v", LogURIs(got.Tiled))
+	}
+}
+
+// TestSelectCarriesWhatVerificationNeeds is what turned a list of URLs into a
+// list of logs. Both are useless a step later if they are dropped here, and
+// both are silent about it: with no key nothing is checked, and with the wrong
+// origin the key id matches no line and every log looks like one that did not
+// sign.
+func TestSelectCarriesWhatVerificationNeeds(t *testing.T) {
+	now := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
+	rfcKey, tiledKey := []byte("rfc6962 key"), []byte("tiled key")
+
+	rfc := usableLog("https://ct.example/2026h2", now.Add(-60*day), now.Add(130*day))
+	rfc.Key = rfcKey
+	tiled := usableTiled("https://mon.ct.example/2026h2/", now.Add(-60*day), now.Add(130*day))
+	tiled.Key = tiledKey
+	ll := &loglist3.LogList{Operators: []*loglist3.Operator{{
+		Name:      "Test",
+		Logs:      []*loglist3.Log{rfc},
+		TiledLogs: []*loglist3.TiledLog{tiled},
+	}}}
+
+	got := selectLogs(ll, now, 200*day)
+	if len(got.RFC6962) != 1 || len(got.Tiled) != 1 {
+		t.Fatalf("selectLogs returned %d rfc6962 and %d tiled logs, want one of each",
+			len(got.RFC6962), len(got.Tiled))
+	}
+	if !bytes.Equal(got.RFC6962[0].Key, rfcKey) {
+		t.Errorf("RFC 6962 key = %q, want %q", got.RFC6962[0].Key, rfcKey)
+	}
+	if !bytes.Equal(got.Tiled[0].Key, tiledKey) {
+		t.Errorf("tiled key = %q, want %q", got.Tiled[0].Key, tiledKey)
+	}
+	// The origin is the submission prefix, which usableTiled deliberately
+	// makes a different host from the monitoring URL the log is read at.
+	if want := "submit.ct.example/2026h2"; got.Tiled[0].Origin != want {
+		t.Errorf("tiled origin = %q, want %q", got.Tiled[0].Origin, want)
+	}
+	// An RFC 6962 log signs no note and names itself nowhere, so it has no
+	// origin to carry and must not invent one.
+	if got.RFC6962[0].Origin != "" {
+		t.Errorf("RFC 6962 origin = %q, want none", got.RFC6962[0].Origin)
 	}
 }

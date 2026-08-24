@@ -10,6 +10,8 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"fmt"
+	"io"
+	"log/slog"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
@@ -64,6 +66,10 @@ type fakeTiled struct {
 	mu sync.Mutex
 	// leaves are the framed entries, one per index.
 	leaves [][]byte
+	// signer signs the checkpoint. Left nil the log serves the unsigned
+	// placeholder note these tests used before signatures were checked, which
+	// is what a log that cannot be believed looks like from the follower.
+	signer *testLog
 	// withheld are tile paths answered as absent, as a log whose checkpoint
 	// has run ahead of its storage does.
 	withheld map[string]bool
@@ -91,6 +97,10 @@ func (f *fakeTiled) serve(t *testing.T) string {
 		size := f.size
 		if size == 0 {
 			size = uint64(len(f.leaves))
+		}
+		if f.signer != nil {
+			io.WriteString(w, f.signer.checkpointOf(size, testRoot))
+			return
 		}
 		fmt.Fprintf(w, "log.example/test\n%d\n%s\n\n— log.example/test AAAA\n",
 			size, base64.StdEncoding.EncodeToString(make([]byte, 32)))
@@ -163,6 +173,14 @@ func (f *fakeTiled) publish(path string) {
 	delete(f.withheld, path)
 }
 
+// checkpointsAsked is how many times the log's head has been fetched, which is
+// how a test tells a follower that is still running from one that has stopped.
+func (f *fakeTiled) checkpointsAsked() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.checkpoints
+}
+
 func (f *fakeTiled) tilesAsked() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -173,7 +191,7 @@ func (f *fakeTiled) tilesAsked() []string {
 // watch it.
 func tiledOf(uri string, pos Positions) *TiledLog {
 	return &TiledLog{
-		URIs:              []string{uri},
+		Logs:              unkeyed(uri),
 		Positions:         pos,
 		PollInterval:      5 * time.Millisecond,
 		RequestsPerSecond: 1000,
@@ -398,7 +416,7 @@ func TestTiledKeepsOneLogPerPrefix(t *testing.T) {
 	pos := newPositions()
 
 	feed := tiledOf(uri+"/", pos)
-	feed.URIs = append(feed.URIs, uri)
+	feed.Logs = append(feed.Logs, Log{URI: uri})
 	runTiled(t, feed)
 
 	waitFor(t, "the log to be picked up", func() bool { return pos.seen(uri) })
@@ -416,7 +434,7 @@ func TestTiledKeepsOneLogPerPrefix(t *testing.T) {
 // looking like a quiet log.
 func TestTiledRefusesToStartWithoutWhatItNeeds(t *testing.T) {
 	out := make(chan Cert)
-	if err := (&TiledLog{URIs: []string{"https://log.example"}}).Run(context.Background(), out); err == nil {
+	if err := (&TiledLog{Logs: unkeyed("https://log.example")}).Run(context.Background(), out); err == nil {
 		t.Error("ran without a Positions store")
 	}
 	if err := (&TiledLog{Positions: newPositions()}).Run(context.Background(), out); err == nil {
@@ -451,4 +469,162 @@ func TestTiledIgnoresWhatTheCheckpointDidNotCount(t *testing.T) {
 	if n := got.len(); n != 280 {
 		t.Errorf("emitted %d certificates, want the 280 the checkpoint counted", n)
 	}
+}
+
+// TestTiledFollowsALogThatSignsWhatItServes is the whole path with the check
+// switched on: a log with a key on the list, a checkpoint it actually signed,
+// and entries reaching the channel.
+func TestTiledFollowsALogThatSignsWhatItServes(t *testing.T) {
+	signer := newTestLog(t, "log.example/2026h2")
+	log := &fakeTiled{leaves: tileOf(t, 300), signer: signer}
+	uri := log.serve(t)
+
+	pos := newPositions()
+	feed := tiledOf(uri, pos)
+	feed.Logs = []Log{signer.entry(uri)}
+	feed.FromStart = true
+	got := runTiled(t, feed)
+
+	waitFor(t, "the log to be read to its tip", func() bool { return pos.get(uri) == 300 })
+	if n := len(got.all()); n == 0 {
+		t.Error("no certificates reached the channel")
+	}
+}
+
+// TestTiledStopsFollowingALogThatDoesNotVerify is the reaction the whole
+// change turns on. A checkpoint that does not verify is not a bad minute — it
+// is the wrong key or a log serving what it did not sign — so the follower
+// says so and leaves, rather than backing off and asking again forever.
+//
+// What this watches is that the log stops being asked. A follower that treated
+// it as an ordinary failure would still be fetching checkpoints, just more
+// slowly, and would look identical from the position store.
+func TestTiledStopsFollowingALogThatDoesNotVerify(t *testing.T) {
+	// No signer, so the log serves the unsigned placeholder note while the
+	// list says it has a key.
+	log := &fakeTiled{leaves: tileOf(t, 300)}
+	uri := log.serve(t)
+
+	pos := newPositions()
+	feed := tiledOf(uri, pos)
+	feed.Logs = []Log{newTestLog(t, "log.example/test").entry(uri)}
+	runTiled(t, feed)
+
+	waitFor(t, "the log to be read once", func() bool { return log.checkpointsAsked() > 0 })
+	// Long enough for many more polls at the 5ms interval, and for the first
+	// 5s backoff to have been nowhere near expiring.
+	asked := log.checkpointsAsked()
+	time.Sleep(100 * time.Millisecond)
+	if now := log.checkpointsAsked(); now != asked {
+		t.Errorf("checkpoint fetched %d more times after the signature failed; the follower is still running", now-asked)
+	}
+	if p, seen, _ := pos.LogPos(uri); seen {
+		t.Errorf("stored a position of %d for a log that never verified", p)
+	}
+}
+
+// TestTiledRefusesACheckpointForAnotherLog is the misconfiguration this
+// catches for free: the right key, a genuinely signed checkpoint, and the
+// wrong log at the other end of the URL.
+func TestTiledRefusesACheckpointForAnotherLog(t *testing.T) {
+	signer := newTestLog(t, "log.example/2026h2")
+	log := &fakeTiled{leaves: tileOf(t, 300), signer: signer}
+	uri := log.serve(t)
+
+	pos := newPositions()
+	feed := tiledOf(uri, pos)
+	// Same key, and the list says this URL serves the next shard along.
+	entry := signer.entry(uri)
+	entry.Origin = "log.example/2027h1"
+	feed.Logs = []Log{entry}
+	runTiled(t, feed)
+
+	waitFor(t, "the log to be read once", func() bool { return log.checkpointsAsked() > 0 })
+	asked := log.checkpointsAsked()
+	time.Sleep(100 * time.Millisecond)
+	if now := log.checkpointsAsked(); now != asked {
+		t.Errorf("checkpoint fetched %d more times; the follower is still running", now-asked)
+	}
+}
+
+// TestTiledSaysWhenItIsFollowingNothing is the other half of not retrying a
+// log that cannot be believed. Stopping is right; going quiet about it is not.
+// A feed following no logs reports nothing, which is exactly what a feed
+// following quiet logs reports, and the error at the moment the last follower
+// left has scrolled away by the time anyone wonders.
+func TestTiledSaysWhenItIsFollowingNothing(t *testing.T) {
+	// No signer, so neither log's checkpoint verifies and both followers stop.
+	first, second := &fakeTiled{leaves: tileOf(t, 300)}, &fakeTiled{leaves: tileOf(t, 300)}
+	a, b := first.serve(t), second.serve(t)
+
+	var lines lockedBuffer
+	feed := tiledOf(a, newPositions())
+	feed.Log = slog.New(slog.NewTextHandler(&lines, &slog.HandlerOptions{Level: slog.LevelError}))
+	feed.Logs = []Log{
+		newTestLog(t, "log.example/a").entry(a),
+		newTestLog(t, "log.example/b").entry(b),
+	}
+	runTiled(t, feed)
+
+	waitFor(t, "the feed to report that it is following nothing", func() bool {
+		return strings.Contains(lines.String(), "now reading nothing")
+	})
+	// Said once, when the last one left — not once per follower.
+	if n := strings.Count(lines.String(), "now reading nothing"); n != 1 {
+		t.Errorf("reported %d times, want once: the first follower to leave was not the last", n)
+	}
+}
+
+// TestTiledStaysQuietWhenTheRunEnds is the other side of that. Shutdown takes
+// every follower with it, and a run being stopped is not a feed that has lost
+// its logs.
+func TestTiledStaysQuietWhenTheRunEnds(t *testing.T) {
+	signer := newTestLog(t, "log.example/2026h2")
+	log := &fakeTiled{leaves: tileOf(t, 300), signer: signer}
+	uri := log.serve(t)
+
+	var lines lockedBuffer
+	pos := newPositions()
+	feed := tiledOf(uri, pos)
+	feed.Log = slog.New(slog.NewTextHandler(&lines, &slog.HandlerOptions{Level: slog.LevelError}))
+	feed.Logs = []Log{signer.entry(uri)}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	out := make(chan Cert, 4096)
+	go func() {
+		for range out {
+		}
+	}()
+	done := make(chan error, 1)
+	go func() { done <- feed.Run(ctx, out) }()
+
+	waitFor(t, "the log to be read", func() bool { return pos.seen(uri) })
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run did not return after cancellation")
+	}
+
+	if got := lines.String(); got != "" {
+		t.Errorf("shutdown logged an error:\n%s", got)
+	}
+}
+
+// lockedBuffer collects log output written from the followers' goroutines.
+type lockedBuffer struct {
+	mu sync.Mutex
+	b  strings.Builder
+}
+
+func (l *lockedBuffer) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
+
+func (l *lockedBuffer) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.String()
 }

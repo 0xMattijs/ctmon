@@ -1,12 +1,15 @@
 package source
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	ct "github.com/google/certificate-transparency-go"
@@ -28,9 +31,9 @@ type Positions interface {
 // depends on nobody but the logs themselves and resumes cleanly after a
 // restart, at the cost of more requests than the firehose.
 type CTLog struct {
-	// URIs are the log base URLs to follow, e.g.
-	// "https://ct.googleapis.com/logs/us1/argon2026h1".
-	URIs []string
+	// Logs are the logs to follow, each a base URL and the key it signs with.
+	// A log with no key is followed and not checked; see verifierFor.
+	Logs []Log
 	// Positions stores per-log read positions. Required.
 	Positions Positions
 	// FromStart reads each log from index 0 the first time it is seen.
@@ -61,9 +64,9 @@ type CTLog struct {
 	DialContext func(ctx context.Context, network, addr string) (net.Conn, error)
 	// Discover re-reads the set of logs worth following, normally
 	// DiscoverLogs against the same list URI startup used. Set it and Run
-	// reconsiders the set every RefreshInterval; leave it nil and URIs is the
+	// reconsiders the set every RefreshInterval; leave it nil and Logs is the
 	// set for the life of the run, which is what --logs asks for.
-	Discover func(ctx context.Context) ([]string, error)
+	Discover func(ctx context.Context) ([]Log, error)
 	// RefreshInterval is how often Discover is called (default 24h). Logs are
 	// sharded by time and roll over about twice a year, so this is about
 	// noticing a boundary within a day of it happening, not about keeping up
@@ -121,6 +124,48 @@ func (c *CTLog) Name() string { return "ctlog" }
 // loses certificates.
 const DefaultShardLookahead = 200 * 24 * time.Hour
 
+// Log is one log worth following: where to read it, and what it signs with.
+//
+// The key is why this is a struct rather than the URL it used to be. A log
+// that says how big it is has to be taken at its word or checked, and checking
+// needs the key the list published beside the URL — so the two travel
+// together, through discovery, through the refresh, and into the follower,
+// rather than the URL travelling alone and the key being looked up again
+// somewhere it might not match.
+type Log struct {
+	// URI is where the log is read: a base URL for an RFC 6962 log,
+	// a monitoring prefix for a tiled one. It is also the key positions are
+	// stored under, so it has to mean the same thing for the life of a store.
+	URI string
+	// Key is the log's public key, as the SPKI DER the log list carries. It
+	// is empty for a log named with --logs or --tiled-logs, which comes with
+	// no list entry to take a key from and so cannot be checked.
+	Key []byte
+	// Origin is a tiled log's submission prefix as a schema-less URL —
+	// "log.sycamore.ct.letsencrypt.org/2026h2" — which is the name its
+	// checkpoint signs under. It is not the monitoring URL in URI and is not
+	// derivable from it, so it can only come from the list. Empty for an
+	// RFC 6962 log, which names itself nowhere.
+	Origin string
+}
+
+// sameLog reports whether b is the log a was, rather than a second log that
+// has taken over its URL. Positions are keyed by URI, so the URI alone cannot
+// answer that.
+func sameLog(a, b Log) bool {
+	return a.URI == b.URI && a.Origin == b.Origin && bytes.Equal(a.Key, b.Key)
+}
+
+// LogURIs is the URIs of logs, in order, for callers that care about which
+// logs were picked and not about what they sign with.
+func LogURIs(logs []Log) []string {
+	uris := make([]string, len(logs))
+	for i, lg := range logs {
+		uris[i] = lg.URI
+	}
+	return uris
+}
+
 // LogSet is one pass over the log list, split by the protocol the logs speak.
 //
 // Google's v3 list carries two kinds of log per operator and they are not two
@@ -130,18 +175,19 @@ const DefaultShardLookahead = 200 * 24 * time.Hour
 // discovered into separate fields rather than concatenated into one list of
 // URLs that would fail every poll for half its members.
 type LogSet struct {
-	// RFC6962 are base URLs, e.g.
+	// RFC6962 logs are read at base URLs, e.g.
 	// "https://ct.googleapis.com/logs/us1/argon2026h2/".
-	RFC6962 []string
-	// Tiled are monitoring URLs, e.g.
+	RFC6962 []Log
+	// Tiled logs are read at monitoring URLs, e.g.
 	// "https://mon.sycamore.ct.letsencrypt.org/2026h2/". A tiled log also
 	// publishes a submission URL, which is where certificates are sent and
-	// not where they are read.
+	// not where they are read — it is kept as the Origin, because that is the
+	// name the log's checkpoint signs under.
 	//
-	// Which of the two is stored here is a decision that outlives the run:
-	// Positions is keyed by URI, so switching to the other one later resumes
-	// every tiled log at its tip.
-	Tiled []string
+	// Which of the two is stored as the URI is a decision that outlives the
+	// run: Positions is keyed by URI, so switching to the other one later
+	// resumes every tiled log at its tip.
+	Tiled []Log
 }
 
 // Total is how many logs the set holds, of either kind.
@@ -219,16 +265,38 @@ func selectLogs(ll *loglist3.LogList, now time.Time, lookahead time.Duration) Lo
 	for _, op := range ll.Operators {
 		for _, lg := range op.Logs {
 			if usableNow(lg.State, lg.TemporalInterval, now, opensBy) {
-				set.RFC6962 = append(set.RFC6962, lg.URL)
+				set.RFC6962 = append(set.RFC6962, Log{URI: lg.URL, Key: lg.Key})
 			}
 		}
 		for _, lg := range op.TiledLogs {
 			if usableNow(lg.State, lg.TemporalInterval, now, opensBy) {
-				set.Tiled = append(set.Tiled, lg.MonitoringURL)
+				set.Tiled = append(set.Tiled, Log{
+					URI:    lg.MonitoringURL,
+					Key:    lg.Key,
+					Origin: noteOrigin(lg.SubmissionURL),
+				})
 			}
 		}
 	}
 	return set
+}
+
+// noteOrigin is the name a tiled log's checkpoint signs under, derived from
+// the submission URL the log list gives: the URL without its scheme and
+// without a trailing slash, so
+// "https://log.sycamore.ct.letsencrypt.org/2026h2/" becomes
+// "log.sycamore.ct.letsencrypt.org/2026h2".
+//
+// It is derived from the submission URL and not the monitoring one because
+// those are different hosts for most operators — Let's Encrypt reads from
+// mon.sycamore and submits to log.sycamore, Geomys reads from skylight and
+// submits to sunlight — and it is the submission prefix a log names itself by.
+// Checked against every tiled log on Google's list: the origin computed this
+// way is the first line of the checkpoint each of them serves.
+func noteOrigin(submissionURL string) string {
+	s := strings.TrimPrefix(submissionURL, "https://")
+	s = strings.TrimPrefix(s, "http://")
+	return strings.TrimRight(s, "/")
 }
 
 // usableNow is the rule both kinds of log are judged by: approved for Chrome,
@@ -256,18 +324,18 @@ func (c *CTLog) Run(ctx context.Context, out chan<- Cert) error {
 	if c.Positions == nil {
 		return fmt.Errorf("ctlog: Positions is required")
 	}
-	if len(c.URIs) == 0 {
+	if len(c.Logs) == 0 {
 		return fmt.Errorf("ctlog: no log URIs configured")
 	}
 	set := &followSet{
-		uris:      c.URIs,
+		logs:      c.Logs,
 		positions: c.Positions,
 		discover:  c.Discover,
 		refresh:   c.RefreshInterval,
 		kind:      "ct log",
 		log:       c.Log,
-		follow: func(fctx context.Context, uri string) {
-			c.followForever(fctx, uri, out)
+		follow: func(fctx context.Context, lg Log) {
+			c.followForever(fctx, lg, out)
 		},
 	}
 	return set.run(ctx)
@@ -276,18 +344,25 @@ func (c *CTLog) Run(ctx context.Context, out chan<- Cert) error {
 // followForever restarts follow after any failure, backing off between tries.
 // The backoff counter resets after a run that lasted, so an occasional failure
 // on a healthy log costs one short pause rather than a permanently long one.
-func (c *CTLog) followForever(ctx context.Context, uri string, out chan<- Cert) {
+func (c *CTLog) followForever(ctx context.Context, lg Log, out chan<- Cert) {
 	st := &logState{batch: c.batchCeiling(), max: c.batchCeiling()}
 	rt := retry{base: 5 * time.Second, max: 10 * time.Minute}
 	for ctx.Err() == nil {
 		start := time.Now()
-		err := c.follow(ctx, uri, out, st)
+		err := c.follow(ctx, lg, out, st)
 		if ctx.Err() != nil {
+			return
+		}
+		if errors.Is(err, errUntrusted) {
+			// Not a bad minute. See errUntrusted: this is the wrong key or a
+			// log serving what it did not sign, and neither is waited out.
+			c.Log.Error("ct log signature did not verify; no longer following it",
+				"log", lg.URI, "err", err)
 			return
 		}
 		ran := time.Since(start)
 		d := rt.after(ran)
-		c.Log.Warn("ct log follow failed", "log", uri, "err", err,
+		c.Log.Warn("ct log follow failed", "log", lg.URI, "err", err,
 			"ran", ran.Round(time.Second), "batch", st.batch, "retry_in", d)
 		if sleep(ctx, d) != nil {
 			return
@@ -305,7 +380,8 @@ func (c *CTLog) batchCeiling() int {
 
 // follow reads one log from its stored position to the tip, then keeps pace
 // with it. It returns on the first error so the caller can back off.
-func (c *CTLog) follow(ctx context.Context, uri string, out chan<- Cert, st *logState) error {
+func (c *CTLog) follow(ctx context.Context, lg Log, out chan<- Cert, st *logState) error {
+	uri := lg.URI
 	poll := c.PollInterval
 	if poll <= 0 {
 		poll = 30 * time.Second
@@ -316,9 +392,15 @@ func (c *CTLog) follow(ctx context.Context, uri string, out chan<- Cert, st *log
 	}
 	limiter := rate.NewLimiter(rate.Limit(rps), 1)
 
+	// The client is built without a public key on purpose, and the tree head
+	// it returns is verified below instead. See verifySTH for why.
 	lc, err := client.New(uri, c.httpClient(), jsonclient.Options{UserAgent: c.UserAgent})
 	if err != nil {
 		return fmt.Errorf("client: %w", err)
+	}
+	v, err := verifierFor(lg.Key)
+	if err != nil {
+		return err
 	}
 
 	pos, ok, err := c.Positions.LogPos(uri)
@@ -332,6 +414,9 @@ func (c *CTLog) follow(ctx context.Context, uri string, out chan<- Cert, st *log
 		}
 		sth, err := lc.GetSTH(ctx)
 		if err != nil {
+			return fmt.Errorf("get-sth: %w", err)
+		}
+		if err := verifySTH(v, sth); err != nil {
 			return fmt.Errorf("get-sth: %w", err)
 		}
 		firstSight := !ok
