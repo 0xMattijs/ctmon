@@ -244,19 +244,21 @@ func buildSources(cfg feedConfig, userAgent string, db *store.Store, log *slog.L
 	}
 	if want["ctlog"] {
 		uris := splitList(cfg.logURIs)
+		var discover func(context.Context) ([]string, error)
 		if len(uris) == 0 {
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
+			// The list is read now to start, and again while the run
+			// continues: which logs are current changes underneath a long
+			// run. --logs names a set explicitly, and an explicit set is not
+			// second-guessed.
+			discover = logDiscoverer(cfg.listURL, dial)
 			var err error
-			hc := &http.Client{Timeout: 30 * time.Second}
-			if dial != nil {
-				hc.Transport = &http.Transport{DialContext: dial, ForceAttemptHTTP2: true}
-			}
-			uris, err = source.DiscoverLogs(ctx, hc, cfg.listURL)
-			if err != nil {
+			if uris, err = discover(context.Background()); err != nil {
 				return nil, err
 			}
 			log.Info("discovered ct logs", "count", len(uris))
+			if cfg.logRefresh <= 0 {
+				discover = nil
+			}
 		}
 		feeds = append(feeds, &source.CTLog{
 			URIs:              uris,
@@ -268,10 +270,28 @@ func buildSources(cfg feedConfig, userAgent string, db *store.Store, log *slog.L
 			RequestsPerSecond: cfg.rps,
 			UserAgent:         userAgent,
 			DialContext:       dial,
+			Discover:          discover,
+			RefreshInterval:   cfg.logRefresh,
 			Log:               log,
 		})
 	}
 	return feeds, nil
+}
+
+// logDiscoverer returns a function that reads the CT log list, over the same
+// dialer the feed uses so the list is fetched through the run's own resolver.
+// The client is built once and shared: every refresh talks to the same host,
+// and a connection kept open is one name the resolver is not asked for again.
+func logDiscoverer(listURL string, dial func(ctx context.Context, network, addr string) (net.Conn, error)) func(context.Context) ([]string, error) {
+	hc := &http.Client{Timeout: 30 * time.Second}
+	if dial != nil {
+		hc.Transport = &http.Transport{DialContext: dial, ForceAttemptHTTP2: true}
+	}
+	return func(ctx context.Context) ([]string, error) {
+		ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+		return source.DiscoverLogs(ctx, hc, listURL)
+	}
 }
 
 // compactLoop rewrites the database into full pages on a schedule. bolt never

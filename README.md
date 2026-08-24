@@ -234,6 +234,27 @@ By default a newly seen log starts at its current tree head, so you get new
 certificates rather than history. Pass `--from-start` to backfill a log from
 index 0 — that is millions of entries per log, so use it deliberately.
 
+### The log list moves
+
+Logs are sharded by time, and most operators roll over every half year. A run
+that discovered its logs at startup and never looked again outlives them: at a
+boundary the whole set stops accepting certificates at once, and the monitor
+keeps politely polling shards nobody writes to while missing the ones that
+replaced them. With `--source both` the firehose covers for it, so the only
+sign is the `ctlog` share of the counters going quiet.
+
+So the list is re-read every `--log-refresh` (24h by default, `0` disables) and
+the followers are brought in line with it: a log the list has added gets one, a
+log it has dropped loses its. Both sides are logged. A refresh that fails, or
+that comes back empty, changes nothing — a list that would not load is no
+reason to stop following logs that are working.
+
+The stored position of a log that left is kept. Shards come back, and resuming
+one at its tip would lose everything logged while it was away.
+
+`--logs` names a set explicitly and is never second-guessed: no discovery at
+startup, and no refresh after it.
+
 ### When a log goes bad
 
 Logs degrade. One measured case: `ct2026-b.trustasia.com/log2026b` served 64
