@@ -60,7 +60,17 @@ type CTLog struct {
 	// saturate DNS starves its own source of certificates, which fails as
 	// "get-sth: ... server misbehaving" and stops the feed entirely.
 	DialContext func(ctx context.Context, network, addr string) (net.Conn, error)
-	Log         *slog.Logger
+	// Discover re-reads the set of logs worth following, normally
+	// DiscoverLogs against the same list URI startup used. Set it and Run
+	// reconsiders the set every RefreshInterval; leave it nil and URIs is the
+	// set for the life of the run, which is what --logs asks for.
+	Discover func(ctx context.Context) ([]string, error)
+	// RefreshInterval is how often Discover is called (default 24h). Logs are
+	// sharded by time and roll over about twice a year, so this is about
+	// noticing a boundary within a day of it happening, not about keeping up
+	// with a fast-moving list.
+	RefreshInterval time.Duration
+	Log             *slog.Logger
 }
 
 // Batch sizes are adapted per log between minBatchSize and the configured
@@ -144,6 +154,12 @@ func DiscoverLogs(ctx context.Context, hc *http.Client, listURL string) ([]strin
 
 // Run follows every configured log until ctx is cancelled. A log that keeps
 // failing is retried with backoff rather than taking the others down with it.
+//
+// With Discover set, the set itself is reconsidered every RefreshInterval:
+// a log the list has added gets a follower, one it has dropped loses its.
+// Without that, a run outlives the shards it started with — logs are sharded
+// by time, and at a rollover the whole set stops accepting certificates at
+// once while this keeps politely asking it for entries.
 func (c *CTLog) Run(ctx context.Context, out chan<- Cert) error {
 	if c.Positions == nil {
 		return fmt.Errorf("ctlog: Positions is required")
@@ -152,16 +168,126 @@ func (c *CTLog) Run(ctx context.Context, out chan<- Cert) error {
 		return fmt.Errorf("ctlog: no log URIs configured")
 	}
 
+	// following holds every running follower, keyed by URI. It is touched
+	// only from this goroutine — the refresh loop below runs here rather than
+	// beside it — so it needs no lock of its own.
 	var wg sync.WaitGroup
-	for _, uri := range c.URIs {
+	following := make(map[string]*follower, len(c.URIs))
+	follow := func(uri string) {
+		fctx, cancel := context.WithCancel(ctx)
+		f := &follower{cancel: cancel, done: make(chan struct{})}
+		following[uri] = f
 		wg.Add(1)
-		go func(uri string) {
+		go func() {
 			defer wg.Done()
-			c.followForever(ctx, uri, out)
-		}(uri)
+			defer close(f.done)
+			c.followForever(fctx, uri, out)
+		}()
+	}
+	for _, uri := range c.URIs {
+		if _, dup := following[uri]; !dup {
+			follow(uri)
+		}
+	}
+
+	if c.Discover != nil {
+		c.refreshForever(ctx, following, follow)
 	}
 	wg.Wait()
 	return ctx.Err()
+}
+
+// refreshForever re-reads the log list on a timer and reconciles the running
+// followers against it. It returns when ctx is cancelled.
+//
+// A refresh that fails changes nothing. The list comes over the network, and a
+// monitor that stopped following every log because one fetch timed out would
+// be worse off than one running on a list a day old.
+func (c *CTLog) refreshForever(ctx context.Context, following map[string]*follower, follow func(string)) {
+	t := time.NewTicker(c.refreshEvery())
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		uris, err := c.Discover(ctx)
+		if ctx.Err() != nil {
+			return
+		}
+		switch {
+		case err != nil:
+			c.Log.Warn("ct log list refresh failed; keeping the current logs",
+				"err", err, "logs", len(following))
+		case len(uris) == 0:
+			// Every log at once is a broken list, not a rollover.
+			c.Log.Warn("ct log list refresh returned no logs; keeping the current logs",
+				"logs", len(following))
+		default:
+			c.reconcile(uris, following, follow)
+		}
+	}
+}
+
+// reconcile starts and stops followers until the running set is uris. Both
+// sides are logged at info: a monitor that swaps out its own inputs without
+// saying so is hard to trust when its counters later move differently.
+//
+// The stored position of a log that dropped out is left where it is. A shard
+// can return, Positions is keyed by URI, and forgetting the position would
+// resume it at the tip and lose whatever it logged in between. It is logged on
+// the way out, because a log that was behind when it left — a degraded one, or
+// one --max-lag has been letting slip — leaves entries after it that nothing
+// will read unless the list brings it back.
+func (c *CTLog) reconcile(uris []string, following map[string]*follower, follow func(string)) {
+	want := make(map[string]bool, len(uris))
+	for _, uri := range uris {
+		want[uri] = true
+	}
+	for uri, f := range following {
+		if !want[uri] {
+			f.stop()
+			// Read the position after the follower has gone, not while it is
+			// still moving it, so the number logged is the one it left.
+			pos, _, _ := c.Positions.LogPos(uri)
+			c.Log.Info("ct log left the log list; stopped", "log", uri, "position", pos)
+			delete(following, uri)
+		}
+	}
+	for _, uri := range uris {
+		if _, running := following[uri]; !running {
+			c.Log.Info("ct log joined the log list; following", "log", uri)
+			follow(uri)
+		}
+	}
+}
+
+// follower is one running follow loop and the handle to stop it.
+type follower struct {
+	cancel context.CancelFunc
+	done   chan struct{}
+}
+
+// stop cancels the follower and waits for it to leave.
+//
+// The waiting is the point. Cancelling and returning would let the next
+// refresh start a second follower for a URI the first has not finished
+// leaving yet — a list served stale or half-written by a CDN is enough to ask
+// for that — and two loops on one log read the same ranges and write the same
+// position, which can walk it backwards. Every wait in the loop watches the
+// context, so this returns as fast as the follower can notice.
+func (f *follower) stop() {
+	f.cancel()
+	<-f.done
+}
+
+// refreshEvery is how often the log list is re-read.
+func (c *CTLog) refreshEvery() time.Duration {
+	if c.RefreshInterval <= 0 {
+		return 24 * time.Hour
+	}
+	return c.RefreshInterval
 }
 
 // followForever restarts follow after any failure, backing off between tries.

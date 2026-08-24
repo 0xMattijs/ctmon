@@ -39,15 +39,20 @@ type runConfig struct {
 
 // feedConfig selects and paces the certificate sources.
 type feedConfig struct {
-	sources   string
-	certURL   string
-	logURIs   string
-	listURL   string
-	fromStart bool
-	batch     int
-	maxLag    uint64
-	poll      time.Duration
-	rps       float64
+	sources string
+	certURL string
+	logURIs string
+	listURL string
+	// logRefresh is how often the log list is re-read while a run continues.
+	// Logs are sharded by time, so the set discovered at startup expires — the
+	// whole set at once, at a rollover — and a long run that never looks again
+	// polls shards nobody writes to any more.
+	logRefresh time.Duration
+	fromStart  bool
+	batch      int
+	maxLag     uint64
+	poll       time.Duration
+	rps        float64
 	// dialTimeout bounds the TCP connect to a log or to the firehose. It is
 	// separate from the prober's --dial-timeout, which is deliberately harsh:
 	// two seconds is right for shedding a host out of CT that will never
@@ -124,6 +129,7 @@ func (c *runConfig) bind(fs *flag.FlagSet) {
 	fs.StringVar(&f.certURL, "certstream-url", source.DefaultCertstreamURL, "certstream websocket URL")
 	fs.StringVar(&f.logURIs, "logs", "", "comma-separated CT log URLs (default: discover usable logs)")
 	fs.StringVar(&f.listURL, "log-list-url", "", "CT log list URL (default: Google's v3 list)")
+	fs.DurationVar(&f.logRefresh, "log-refresh", 24*time.Hour, "re-read the log list this often and follow what it now lists (0 disables; ignored with --logs)")
 	fs.BoolVar(&f.fromStart, "from-start", false, "read each new log from index 0 instead of its current tip")
 	fs.IntVar(&f.batch, "batch", 256, "entries per get-entries request (a ceiling: a log that times out gets asked for less)")
 	fs.Uint64Var(&f.maxLag, "max-lag", 0, "skip a log to its tree head when it falls this many entries behind (0 = never skip)")

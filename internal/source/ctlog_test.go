@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -27,6 +28,7 @@ type fakeLog struct {
 	treeSize  uint64
 	maxServed int   // 0 means serve whatever is asked
 	asked     []int // entry counts requested, in order
+	heads     int   // get-sth calls, which is how a follower shows it is alive
 }
 
 func (f *fakeLog) serve(t *testing.T) string {
@@ -35,6 +37,7 @@ func (f *fakeLog) serve(t *testing.T) string {
 	mux.HandleFunc("/ct/v1/get-sth", func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		defer f.mu.Unlock()
+		f.heads++
 		json.NewEncoder(w).Encode(map[string]any{
 			"tree_size":           f.treeSize,
 			"timestamp":           int64(1787000000000),
@@ -75,6 +78,12 @@ func (f *fakeLog) requests() []int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]int(nil), f.asked...)
+}
+
+func (f *fakeLog) sths() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.heads
 }
 
 // memPositions is an in-memory Positions.
@@ -277,5 +286,254 @@ func TestRetryCapsTheDelay(t *testing.T) {
 	}
 	if last != 4*time.Second {
 		t.Errorf("delay = %v, want the 4s cap", last)
+	}
+}
+
+// waitFor polls cond until it holds, and fails the test if it never does.
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.After(10 * time.Second)
+	for !cond() {
+		select {
+		case <-deadline:
+			t.Fatalf("timed out waiting for %s", what)
+		case <-time.After(2 * time.Millisecond):
+		}
+	}
+}
+
+func (m *memPositions) seen(uri string) bool {
+	_, ok, _ := m.LogPos(uri)
+	return ok
+}
+
+// listOf is a log list a test can rewrite while the feed is running, which is
+// what a shard rollover looks like from the monitor's side.
+type listOf struct {
+	mu   sync.Mutex
+	uris []string
+	err  error
+}
+
+func (l *listOf) set(uris ...string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.uris = uris
+}
+
+func (l *listOf) discover(context.Context) ([]string, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]string(nil), l.uris...), l.err
+}
+
+// runFeed starts c and stops it when the test ends.
+func runFeed(t *testing.T, c *CTLog) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	out := make(chan Cert, 64)
+	go func() {
+		for range out {
+		}
+	}()
+	done := make(chan error, 1)
+	go func() { done <- c.Run(ctx, out) }()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Error("Run did not return after cancellation")
+		}
+	})
+}
+
+// refreshing is a CTLog wired to list, polling fast enough for a test to watch.
+func refreshing(uris []string, pos Positions, list *listOf) *CTLog {
+	return &CTLog{
+		URIs:              uris,
+		Positions:         pos,
+		PollInterval:      5 * time.Millisecond,
+		RequestsPerSecond: 1000,
+		RefreshInterval:   10 * time.Millisecond,
+		Discover:          list.discover,
+		Log:               discardLog(),
+	}
+}
+
+func TestRefreshFollowsALogTheListAdds(t *testing.T) {
+	started, added := &fakeLog{}, &fakeLog{}
+	a, b := started.serve(t), added.serve(t)
+
+	list := &listOf{uris: []string{a}}
+	pos := newPositions()
+	runFeed(t, refreshing([]string{a}, pos, list))
+
+	waitFor(t, "the configured log to be followed", func() bool { return pos.seen(a) })
+	if n := added.sths(); n != 0 {
+		t.Fatalf("polled a log that is not on the list %d times", n)
+	}
+
+	// A new shard opens.
+	list.set(a, b)
+	waitFor(t, "the new log to be followed", func() bool { return pos.seen(b) })
+}
+
+func TestRefreshStopsALogTheListDrops(t *testing.T) {
+	kept, dropped := &fakeLog{}, &fakeLog{treeSize: 100}
+	a, b := kept.serve(t), dropped.serve(t)
+
+	list := &listOf{uris: []string{a, b}}
+	pos := newPositions()
+	runFeed(t, refreshing([]string{a, b}, pos, list))
+	waitFor(t, "both logs to be followed", func() bool { return pos.seen(a) && pos.seen(b) })
+
+	// The shard expires out of the list.
+	list.set(a)
+	waitFor(t, "the dropped log to stop being polled", func() bool {
+		before := dropped.sths()
+		time.Sleep(50 * time.Millisecond)
+		return dropped.sths() == before
+	})
+
+	// Stopping one follower must not stop the others.
+	busy := kept.sths()
+	waitFor(t, "the remaining log to keep being polled", func() bool { return kept.sths() > busy })
+
+	// The position of a log that left is kept, because a shard can come back
+	// and resuming it at the tip would lose everything logged in between.
+	if got := pos.get(b); got != 100 {
+		t.Errorf("position of the dropped log = %d, want the 100 it had reached", got)
+	}
+	list.set(a, b)
+	resumed := dropped.sths()
+	waitFor(t, "the returning log to be followed again", func() bool { return dropped.sths() > resumed })
+	if got := pos.get(b); got != 100 {
+		t.Errorf("position after the log came back = %d, want the 100 it left at", got)
+	}
+}
+
+func TestRefreshThatFailsKeepsTheCurrentLogs(t *testing.T) {
+	// A list that cannot be read, and a list that comes back empty, are both
+	// reasons to keep following what is already working: neither is evidence
+	// that every log on earth stopped accepting certificates.
+	for _, tc := range []struct {
+		name string
+		list *listOf
+	}{
+		{"fetch fails", &listOf{uris: []string{"http://unused.invalid"}, err: errors.New("no route to host")}},
+		{"list is empty", &listOf{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			log := &fakeLog{}
+			uri := log.serve(t)
+			pos := newPositions()
+			runFeed(t, refreshing([]string{uri}, pos, tc.list))
+
+			waitFor(t, "the log to be followed", func() bool { return pos.seen(uri) })
+			// Long enough for several refreshes to have come and gone.
+			time.Sleep(100 * time.Millisecond)
+			before := log.sths()
+			waitFor(t, "the log to still be polled", func() bool { return log.sths() > before })
+		})
+	}
+}
+
+// slowPositions is a store that takes its time, the way bolt does while a
+// compaction holds the write lock. It records the most followers that were
+// ever inside it at once for one log, which is how a follower that was
+// cancelled but has not left yet becomes visible.
+type slowPositions struct {
+	*memPositions
+	delay time.Duration
+
+	mu     sync.Mutex
+	live   map[string]int
+	most   map[string]int
+	starts map[string]int
+}
+
+func newSlowPositions(delay time.Duration) *slowPositions {
+	return &slowPositions{
+		memPositions: newPositions(),
+		delay:        delay,
+		live:         map[string]int{},
+		most:         map[string]int{},
+		starts:       map[string]int{},
+	}
+}
+
+func (s *slowPositions) LogPos(uri string) (uint64, bool, error) {
+	s.mu.Lock()
+	s.live[uri]++
+	s.starts[uri]++
+	s.most[uri] = max(s.most[uri], s.live[uri])
+	s.mu.Unlock()
+
+	// A store does not watch anyone's context, which is the point: a follower
+	// blocked in here has been cancelled and is still running.
+	time.Sleep(s.delay)
+
+	s.mu.Lock()
+	s.live[uri]--
+	s.mu.Unlock()
+	return s.memPositions.LogPos(uri)
+}
+
+func (s *slowPositions) mostAtOnce(uri string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.most[uri]
+}
+
+// followers is how many followers have started on uri since the run began.
+func (s *slowPositions) followers(uri string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.starts[uri]
+}
+
+// flapping hands out one log and then the other, so every refresh drops a log
+// and brings the one before it back.
+type flapping struct {
+	mu   sync.Mutex
+	uris []string
+	n    int
+}
+
+func (f *flapping) discover(context.Context) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.n++
+	return []string{f.uris[f.n%len(f.uris)]}, nil
+}
+
+func TestRefreshRunsOneFollowerPerLog(t *testing.T) {
+	// A log list served stale or half-written flaps, and a refresh that
+	// cancelled a follower without waiting for it would start a second one
+	// over the top of it. Two loops on one log read the same ranges and write
+	// the same position, which can walk it backwards.
+	first, second := &fakeLog{}, &fakeLog{}
+	a, b := first.serve(t), second.serve(t)
+
+	pos := newSlowPositions(20 * time.Millisecond)
+	list := &flapping{uris: []string{a, b}}
+	c := refreshing([]string{a}, pos, &listOf{})
+	c.Discover = list.discover
+	// Faster than the store answers, so a follower on its way out overlaps
+	// the refresh that brings its log back.
+	c.RefreshInterval = time.Millisecond
+	runFeed(t, c)
+
+	// Each log has to go round the drop-and-return cycle several times, or
+	// the run proves nothing about what happens when it does.
+	waitFor(t, "both logs to have been followed repeatedly", func() bool {
+		return pos.followers(a) >= 5 && pos.followers(b) >= 5
+	})
+
+	for _, uri := range []string{a, b} {
+		if n := pos.mostAtOnce(uri); n > 1 {
+			t.Errorf("%d followers ran on one log at once, want 1", n)
+		}
 	}
 }
