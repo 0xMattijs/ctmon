@@ -528,3 +528,47 @@ func TestSeedForUnqueuedRunResumesItsOwnWalk(t *testing.T) {
 		t.Errorf("resumed seed scanned %d records, want only the 10 the first attempt had not reached", scanned)
 	}
 }
+
+// A mark can arrive while a walk that is itself making up for one is halfway
+// through. The walk must not carry on where it stopped: the second run's
+// records are behind it too, and finishing clears the marker for both.
+func TestSeedRestartsWhenAMarkArrivesMidWalk(t *testing.T) {
+	db := openTemp(t)
+	defer func(orig int) { seedChunk = orig }(seedChunk)
+	seedChunk = 10
+
+	seen := time.Now().UTC().Add(-time.Hour)
+	due := seedTestHosts(t, db, 30, seen)
+	if err := db.MarkUnqueued(); err != nil {
+		t.Fatal(err)
+	}
+	interruptSeed(db, "gen1", due, 2)
+
+	// A second run with the sweep off, recording a host the interrupted walk
+	// has already gone past.
+	err := db.Update("aaa.example", func(r *Record, _ bool) bool {
+		r.FirstSeen = seen
+		return true
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkUnqueued(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, ran, err := db.SeedPending("gen1", due, nil); err != nil || !ran {
+		t.Fatalf("seed did not run (ran=%v, err %v)", ran, err)
+	}
+	got, err := db.PendingLease(time.Now().UTC(), 100, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	queued := make(map[string]bool, len(got))
+	for _, p := range got {
+		queued[p.Host] = true
+	}
+	if !queued["aaa.example"] || len(queued) != 31 {
+		t.Errorf("queue holds %d hosts (aaa.example=%v), want all 31", len(queued), queued["aaa.example"])
+	}
+}
