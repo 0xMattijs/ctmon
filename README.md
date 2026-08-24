@@ -249,11 +249,21 @@ log it has dropped loses its. Both sides are logged. A refresh that fails, or
 that comes back empty, changes nothing — a list that would not load is no
 reason to stop following logs that are working.
 
-The stored position of a log that left is kept. Shards come back, and resuming
-one at its tip would lose everything logged while it was away.
+The stored position of a log that left is kept, and logged on the way out.
+Shards come back, and resuming one at its tip would lose everything logged
+while it was away. A log that was behind when it left — a degraded one, or one
+`--max-lag` has been letting slip — leaves entries after that position that
+nothing reads unless the list brings it back.
 
 `--logs` names a set explicitly and is never second-guessed: no discovery at
 startup, and no refresh after it.
+
+What this does not fix: a shard's temporal interval bounds the certificate's
+`NotAfter`, not when it was submitted, and the list is filtered to shards whose
+interval contains *now*. A certificate issued today with 200 days to run is
+logged to the shard covering early 2027 — usable, listed, and not followed. So
+the `ctlog` feed sees less of each shard's tail as its successor fills up,
+refresh or no refresh.
 
 ### When a log goes bad
 

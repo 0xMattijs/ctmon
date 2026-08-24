@@ -280,12 +280,23 @@ func buildSources(cfg feedConfig, userAgent string, db *store.Store, log *slog.L
 
 // logDiscoverer returns a function that reads the CT log list, over the same
 // dialer the feed uses so the list is fetched through the run's own resolver.
-// The client is built once and shared: every refresh talks to the same host,
-// and a connection kept open is one name the resolver is not asked for again.
+// The client is built once and shared, so a refresh that follows another
+// closely reuses the connection.
+//
+// IdleConnTimeout is set for the same reason http.DefaultTransport sets it,
+// and matters more here: refreshes are a day apart, and a transport that
+// never reaps an idle connection would offer that day-old socket to the next
+// one. A NAT or proxy that dropped it in the meantime says nothing — the
+// request goes into a dead connection, waits out the 30s timeout, and costs a
+// refresh that is not tried again for another day.
 func logDiscoverer(listURL string, dial func(ctx context.Context, network, addr string) (net.Conn, error)) func(context.Context) ([]string, error) {
 	hc := &http.Client{Timeout: 30 * time.Second}
 	if dial != nil {
-		hc.Transport = &http.Transport{DialContext: dial, ForceAttemptHTTP2: true}
+		hc.Transport = &http.Transport{
+			DialContext:       dial,
+			ForceAttemptHTTP2: true,
+			IdleConnTimeout:   90 * time.Second,
+		}
 	}
 	return func(ctx context.Context) ([]string, error) {
 		ctx, cancel := context.WithTimeout(ctx, 30*time.Second)

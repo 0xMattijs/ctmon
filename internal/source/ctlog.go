@@ -168,17 +168,19 @@ func (c *CTLog) Run(ctx context.Context, out chan<- Cert) error {
 		return fmt.Errorf("ctlog: no log URIs configured")
 	}
 
-	// following holds the cancel of every running follower, keyed by URI. It
-	// is touched only from this goroutine — the refresh loop below runs here
-	// rather than beside it — so it needs no lock of its own.
+	// following holds every running follower, keyed by URI. It is touched
+	// only from this goroutine — the refresh loop below runs here rather than
+	// beside it — so it needs no lock of its own.
 	var wg sync.WaitGroup
-	following := make(map[string]context.CancelFunc, len(c.URIs))
+	following := make(map[string]*follower, len(c.URIs))
 	follow := func(uri string) {
 		fctx, cancel := context.WithCancel(ctx)
-		following[uri] = cancel
+		f := &follower{cancel: cancel, done: make(chan struct{})}
+		following[uri] = f
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			defer close(f.done)
 			c.followForever(fctx, uri, out)
 		}()
 	}
@@ -201,7 +203,7 @@ func (c *CTLog) Run(ctx context.Context, out chan<- Cert) error {
 // A refresh that fails changes nothing. The list comes over the network, and a
 // monitor that stopped following every log because one fetch timed out would
 // be worse off than one running on a list a day old.
-func (c *CTLog) refreshForever(ctx context.Context, following map[string]context.CancelFunc, follow func(string)) {
+func (c *CTLog) refreshForever(ctx context.Context, following map[string]*follower, follow func(string)) {
 	t := time.NewTicker(c.refreshEvery())
 	defer t.Stop()
 	for {
@@ -234,16 +236,22 @@ func (c *CTLog) refreshForever(ctx context.Context, following map[string]context
 //
 // The stored position of a log that dropped out is left where it is. A shard
 // can return, Positions is keyed by URI, and forgetting the position would
-// resume it at the tip and lose whatever it logged in between.
-func (c *CTLog) reconcile(uris []string, following map[string]context.CancelFunc, follow func(string)) {
+// resume it at the tip and lose whatever it logged in between. It is logged on
+// the way out, because a log that was behind when it left — a degraded one, or
+// one --max-lag has been letting slip — leaves entries after it that nothing
+// will read unless the list brings it back.
+func (c *CTLog) reconcile(uris []string, following map[string]*follower, follow func(string)) {
 	want := make(map[string]bool, len(uris))
 	for _, uri := range uris {
 		want[uri] = true
 	}
-	for uri, cancel := range following {
+	for uri, f := range following {
 		if !want[uri] {
-			c.Log.Info("ct log left the log list; stopping", "log", uri)
-			cancel()
+			f.stop()
+			// Read the position after the follower has gone, not while it is
+			// still moving it, so the number logged is the one it left.
+			pos, _, _ := c.Positions.LogPos(uri)
+			c.Log.Info("ct log left the log list; stopped", "log", uri, "position", pos)
 			delete(following, uri)
 		}
 	}
@@ -253,6 +261,25 @@ func (c *CTLog) reconcile(uris []string, following map[string]context.CancelFunc
 			follow(uri)
 		}
 	}
+}
+
+// follower is one running follow loop and the handle to stop it.
+type follower struct {
+	cancel context.CancelFunc
+	done   chan struct{}
+}
+
+// stop cancels the follower and waits for it to leave.
+//
+// The waiting is the point. Cancelling and returning would let the next
+// refresh start a second follower for a URI the first has not finished
+// leaving yet — a list served stale or half-written by a CDN is enough to ask
+// for that — and two loops on one log read the same ranges and write the same
+// position, which can walk it backwards. Every wait in the loop watches the
+// context, so this returns as fast as the follower can notice.
+func (f *follower) stop() {
+	f.cancel()
+	<-f.done
 }
 
 // refreshEvery is how often the log list is re-read.

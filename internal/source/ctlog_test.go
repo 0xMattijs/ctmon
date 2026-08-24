@@ -438,3 +438,102 @@ func TestRefreshThatFailsKeepsTheCurrentLogs(t *testing.T) {
 		})
 	}
 }
+
+// slowPositions is a store that takes its time, the way bolt does while a
+// compaction holds the write lock. It records the most followers that were
+// ever inside it at once for one log, which is how a follower that was
+// cancelled but has not left yet becomes visible.
+type slowPositions struct {
+	*memPositions
+	delay time.Duration
+
+	mu     sync.Mutex
+	live   map[string]int
+	most   map[string]int
+	starts map[string]int
+}
+
+func newSlowPositions(delay time.Duration) *slowPositions {
+	return &slowPositions{
+		memPositions: newPositions(),
+		delay:        delay,
+		live:         map[string]int{},
+		most:         map[string]int{},
+		starts:       map[string]int{},
+	}
+}
+
+func (s *slowPositions) LogPos(uri string) (uint64, bool, error) {
+	s.mu.Lock()
+	s.live[uri]++
+	s.starts[uri]++
+	s.most[uri] = max(s.most[uri], s.live[uri])
+	s.mu.Unlock()
+
+	// A store does not watch anyone's context, which is the point: a follower
+	// blocked in here has been cancelled and is still running.
+	time.Sleep(s.delay)
+
+	s.mu.Lock()
+	s.live[uri]--
+	s.mu.Unlock()
+	return s.memPositions.LogPos(uri)
+}
+
+func (s *slowPositions) mostAtOnce(uri string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.most[uri]
+}
+
+// followers is how many followers have started on uri since the run began.
+func (s *slowPositions) followers(uri string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.starts[uri]
+}
+
+// flapping hands out one log and then the other, so every refresh drops a log
+// and brings the one before it back.
+type flapping struct {
+	mu   sync.Mutex
+	uris []string
+	n    int
+}
+
+func (f *flapping) discover(context.Context) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.n++
+	return []string{f.uris[f.n%len(f.uris)]}, nil
+}
+
+func TestRefreshRunsOneFollowerPerLog(t *testing.T) {
+	// A log list served stale or half-written flaps, and a refresh that
+	// cancelled a follower without waiting for it would start a second one
+	// over the top of it. Two loops on one log read the same ranges and write
+	// the same position, which can walk it backwards.
+	first, second := &fakeLog{}, &fakeLog{}
+	a, b := first.serve(t), second.serve(t)
+
+	pos := newSlowPositions(20 * time.Millisecond)
+	list := &flapping{uris: []string{a, b}}
+	c := refreshing([]string{a}, pos, &listOf{})
+	c.Discover = list.discover
+	// Faster than the store answers, so a follower on its way out overlaps
+	// the refresh that brings its log back.
+	c.RefreshInterval = time.Millisecond
+	runFeed(t, c)
+
+	// Each log has to go round the drop-and-return cycle several times, or
+	// the run proves nothing about what happens when it does.
+	waitFor(t, "both logs to have been followed repeatedly", func() bool {
+		return pos.followers(a) >= 5 && pos.followers(b) >= 5
+	})
+
+	for _, uri := range []string{a, b} {
+		if n := pos.mostAtOnce(uri); n > 1 {
+			t.Errorf("%d followers ran on one log at once, want 1", n)
+		}
+	}
+}
