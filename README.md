@@ -411,6 +411,7 @@ ctmon run     [flags]    follow CT logs and record discovered domains
 ctmon list    [flags]    list stored domains
 ctmon get     <host>     show one record as JSON
 ctmon stats              summarize the store
+ctmon prune   [flags]    delete records a retention rule has aged out
 ctmon migrate [flags]    rewrite an old JSON database into the packed format
 ctmon compact [flags]    repack the database into full pages
 ```
@@ -424,9 +425,9 @@ $ ctmon stats --db ct.dbb
 error: ct.dbb: no such database
 ```
 
-`run` is the one command that writes to `--db`, and it still creates the
-database on first use. `migrate` and `compact` read `--db` and write to
-`--out`, leaving the original untouched.
+`run` and `prune` are the two commands that write to `--db`; `run` also
+creates the database on first use. `migrate` and `compact` read `--db` and
+write to `--out`, leaving the original untouched.
 
 Useful `list` filters: `--with-hash`, `--wildcard`, `--changed`, `--since 1h`,
 `--under example.com`, `--limit N`, `--json` for JSON lines.
@@ -874,6 +875,127 @@ reader finds either the previous snapshot or the new one, never a half-written
 file. Windows has no `SIGUSR1`, so there the run logs nothing about snapshots
 and the database has to be stopped to read it.
 
+### Forgetting
+
+The store otherwise only grows. Records are written and updated, never
+removed, and compaction returns the slack between them without dropping any.
+That is the right default for a discovery tool — a hostname seen once is
+evidence, and evidence you threw away is not evidence you can go back to — but
+it leaves no answer to the questions an operator eventually has.
+
+`ctmon prune` is that answer, and it is the only command that deletes
+anything:
+
+```console
+$ ctmon prune --db ct.db --unseen-for 90d       # no certificate has named it in this long
+$ ctmon prune --db ct.db --failed-since 30d     # probed, never answered, discovered a while ago
+$ ctmon prune --db ct.db --under workers.dev    # a platform and every tenant under it
+```
+
+The last one is the case with no other workaround. `--skip-suffix` mutes a
+hosting platform going forward and leaves however many thousand of its tenants
+already recorded; this is how you clear them out afterwards.
+
+`--failed-since` means "has been failing this long", and asks two things of a
+record: that it was discovered before the cutoff, and that its last probe was
+too. A record does not store when it *started* failing, so the rule
+approximates it from both ends. On FirstSeen alone, a host discovered months
+ago that only now reaches the front of a deep queue would be deleted an hour
+after its first probe returned a transient failure — the backlog delay, not
+the host, being what aged it past the cutoff. Under `--reprobe` the rule
+narrows instead, since a host tried this morning stops matching; that is the
+safe direction for a rule that deletes.
+
+**Nothing is deleted without `--apply`.** Without it prune runs the same walk
+and reports what matched, so what it prints is what `--apply` would remove and
+not an estimate of it:
+
+```console
+$ ctmon prune --db ct.db --failed-since 1d
+170355 of 3131473 records match, and their queue entries with them (1.5s)
+
+Nothing was deleted. Add --apply to remove them.
+```
+
+Durations here take days as well as the usual units, because retention is
+something people count in days: `90d`, `1d12h`, and `36h` all work.
+
+Rules combine with **and**, not or. `--under workers.dev --failed-since 30d`
+deletes tenants of that platform that have never answered, and leaves the ones
+that have. At least one rule is required — `ctmon prune --apply` with no rule
+would empty the store, and there is no way to type that on purpose.
+
+`--under` is a range scan, which is what reversed keys buy. On a 3.1M-record
+store, scoping to one parent found its 9,892 records in **10 ms**; the same
+question asked of the whole store takes 1.5 seconds.
+
+Queue entries go with the records. A pruned host leaves entries in the pending
+queue pointing at nothing, which the sweep already drops on sight — but only
+one lease at a time, so a large prune would leave the queue dragging behind
+the store for days. Prune reconciles the two itself, in one pass over the
+queue after the records have gone.
+
+That pass runs on every `--apply`, including one that matched no records, and
+it is what dominates a small prune: deleting 9,892 records took 10 ms, and
+walking the 3.9M-entry queue behind it took seven seconds. Running it
+unconditionally is what makes an interrupted prune safe to repeat. The gap
+between the two halves is the wide one, so that is where an interruption
+lands; a second run that stopped on finding no records left to delete would
+never reach the entries the first one orphaned.
+
+Deleting frees pages without shrinking the file, so `--compact` repacks in
+place afterwards:
+
+```console
+$ ctmon prune --db ct.db --failed-since 1d --apply --compact
+deleted 165840 of 3121581 records and 65829 queue entries in 10.8s
+compacted:
+  in use:  500.4 MiB -> 307.8 MiB  (1.6x smaller)
+  on disk: 521.1 MiB -> 313.7 MiB
+```
+
+Two things prune refuses. A database a run is holding, because prune writes
+and bolt gives the writer an exclusive lock — the snapshot route the reading
+commands suggest is no help here, since deleting from a copy leaves the
+original as it was:
+
+```console
+$ ctmon prune --db ct.db --unseen-for 90d --apply
+error: ct.db: database is held by another process; prune writes to the database, so stop the run first
+```
+
+And a snapshot itself, when asked to delete from it. Pruning a snapshot would
+appear to work and change nothing, since the next `SIGUSR1` overwrites it from
+the live database:
+
+```console
+$ ctmon prune --db ct.db.snap --unseen-for 90d --apply
+error: ct.db.snap is a snapshot, and pruning it would change nothing: the next
+snapshot overwrites it from the live database. Stop the run and prune ct.db instead
+```
+
+Counting against a snapshot is allowed, and is the useful thing to do with
+one: while a run holds the live database the snapshot is the only readable
+copy, and "how many records would this rule remove?" is exactly the question
+worth asking of it. A counting run takes a read-only handle, so it cannot
+write to the copy even by accident.
+
+That guard recognizes a snapshot by its `.snap` name, which is all it has to go
+on — prune cannot see the flags the run was started with. A run using
+`--snapshot /var/backup/ct.copy` produces a snapshot prune will delete from
+quite happily, so keep the default suffix if you want the guard.
+
+A prune that is interrupted leaves the store consistent — it has simply
+deleted fewer records than it was asked to, because the walk commits in chunks
+rather than holding millions of deletions in one transaction. Running it again
+finishes the job, records and queue both.
+
+Two rules prune will not take. A retention window of zero or less, which names
+a policy nobody can mean and which the layer above would read as no rule at
+all. And `--under .`, or anything else that trims down to nothing: it names no
+domain, and the scope it would collapse to is the whole store, so the flag
+typed to make a prune narrow would be the one that emptied it.
+
 ### Migrating an existing database
 
 `ctmon run` refuses a database in the old JSON format rather than misreading
@@ -951,12 +1073,12 @@ records per second; raise it if you turn the filters off.
 ## Layout
 
 ```
-cmd/ctmon            command line: run, list, get, stats
+cmd/ctmon            command line: run, list, get, stats, prune
 internal/source      certificate feeds (certstream, RFC 6962 poller, Static CT reader)
 internal/domain      CN and SAN → hostname expansion, validation, depth
 internal/resolve     caching DNS front end, shared by the probes and the feed
 internal/probe       HTTPS fetch and body hashing
-internal/store       packed records, dictionaries, migration, compaction
+internal/store       packed records, dictionaries, migration, compaction, pruning
 internal/pipeline    wiring: filters, record, probe, backfill
 ```
 

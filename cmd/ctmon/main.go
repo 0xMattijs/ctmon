@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"maps"
 	"net"
@@ -17,6 +18,7 @@ import (
 	"os"
 	"os/signal"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -31,10 +33,11 @@ import (
 const usage = `ctmon — certificate transparency domain monitor
 
 usage:
-  ctmon run    [flags]        follow CT logs and record discovered domains
-  ctmon list   [flags]        list stored domains
-  ctmon get    <host>         show one domain record as JSON
+  ctmon run     [flags]       follow CT logs and record discovered domains
+  ctmon list    [flags]       list stored domains
+  ctmon get     <host>        show one domain record as JSON
   ctmon stats                 summarize the store
+  ctmon prune   [flags]       delete stored domains a retention rule has aged out
   ctmon migrate [flags]       rewrite an old JSON database into the packed format
   ctmon compact [flags]       repack the database into full pages
 
@@ -58,6 +61,8 @@ func main() {
 		err = getCmd(args)
 	case "stats":
 		err = statsCmd(args)
+	case "prune":
+		err = pruneCmd(args)
 	case "migrate":
 		err = migrateCmd(args)
 	case "compact":
@@ -546,6 +551,269 @@ func getCmd(args []string) error {
 		enc.SetIndent("", "  ")
 		return enc.Encode(rec)
 	})
+}
+
+// pruneCmd deletes stored records a retention rule has aged out.
+//
+// It is the one command that removes anything, and the only one whose mistakes
+// cannot be undone: a hostname deleted here is gone until a certificate names
+// it again, which for a name that stopped being renewed is never. So the
+// default is to count. Nothing is deleted without --apply, and the counting
+// pass is exactly the pass that would have done the deleting, so what it
+// reports is what --apply would remove and not an estimate of it.
+func pruneCmd(args []string) error {
+	fs := flag.NewFlagSet("prune", flag.ExitOnError)
+	var (
+		dbPath  = fs.String("db", "ct.db", "path to the bbolt database")
+		under   = fs.String("under", "", "restrict to this domain and every host beneath it")
+		apply   = fs.Bool("apply", false, "actually delete; without it prune only counts")
+		compact = fs.Bool("compact", false, "repack the database in place afterwards, to give the freed pages back to the disk")
+	)
+	var unseen, failed days
+	fs.Var(&unseen, "unseen-for", "hosts no certificate has named in this long, e.g. 90d")
+	fs.Var(&failed, "failed-since", "hosts probed, never answered, and first seen this long ago, e.g. 30d")
+	fs.Parse(args)
+
+	opts, err := pruneOptions(*under, time.Duration(unseen), time.Duration(failed))
+	if err != nil {
+		return err
+	}
+	opts.DryRun = !*apply
+
+	db, err := openForPrune(*dbPath, *apply)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	start := time.Now()
+	res, err := db.Prune(opts)
+	took := time.Since(start).Round(time.Millisecond)
+	if err != nil {
+		// The record walk commits as it goes, so a failure in the queue pass
+		// that follows it arrives with records already deleted. Saying only
+		// what went wrong would leave an operator not knowing that.
+		if res.Deleted > 0 {
+			fmt.Printf("deleted %d of %d records in %s before failing\n",
+				res.Deleted, res.Scanned, took)
+		}
+		return err
+	}
+
+	if opts.DryRun {
+		fmt.Printf("%d of %d records match, and their queue entries with them (%s)\n",
+			res.Deleted, res.Scanned, took)
+		if res.Deleted > 0 {
+			fmt.Printf("\nNothing was deleted. Add --apply to remove them.\n")
+		}
+		return nil
+	}
+
+	fmt.Printf("deleted %d of %d records and %d queue entries in %s\n",
+		res.Deleted, res.Scanned, res.Pending, took)
+	// Queue entries count toward whether anything was freed. Re-running an
+	// interrupted prune is the case: the records went the first time, so this
+	// run deletes none of them and drops the entries the first one orphaned.
+	if res.Deleted == 0 && res.Pending == 0 {
+		return nil
+	}
+	if !*compact {
+		// Deleting frees pages without shrinking the file, so a prune that
+		// stops here has reclaimed nothing an operator can see.
+		fmt.Printf("\nThe freed pages are still in the file. To give them back:\n"+
+			"  ctmon compact --db %s      writes a repacked copy to %s.compact\n"+
+			"or add --compact to the prune next time, which repacks in place.\n",
+			*dbPath, *dbPath)
+		return nil
+	}
+	cres, err := db.CompactInPlace()
+	if err != nil {
+		return err
+	}
+	fmt.Println("compacted:")
+	printSizes(os.Stdout, "  ", cres.OldUsed, cres.NewUsed, cres.OldBytes, cres.NewBytes, 0)
+	return nil
+}
+
+// openForPrune opens the database the way this run needs it.
+//
+// A counting run writes nothing, so it takes a handle that cannot write. That
+// is not only tidiness: it is what lets prune answer a question about a
+// snapshot. While a run holds the live database the snapshot is the only
+// readable copy an operator has, and "how many records would this rule
+// remove?" is exactly the question they can usefully ask of it. Only the
+// deleting run has to refuse one, because only its work would be thrown away
+// by the next SIGUSR1.
+func openForPrune(path string, apply bool) (*store.Store, error) {
+	if err := refuseMissing(path); err != nil {
+		return nil, err
+	}
+	if !apply {
+		db, err := store.OpenReadOnly(path)
+		if err != nil {
+			return nil, readErr(path, err)
+		}
+		return db, nil
+	}
+	if err := refuseSnapshot(path); err != nil {
+		return nil, err
+	}
+	db, err := store.Open(path)
+	if err != nil {
+		if errors.Is(err, store.ErrLocked) {
+			// Not the advice readErr gives. A snapshot is no use to a run that
+			// deletes: writing to the copy leaves the database it was copied
+			// from exactly as it was.
+			return nil, fmt.Errorf("%w; prune writes to the database, so stop the run first", err)
+		}
+		return nil, err
+	}
+	return db, nil
+}
+
+// pruneOptions turns the retention flags into a scope and a predicate.
+//
+// Filters combine with and, not or. Given both --unseen-for and
+// --failed-since, a record has to satisfy the two of them to go. That is the
+// conservative reading of a pair of rules, and it is the one to take when
+// guessing wrong deletes hostnames.
+//
+// At least one filter is required. "ctmon prune --apply" with no rule at all
+// would empty the store, and there is no plausible way to type that on
+// purpose — the command for starting over is deleting the file.
+func pruneOptions(under string, unseen, failed time.Duration) (store.PruneOptions, error) {
+	now := time.Now().UTC()
+	var match []func(*store.Record) bool
+	if unseen > 0 {
+		match = append(match, store.Unseen(now.Add(-unseen)))
+	}
+	if failed > 0 {
+		match = append(match, store.Failed(now.Add(-failed)))
+	}
+	if under == "" && len(match) == 0 {
+		return store.PruneOptions{}, errors.New("prune needs a rule: --under, --unseen-for, or --failed-since")
+	}
+	return store.PruneOptions{Under: under, Match: store.All(match...)}, nil
+}
+
+// refuseSnapshot turns away a path that names a snapshot rather than a
+// database.
+//
+// Reading a store while a run holds it means signalling for a snapshot and
+// reading the copy, so a snapshot path is what an operator has in hand and in
+// their shell history. Pruning it does nothing they want: the deletions land
+// in a file the next SIGUSR1 overwrites, and the database they were trying to
+// shrink is untouched. That is a failure with no symptom, which is worse than
+// one with a message.
+func refuseSnapshot(path string) error {
+	if !strings.HasSuffix(path, snapshotSuffix) {
+		return nil
+	}
+	instead := "the database it was copied from"
+	if live := strings.TrimSuffix(path, snapshotSuffix); live != "" {
+		instead = live
+	}
+	return fmt.Errorf("%s is a snapshot, and pruning it would change nothing:"+
+		" the next snapshot overwrites it from the live database."+
+		" Stop the run and prune %s instead", path, instead)
+}
+
+// refuseMissing turns away a path that names no database, the way the reading
+// commands do.
+//
+// store.Open creates one, which is right for a run starting fresh and wrong
+// here. A mistyped --db would otherwise conjure an empty store and report that
+// nothing matched — a typo that reads as an answer, and the one kind of answer
+// this command must never give by accident.
+func refuseMissing(path string) error {
+	switch fi, err := os.Stat(path); {
+	case errors.Is(err, fs.ErrNotExist):
+		return fmt.Errorf("%s: %w", path, store.ErrNoDatabase)
+	case err != nil:
+		return err
+	case fi.IsDir() || fi.Size() == 0:
+		// The same check OpenReadOnly makes, for the same reason. An empty
+		// file is what a mistyped shell redirect leaves behind, and store.Open
+		// would happily initialize it into a fresh database and then report
+		// that nothing matched.
+		return fmt.Errorf("%s: %w", path, store.ErrNoDatabase)
+	}
+	return nil
+}
+
+// days is a duration flag that also understands days, because retention is
+// something people count in days and 90d beats 2160h for saying so. Everything
+// time.ParseDuration accepts still works, and a day count may carry a
+// remainder: 90d, 36h, 1d12h.
+//
+// It is only on prune. The run's durations are timeouts and intervals, which
+// nobody writes in days, and a flag type that shows up on half the commands is
+// worse than one that shows up where it earns its place.
+//
+// Zero and negative windows are refused rather than parsed. Both name a rule
+// that cannot be meant — "delete what no certificate has named in the last
+// -30 days" is not a retention policy — and the layer above reads an unset
+// window as "no rule given", so a window that arrived and then vanished would
+// be silently dropped and leave whatever other rules were typed to delete
+// strictly more than the operator asked for.
+type days time.Duration
+
+func (d *days) String() string {
+	if d == nil || *d == 0 {
+		return "0s"
+	}
+	if n := time.Duration(*d); n%(24*time.Hour) == 0 {
+		return fmt.Sprintf("%dd", n/(24*time.Hour))
+	}
+	return time.Duration(*d).String()
+}
+
+// maxDays bounds the day count, and the bound is about overflow rather than
+// taste. A duration is int64 nanoseconds, so 106,752 days is the most that
+// fits; past that the multiplication wraps silently, and a wrapped retention
+// window is not a window that matches nothing — it is one whose cutoff lands
+// in the future and matches every record in the store. On a command that
+// deletes, that is the difference between a typo and an empty database.
+//
+// The bound is set well below the point where it could happen, because a
+// retention rule of 274 years is a typo whatever the arithmetic does with it.
+const maxDays = 100000
+
+func (d *days) Set(s string) error {
+	if s == "" {
+		return errors.New("empty duration")
+	}
+	// time.ParseDuration has no unit spelled with a d, so the first one can
+	// only be the day count this type adds.
+	rest, n := s, time.Duration(0)
+	if i := strings.IndexByte(s, 'd'); i >= 0 {
+		count, err := strconv.Atoi(s[:i])
+		if err != nil {
+			return fmt.Errorf("invalid duration %q: want a whole number of days, like 90d", s)
+		}
+		if count > maxDays || count < -maxDays {
+			return fmt.Errorf("invalid duration %q: %d days is not a retention rule", s, count)
+		}
+		n, rest = time.Duration(count)*24*time.Hour, s[i+1:]
+	}
+	if rest != "" {
+		extra, err := time.ParseDuration(rest)
+		if err != nil {
+			return fmt.Errorf("invalid duration %q", s)
+		}
+		// time.ParseDuration bounds extra on its own, but the sum of two
+		// durations that each fit need not.
+		sum := n + extra
+		if (extra > 0 && sum < n) || (extra < 0 && sum > n) {
+			return fmt.Errorf("invalid duration %q: out of range", s)
+		}
+		n = sum
+	}
+	if n <= 0 {
+		return fmt.Errorf("invalid duration %q: a retention window has to be positive", s)
+	}
+	*d = days(n)
+	return nil
 }
 
 // humanBytes renders a byte count for a person.

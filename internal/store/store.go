@@ -91,9 +91,17 @@ type Store struct {
 }
 
 // Open opens or creates the database at path.
+//
+// The handle takes bolt's exclusive lock, so it refuses a database a run is
+// already holding, with ErrLocked. What to do about that depends on why the
+// caller wanted to write — a second run is a mistake, a prune is a thing to
+// do later — so the command says that part.
 func Open(path string) (*Store, error) {
 	db, err := bolt.Open(path, 0o600, &bolt.Options{Timeout: 5 * time.Second})
 	if err != nil {
+		if errors.Is(err, bolt.ErrTimeout) {
+			return nil, fmt.Errorf("%s: %w", path, ErrLocked)
+		}
 		return nil, fmt.Errorf("open %s: %w", path, err)
 	}
 	s := newStore(db, path)
@@ -393,26 +401,89 @@ func (s *Store) ForEach(fn func(*Record) error) error {
 	})
 }
 
+// hostRange is the run of keys one parent covers: the parent's own record and
+// every host beneath it. Reversed keys are what make it a run at all — all of
+// example.com sorts together under com.example — so a query about a domain is
+// a range scan rather than a walk of the whole store.
+//
+// The two bounds are not one prefix test, because the keys between them are
+// not all inside. com.example-two sorts after com.example and before
+// com.example., and is a different domain entirely.
+type hostRange struct {
+	// prefix is the parent's own key, and nil for the whole store.
+	prefix []byte
+	// under is prefix plus the separator, which every host beneath the
+	// parent starts with.
+	under []byte
+}
+
+// rangeUnder builds the range covering parent and everything below it. An
+// empty parent gives the range that holds everything.
+//
+// Surrounding whitespace goes first, because no hostname has any and a value
+// that kept it would name a domain that cannot exist — a silent match of
+// nothing, where a shell quote went astray.
+func rangeUnder(parent string) hostRange {
+	prefix := []byte(reverseHost(strings.ToLower(strings.Trim(strings.TrimSpace(parent), "."))))
+	if len(prefix) == 0 {
+		return hostRange{}
+	}
+	return hostRange{prefix: prefix, under: append(append([]byte{}, prefix...), '.')}
+}
+
+// test reports whether k is inside the range, and whether the cursor has left
+// it for good. Keys arrive in order, so past ends a scan rather than skipping
+// one key.
+func (r hostRange) test(k []byte) (in, past bool) {
+	switch {
+	case r.prefix == nil:
+		return true, false
+	case bytes.Equal(k, r.prefix):
+		return true, false
+	case bytes.HasPrefix(k, r.under):
+		return true, false
+	default:
+		// Everything from here on sorts above the range, so the first key
+		// past it is the end.
+		return false, bytes.Compare(k, r.under) > 0
+	}
+}
+
+// scopeUnder builds the range covering parent, and refuses one that names no
+// domain.
+//
+// The distinction it draws is between a caller who passed nothing, meaning the
+// whole store, and one who passed something that trimmed away to nothing. Both
+// reach rangeUnder as the empty scope, and the empty scope is everything — so
+// a value like "." asks to narrow and would widen instead. Every entry point
+// that takes a parent has to tell the two apart, not just the one that
+// deletes: a list that silently prints the whole store is a wrong answer too.
+func scopeUnder(parent string) (hostRange, error) {
+	r := rangeUnder(parent)
+	if parent != "" && r.prefix == nil {
+		return r, fmt.Errorf("%q names no domain", parent)
+	}
+	return r, nil
+}
+
 // ForEachUnder calls fn for parent and every host beneath it. Reversed keys
 // make this a range scan over one contiguous run of the tree rather than a
 // walk of the whole store.
 func (s *Store) ForEachUnder(parent string, fn func(*Record) error) error {
-	prefix := []byte(reverseHost(strings.ToLower(strings.Trim(parent, "."))))
-	if len(prefix) == 0 {
+	r, err := scopeUnder(parent)
+	if err != nil {
+		return err
+	}
+	if r.prefix == nil {
 		return s.ForEach(fn)
 	}
-	under := append(append([]byte{}, prefix...), '.')
-
 	return s.view(func(tx *bolt.Tx) error {
 		c := tx.Bucket(bucketDomains).Cursor()
-		for k, v := c.Seek(prefix); k != nil; k, v = c.Next() {
-			switch {
-			case bytes.Equal(k, prefix):
-			case bytes.HasPrefix(k, under):
-			default:
-				if bytes.Compare(k, under) > 0 {
-					return nil
-				}
+		for k, v := c.Seek(r.prefix); k != nil; k, v = c.Next() {
+			switch in, past := r.test(k); {
+			case past:
+				return nil
+			case !in:
 				continue
 			}
 			if err := s.emit(k, v, fn); err != nil {
