@@ -45,8 +45,8 @@ func TestSelectFollowsTheShardCertificatesLandIn(t *testing.T) {
 
 	got := selectLogs(ll, now, 200*day)
 	want := []string{"https://ct.example/2026h2", "https://ct.example/2027h1"}
-	if !slices.Equal(got, want) {
-		t.Fatalf("selectLogs = %v, want %v", got, want)
+	if !slices.Equal(got.RFC6962, want) {
+		t.Fatalf("selectLogs = %v, want %v", got.RFC6962, want)
 	}
 }
 
@@ -63,8 +63,8 @@ func TestSelectStopsAtTheLookahead(t *testing.T) {
 
 	got := selectLogs(ll, now, 200*day)
 	want := []string{"https://ct.example/2027h1"}
-	if !slices.Equal(got, want) {
-		t.Fatalf("selectLogs = %v, want %v", got, want)
+	if !slices.Equal(got.RFC6962, want) {
+		t.Fatalf("selectLogs = %v, want %v", got.RFC6962, want)
 	}
 }
 
@@ -79,8 +79,8 @@ func TestSelectDropsAShardThatEnded(t *testing.T) {
 
 	got := selectLogs(ll, now, 200*day)
 	want := []string{"https://ct.example/2026h2"}
-	if !slices.Equal(got, want) {
-		t.Fatalf("selectLogs = %v, want %v", got, want)
+	if !slices.Equal(got.RFC6962, want) {
+		t.Fatalf("selectLogs = %v, want %v", got.RFC6962, want)
 	}
 }
 
@@ -102,8 +102,8 @@ func TestSelectPinsBothBoundaries(t *testing.T) {
 
 	got := selectLogs(ll, now, 200*day)
 	want := []string{"https://ct.example/opens-at-the-edge"}
-	if !slices.Equal(got, want) {
-		t.Fatalf("selectLogs = %v, want %v", got, want)
+	if !slices.Equal(got.RFC6962, want) {
+		t.Fatalf("selectLogs = %v, want %v", got.RFC6962, want)
 	}
 }
 
@@ -118,8 +118,8 @@ func TestSelectKeepsAnUnshardedLog(t *testing.T) {
 
 	got := selectLogs(ll, now, 200*day)
 	want := []string{"https://ct.example/all"}
-	if !slices.Equal(got, want) {
-		t.Fatalf("selectLogs = %v, want %v", got, want)
+	if !slices.Equal(got.RFC6962, want) {
+		t.Fatalf("selectLogs = %v, want %v", got.RFC6962, want)
 	}
 }
 
@@ -134,8 +134,8 @@ func TestSelectSkipsLogsThatAreNotUsable(t *testing.T) {
 
 	got := selectLogs(ll, now, 200*day)
 	want := []string{"https://ct.example/2026h2"}
-	if !slices.Equal(got, want) {
-		t.Fatalf("selectLogs = %v, want %v", got, want)
+	if !slices.Equal(got.RFC6962, want) {
+		t.Fatalf("selectLogs = %v, want %v", got.RFC6962, want)
 	}
 }
 
@@ -153,8 +153,8 @@ func TestSelectTakesZeroLookaheadLiterally(t *testing.T) {
 	for _, lookahead := range []time.Duration{0, -day} {
 		got := selectLogs(ll, now, lookahead)
 		want := []string{"https://ct.example/open-now"}
-		if !slices.Equal(got, want) {
-			t.Errorf("selectLogs with lookahead %v = %v, want %v", lookahead, got, want)
+		if !slices.Equal(got.RFC6962, want) {
+			t.Errorf("selectLogs with lookahead %v = %v, want %v", lookahead, got.RFC6962, want)
 		}
 	}
 }
@@ -168,8 +168,8 @@ func TestSelectAtTheDefaultLookahead(t *testing.T) {
 		now.Add(DefaultShardLookahead-day), now.Add(400*day)))
 
 	got := selectLogs(ll, now, DefaultShardLookahead)
-	if !slices.Equal(got, []string{"https://ct.example/next"}) {
-		t.Fatalf("selectLogs at the default lookahead = %v, want the successor shard", got)
+	if !slices.Equal(got.RFC6962, []string{"https://ct.example/next"}) {
+		t.Fatalf("selectLogs at the default lookahead = %v, want the successor shard", got.RFC6962)
 	}
 }
 
@@ -193,8 +193,8 @@ func TestDiscoverLogsReadsTheList(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Equal(got, []string{"https://ct.example/current"}) {
-		t.Fatalf("DiscoverLogs = %v, want the current shard only", got)
+	if !slices.Equal(got.RFC6962, []string{"https://ct.example/current"}) {
+		t.Fatalf("DiscoverLogs = %v, want the current shard only", got.RFC6962)
 	}
 }
 
@@ -230,5 +230,116 @@ func TestDiscoverLogsRejectsABadStatus(t *testing.T) {
 
 	if _, err := DiscoverLogs(context.Background(), srv.Client(), srv.URL, 0); err == nil {
 		t.Fatal("DiscoverLogs accepted a 404 response")
+	}
+}
+
+// usableTiled builds one usable, sharded Static CT API log covering
+// [start, end). The monitoring URL is the one a monitor reads; the submission
+// URL is set to something else on purpose, so a test that picked the wrong
+// field would say so.
+func usableTiled(monitor string, start, end time.Time) *loglist3.TiledLog {
+	return &loglist3.TiledLog{
+		MonitoringURL:    monitor,
+		SubmissionURL:    strings.Replace(monitor, "mon.", "submit.", 1),
+		State:            &loglist3.LogStates{Usable: &loglist3.LogState{}},
+		TemporalInterval: &loglist3.TemporalInterval{StartInclusive: start, EndExclusive: end},
+	}
+}
+
+// TestSelectReadsTiledLogsToo is the point of splitting the result: Google's
+// v3 list carries two kinds of log per operator, and a monitor that walks only
+// the first kind is blind to every log the second holds.
+func TestSelectReadsTiledLogsToo(t *testing.T) {
+	now := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
+	ll := &loglist3.LogList{Operators: []*loglist3.Operator{{
+		Name: "Test",
+		Logs: []*loglist3.Log{usableLog("https://ct.example/2026h2", now.Add(-60*day), now.Add(130*day))},
+		TiledLogs: []*loglist3.TiledLog{
+			usableTiled("https://mon.ct.example/2026h2/", now.Add(-60*day), now.Add(130*day)),
+		},
+	}}}
+
+	got := selectLogs(ll, now, 200*day)
+	if !slices.Equal(got.RFC6962, []string{"https://ct.example/2026h2"}) {
+		t.Errorf("RFC6962 = %v", got.RFC6962)
+	}
+	if !slices.Equal(got.Tiled, []string{"https://mon.ct.example/2026h2/"}) {
+		t.Errorf("Tiled = %v, want the monitoring URL", got.Tiled)
+	}
+}
+
+// TestSelectJudgesTiledLogsByTheSameRule keeps the two kinds honest against
+// each other. Status and the temporal window decide which logs are worth
+// following, and they say the same thing whichever protocol the log speaks.
+func TestSelectJudgesTiledLogsByTheSameRule(t *testing.T) {
+	now := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
+	retired := usableTiled("https://mon.ct.example/retired/", now.Add(-60*day), now.Add(130*day))
+	retired.State = &loglist3.LogStates{Retired: &loglist3.LogState{}}
+	ll := &loglist3.LogList{Operators: []*loglist3.Operator{{
+		Name: "Test",
+		TiledLogs: []*loglist3.TiledLog{
+			retired,
+			usableTiled("https://mon.ct.example/ended/", now.Add(-240*day), now.Add(-60*day)),
+			usableTiled("https://mon.ct.example/too-far-out/", now.Add(311*day), now.Add(494*day)),
+			usableTiled("https://mon.ct.example/2027h1/", now.Add(130*day), now.Add(311*day)),
+		},
+	}}}
+
+	got := selectLogs(ll, now, 200*day)
+	if !slices.Equal(got.Tiled, []string{"https://mon.ct.example/2027h1/"}) {
+		t.Errorf("Tiled = %v, want only the shard that is live and usable", got.Tiled)
+	}
+}
+
+// TestSelectKeepsAnOperatorWithOnlyTiledLogs is the trap in
+// loglist3.SelectByStatus, which this package deliberately does not use: it
+// filters Logs, copies TiledLogs through untouched, and drops any operator
+// left holding no usable RFC 6962 log at all. An operator who has moved every
+// shard to Static CT — which is the direction the whole ecosystem is going —
+// would disappear from the list entirely.
+func TestSelectKeepsAnOperatorWithOnlyTiledLogs(t *testing.T) {
+	now := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
+	ll := &loglist3.LogList{Operators: []*loglist3.Operator{{
+		Name: "Tiles only",
+		TiledLogs: []*loglist3.TiledLog{
+			usableTiled("https://mon.ct.example/2026h2/", now.Add(-60*day), now.Add(130*day)),
+		},
+	}}}
+
+	got := selectLogs(ll, now, 200*day)
+	if !slices.Equal(got.Tiled, []string{"https://mon.ct.example/2026h2/"}) {
+		t.Errorf("Tiled = %v, want the operator's log", got.Tiled)
+	}
+}
+
+// TestDiscoverLogsRefusesAnEmptyResult already covers a list with nothing on
+// it. This is the other half: a list with no usable RFC 6962 logs left is not
+// empty if it still has tiled ones, and failing there would turn the ecosystem
+// finishing its move to Static CT into a startup error.
+func TestDiscoverLogsAcceptsATiledOnlyList(t *testing.T) {
+	now := time.Now()
+	body, err := json.Marshal(&loglist3.LogList{Operators: []*loglist3.Operator{{
+		Name: "Tiles only",
+		TiledLogs: []*loglist3.TiledLog{
+			usableTiled("https://mon.ct.example/2026h2/", now.Add(-60*day), now.Add(130*day)),
+		},
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(body)
+	}))
+	defer srv.Close()
+
+	got, err := DiscoverLogs(context.Background(), srv.Client(), srv.URL, DefaultShardLookahead)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.RFC6962) != 0 {
+		t.Errorf("RFC6962 = %v, want none", got.RFC6962)
+	}
+	if !slices.Equal(got.Tiled, []string{"https://mon.ct.example/2026h2/"}) {
+		t.Errorf("Tiled = %v", got.Tiled)
 	}
 }

@@ -132,15 +132,26 @@ func TestBuildSourcesSelection(t *testing.T) {
 	}{
 		{"certstream", []string{"certstream"}},
 		{"ctlog", []string{"ctlog"}},
+		{"tiled", []string{"tiled"}},
 		{"both", []string{"certstream", "ctlog"}},
 		{"certstream,ctlog", []string{"certstream", "ctlog"}},
+		// "both" predates the tiled reader and still means the two feeds it
+		// meant then. Widening it would double the request load of every
+		// existing run without anyone asking.
+		{"all", []string{"certstream", "ctlog", "tiled"}},
+		{"ctlog,tiled", []string{"ctlog", "tiled"}},
 		// Naming the same feed twice asks for it once.
 		{"both,ctlog", []string{"certstream", "ctlog"}},
+		{"all,tiled", []string{"certstream", "ctlog", "tiled"}},
 		{" certstream , ", []string{"certstream"}},
 	}
 	for _, c := range cases {
-		// An explicit log set keeps discovery, and the network, out of this.
-		cfg := feedConfig{sources: c.sources, logURIs: "https://ct.example/log"}
+		// Explicit log sets keep discovery, and the network, out of this.
+		cfg := feedConfig{
+			sources:   c.sources,
+			logURIs:   "https://ct.example/log",
+			tiledURIs: "https://mon.ct.example/log/",
+		}
 		feeds, err := buildSources(cfg, "ua", nil, discardLogger(), nil)
 		if err != nil {
 			t.Errorf("buildSources(%q): %v", c.sources, err)
@@ -155,7 +166,7 @@ func TestBuildSourcesSelection(t *testing.T) {
 
 func TestBuildSourcesRejectsUnknownAndEmpty(t *testing.T) {
 	for _, sources := range []string{"", ",", "  ", "ctlogs", "both,nope"} {
-		cfg := feedConfig{sources: sources, logURIs: "https://ct.example/log"}
+		cfg := feedConfig{sources: sources, logURIs: "https://ct.example/log", tiledURIs: "https://mon.ct.example/log/"}
 		feeds, err := buildSources(cfg, "ua", nil, discardLogger(), nil)
 		if err == nil {
 			t.Errorf("buildSources(%q) = %q, want an error", sources, sourceNames(feeds))
@@ -192,6 +203,48 @@ func TestBuildSourcesExplicitLogsSkipDiscovery(t *testing.T) {
 	}
 	if ct.BatchSize != cfg.batch {
 		t.Errorf("BatchSize = %d, want %d", ct.BatchSize, cfg.batch)
+	}
+}
+
+// --tiled-logs is the same promise --logs makes, for the other protocol: the
+// set is taken as given, and the two flags do not reach into each other.
+// Handing a monitoring prefix to the RFC 6962 poller would fail every poll and
+// back off forever, which is a slow way to learn they are different things.
+func TestBuildSourcesKeepsTheTwoLogSetsApart(t *testing.T) {
+	cfg := feedConfig{
+		sources:    "ctlog,tiled",
+		logURIs:    "https://a.example/log",
+		tiledURIs:  "https://mon.b.example/2026h2/, https://mon.c.example/2026h2/,",
+		logRefresh: time.Hour,
+		maxLag:     500,
+	}
+	feeds, err := buildSources(cfg, "ua", nil, discardLogger(), nil)
+	if err != nil {
+		t.Fatalf("buildSources: %v", err)
+	}
+	if len(feeds) != 2 {
+		t.Fatalf("buildSources returned %d feeds, want 2", len(feeds))
+	}
+	rfc, ok := feeds[0].(*source.CTLog)
+	if !ok {
+		t.Fatalf("feed 0 is %T, want *source.CTLog", feeds[0])
+	}
+	if strings.Join(rfc.URIs, ",") != "https://a.example/log" {
+		t.Errorf("CTLog URIs = %q", rfc.URIs)
+	}
+	tiled, ok := feeds[1].(*source.TiledLog)
+	if !ok {
+		t.Fatalf("feed 1 is %T, want *source.TiledLog", feeds[1])
+	}
+	want := []string{"https://mon.b.example/2026h2/", "https://mon.c.example/2026h2/"}
+	if strings.Join(tiled.URIs, ",") != strings.Join(want, ",") {
+		t.Errorf("TiledLog URIs = %q, want %q", tiled.URIs, want)
+	}
+	if tiled.Discover != nil {
+		t.Error("an explicit --tiled-logs set still installed a discoverer")
+	}
+	if tiled.MaxLag != cfg.maxLag {
+		t.Errorf("MaxLag = %d, want the %d the run asked for", tiled.MaxLag, cfg.maxLag)
 	}
 }
 

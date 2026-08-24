@@ -226,7 +226,9 @@ func buildSources(cfg feedConfig, userAgent string, db *store.Store, log *slog.L
 		switch s = strings.TrimSpace(s); s {
 		case "both":
 			want["certstream"], want["ctlog"] = true, true
-		case "certstream", "ctlog":
+		case "all":
+			want["certstream"], want["ctlog"], want["tiled"] = true, true, true
+		case "certstream", "ctlog", "tiled":
 			want[s] = true
 		case "":
 		default:
@@ -237,6 +239,43 @@ func buildSources(cfg feedConfig, userAgent string, db *store.Store, log *slog.L
 		return nil, errors.New("no sources selected")
 	}
 
+	// One pass over the log list serves both log readers, so a run following
+	// both kinds does not fetch it twice to start. The list is read now, and
+	// again while the run continues: which logs are current changes underneath
+	// a long run. Naming a set explicitly skips both, and an explicit set is
+	// not second-guessed.
+	var (
+		found    source.LogSet
+		discover func(context.Context) (source.LogSet, error)
+	)
+	if (want["ctlog"] && cfg.logURIs == "") || (want["tiled"] && cfg.tiledURIs == "") {
+		// Clamped once, here, so the number logged is the number applied. An
+		// operator who has to reason about coverage reads this line to learn
+		// which shards the run decided to follow, and a line reporting a
+		// window the filter did not use would send them looking in the wrong
+		// place.
+		lookahead := max(cfg.logLookahead, 0)
+		discover = logDiscoverer(cfg.listURL, lookahead, dial)
+		var err error
+		if found, err = discover(context.Background()); err != nil {
+			return nil, err
+		}
+		log.Info("discovered ct logs", "rfc6962", len(found.RFC6962),
+			"tiled", len(found.Tiled), "lookahead", lookahead)
+		if !want["tiled"] && len(found.Tiled) > 0 {
+			// The blind spot, counted. Static CT is where new shards are being
+			// stood up, so this number climbs on its own as operators move
+			// shards across, and a run that never mentions it goes on looking
+			// complete right up to the day the list has no RFC 6962 logs left
+			// on it.
+			log.Warn("static ct logs on the list are not being followed",
+				"count", len(found.Tiled), "follow_them_with", "--source ...,tiled")
+		}
+		if cfg.logRefresh <= 0 {
+			discover = nil
+		}
+	}
+
 	var feeds []source.Source
 	if want["certstream"] {
 		feeds = append(feeds, &source.Certstream{
@@ -244,28 +283,12 @@ func buildSources(cfg feedConfig, userAgent string, db *store.Store, log *slog.L
 		})
 	}
 	if want["ctlog"] {
-		uris := splitList(cfg.logURIs)
-		var discover func(context.Context) ([]string, error)
+		uris, refresh := splitList(cfg.logURIs), (func(context.Context) ([]string, error))(nil)
 		if len(uris) == 0 {
-			// The list is read now to start, and again while the run
-			// continues: which logs are current changes underneath a long
-			// run. --logs names a set explicitly, and an explicit set is not
-			// second-guessed.
-			// Clamped once, here, so the number logged is the number
-			// applied. An operator who has to reason about coverage reads
-			// this line to learn which shards the run decided to follow, and
-			// a line reporting a window the filter did not use would send
-			// them looking in the wrong place.
-			lookahead := max(cfg.logLookahead, 0)
-			discover = logDiscoverer(cfg.listURL, lookahead, dial)
-			var err error
-			if uris, err = discover(context.Background()); err != nil {
-				return nil, err
+			if uris = found.RFC6962; len(uris) == 0 {
+				return nil, errors.New("the log list has no usable RFC 6962 logs accepting certificates now")
 			}
-			log.Info("discovered ct logs", "count", len(uris), "lookahead", lookahead)
-			if cfg.logRefresh <= 0 {
-				discover = nil
-			}
+			refresh = eachRefresh(discover, func(s source.LogSet) []string { return s.RFC6962 })
 		}
 		feeds = append(feeds, &source.CTLog{
 			URIs:              uris,
@@ -277,12 +300,54 @@ func buildSources(cfg feedConfig, userAgent string, db *store.Store, log *slog.L
 			RequestsPerSecond: cfg.rps,
 			UserAgent:         userAgent,
 			DialContext:       dial,
-			Discover:          discover,
+			Discover:          refresh,
+			RefreshInterval:   cfg.logRefresh,
+			Log:               log,
+		})
+	}
+	if want["tiled"] {
+		uris, refresh := splitList(cfg.tiledURIs), (func(context.Context) ([]string, error))(nil)
+		if len(uris) == 0 {
+			if uris = found.Tiled; len(uris) == 0 {
+				return nil, errors.New("the log list has no usable Static CT API logs accepting certificates now")
+			}
+			refresh = eachRefresh(discover, func(s source.LogSet) []string { return s.Tiled })
+		}
+		feeds = append(feeds, &source.TiledLog{
+			URIs:              uris,
+			Positions:         db,
+			FromStart:         cfg.fromStart,
+			MaxLag:            cfg.maxLag,
+			PollInterval:      cfg.poll,
+			RequestsPerSecond: cfg.rps,
+			UserAgent:         userAgent,
+			DialContext:       dial,
+			Discover:          refresh,
 			RefreshInterval:   cfg.logRefresh,
 			Log:               log,
 		})
 	}
 	return feeds, nil
+}
+
+// eachRefresh narrows a whole-list discoverer to the logs one feed can read.
+//
+// The two feeds refresh on their own timers and so fetch the list once each,
+// unlike the single pass at startup. That is two requests a day against a
+// static JSON file, which is not worth a shared cache and the staleness
+// question that would come with one.
+func eachRefresh(discover func(context.Context) (source.LogSet, error),
+	of func(source.LogSet) []string) func(context.Context) ([]string, error) {
+	if discover == nil {
+		return nil
+	}
+	return func(ctx context.Context) ([]string, error) {
+		set, err := discover(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return of(set), nil
+	}
 }
 
 // logDiscoverer returns a function that reads the CT log list, over the same
@@ -296,7 +361,7 @@ func buildSources(cfg feedConfig, userAgent string, db *store.Store, log *slog.L
 // one. A NAT or proxy that dropped it in the meantime says nothing — the
 // request goes into a dead connection, waits out the 30s timeout, and costs a
 // refresh that is not tried again for another day.
-func logDiscoverer(listURL string, lookahead time.Duration, dial func(ctx context.Context, network, addr string) (net.Conn, error)) func(context.Context) ([]string, error) {
+func logDiscoverer(listURL string, lookahead time.Duration, dial func(ctx context.Context, network, addr string) (net.Conn, error)) func(context.Context) (source.LogSet, error) {
 	hc := &http.Client{Timeout: 30 * time.Second}
 	if dial != nil {
 		hc.Transport = &http.Transport{
@@ -305,7 +370,7 @@ func logDiscoverer(listURL string, lookahead time.Duration, dial func(ctx contex
 			IdleConnTimeout:   90 * time.Second,
 		}
 	}
-	return func(ctx context.Context) ([]string, error) {
+	return func(ctx context.Context) (source.LogSet, error) {
 		ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		defer cancel()
 		return source.DiscoverLogs(ctx, hc, listURL, lookahead)
