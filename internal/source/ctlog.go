@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"sync"
 	"time"
 
 	ct "github.com/google/certificate-transparency-go"
@@ -122,44 +121,74 @@ func (c *CTLog) Name() string { return "ctlog" }
 // loses certificates.
 const DefaultShardLookahead = 200 * 24 * time.Hour
 
-// DiscoverLogs returns the URIs of the logs in Google's v3 log list that are
-// worth following now: approved for Chrome, and able to be accepting
-// certificates today. Those are the logs where new certificates actually land.
+// LogSet is one pass over the log list, split by the protocol the logs speak.
+//
+// Google's v3 list carries two kinds of log per operator and they are not two
+// spellings of the same thing: an RFC 6962 log answers get-sth and
+// get-entries, a Static CT API log serves a signed checkpoint and tiles off
+// static storage and answers neither. They need separate readers, so they are
+// discovered into separate fields rather than concatenated into one list of
+// URLs that would fail every poll for half its members.
+type LogSet struct {
+	// RFC6962 are base URLs, e.g.
+	// "https://ct.googleapis.com/logs/us1/argon2026h2/".
+	RFC6962 []string
+	// Tiled are monitoring URLs, e.g.
+	// "https://mon.sycamore.ct.letsencrypt.org/2026h2/". A tiled log also
+	// publishes a submission URL, which is where certificates are sent and
+	// not where they are read.
+	//
+	// Which of the two is stored here is a decision that outlives the run:
+	// Positions is keyed by URI, so switching to the other one later resumes
+	// every tiled log at its tip.
+	Tiled []string
+}
+
+// Total is how many logs the set holds, of either kind.
+func (s LogSet) Total() int { return len(s.RFC6962) + len(s.Tiled) }
+
+// DiscoverLogs returns the logs in Google's v3 log list that are worth
+// following now: approved for Chrome, and able to be accepting certificates
+// today. Those are the logs where new certificates actually land.
 //
 // lookahead is how far ahead of now a shard may open and still be followed.
 // Zero is no lookahead: only the shards whose interval contains now, which is
 // cheaper and misses the shard being written to. See DefaultShardLookahead for
 // why that is the wrong default.
-func DiscoverLogs(ctx context.Context, hc *http.Client, listURL string, lookahead time.Duration) ([]string, error) {
+//
+// Both kinds of log come back from one fetch. Which of them a run follows is
+// the caller's decision, and an empty side is not an error here — only a list
+// with nothing usable on it at all is.
+func DiscoverLogs(ctx context.Context, hc *http.Client, listURL string, lookahead time.Duration) (LogSet, error) {
 	if listURL == "" {
 		listURL = loglist3.LogListURL
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, listURL, nil)
 	if err != nil {
-		return nil, err
+		return LogSet{}, err
 	}
 	resp, err := hc.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("fetch log list: %w", err)
+		return LogSet{}, fmt.Errorf("fetch log list: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("fetch log list: %s", resp.Status)
+		return LogSet{}, fmt.Errorf("fetch log list: %s", resp.Status)
 	}
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if err != nil {
-		return nil, fmt.Errorf("read log list: %w", err)
+		return LogSet{}, fmt.Errorf("read log list: %w", err)
 	}
 	ll, err := loglist3.NewFromJSON(raw)
 	if err != nil {
-		return nil, fmt.Errorf("parse log list: %w", err)
+		return LogSet{}, fmt.Errorf("parse log list: %w", err)
 	}
 
-	uris := selectLogs(ll, time.Now(), lookahead)
-	if len(uris) == 0 {
-		return nil, fmt.Errorf("log list %s contained no logs accepting certificates now", listURL)
+	set := selectLogs(ll, time.Now(), lookahead)
+	if set.Total() == 0 {
+		return LogSet{}, fmt.Errorf("log list %s contained no logs accepting certificates now", listURL)
 	}
-	return uris, nil
+	return set, nil
 }
 
 // selectLogs picks the usable logs that could be accepting certificates at
@@ -174,40 +203,55 @@ func DiscoverLogs(ctx context.Context, hc *http.Client, listURL string, lookahea
 // the same as zero — there is no window narrower than none.
 //
 // A log with no temporal interval is not sharded and is always kept.
-func selectLogs(ll *loglist3.LogList, now time.Time, lookahead time.Duration) []string {
+//
+// The status filter is written out here rather than taken from
+// loglist3.SelectByStatus, which cannot be used for this: it filters Logs and
+// copies TiledLogs through untouched, and it drops any operator left with no
+// usable RFC 6962 log — taking that operator's tiled logs with it. Both
+// mistakes point the same way, which is towards following tiled logs Chrome
+// has retired while missing the ones it has not.
+func selectLogs(ll *loglist3.LogList, now time.Time, lookahead time.Duration) LogSet {
 	opensBy := now
 	if lookahead > 0 {
 		opensBy = now.Add(lookahead)
 	}
-	usable := ll.SelectByStatus([]loglist3.LogStatus{loglist3.UsableLogStatus})
-	var uris []string
-	for _, op := range usable.Operators {
+	var set LogSet
+	for _, op := range ll.Operators {
 		for _, lg := range op.Logs {
-			if ti := lg.TemporalInterval; ti != nil {
-				// Ended: it takes nothing now, whatever it took before.
-				if !now.Before(ti.EndExclusive) {
-					continue
-				}
-				// Too far out: nothing issued today expires that late, so
-				// nothing is being written to it yet.
-				if ti.StartInclusive.After(opensBy) {
-					continue
-				}
+			if usableNow(lg.State, lg.TemporalInterval, now, opensBy) {
+				set.RFC6962 = append(set.RFC6962, lg.URL)
 			}
-			uris = append(uris, lg.URL)
+		}
+		for _, lg := range op.TiledLogs {
+			if usableNow(lg.State, lg.TemporalInterval, now, opensBy) {
+				set.Tiled = append(set.Tiled, lg.MonitoringURL)
+			}
 		}
 	}
-	return uris
+	return set
+}
+
+// usableNow is the rule both kinds of log are judged by: approved for Chrome,
+// and with a temporal interval that has not ended and opens by opensBy.
+func usableNow(state *loglist3.LogStates, ti *loglist3.TemporalInterval, now, opensBy time.Time) bool {
+	if state.LogStatus() != loglist3.UsableLogStatus {
+		return false
+	}
+	if ti == nil {
+		return true
+	}
+	// Ended: it takes nothing now, whatever it took before.
+	if !now.Before(ti.EndExclusive) {
+		return false
+	}
+	// Too far out: nothing issued today expires that late, so nothing is
+	// being written to it yet.
+	return !ti.StartInclusive.After(opensBy)
 }
 
 // Run follows every configured log until ctx is cancelled. A log that keeps
 // failing is retried with backoff rather than taking the others down with it.
-//
-// With Discover set, the set itself is reconsidered every RefreshInterval:
-// a log the list has added gets a follower, one it has dropped loses its.
-// Without that, a run outlives the shards it started with — logs are sharded
-// by time, and at a rollover the whole set stops accepting certificates at
-// once while this keeps politely asking it for entries.
+// The set is reconsidered on a timer when Discover is set; see followSet.
 func (c *CTLog) Run(ctx context.Context, out chan<- Cert) error {
 	if c.Positions == nil {
 		return fmt.Errorf("ctlog: Positions is required")
@@ -215,127 +259,18 @@ func (c *CTLog) Run(ctx context.Context, out chan<- Cert) error {
 	if len(c.URIs) == 0 {
 		return fmt.Errorf("ctlog: no log URIs configured")
 	}
-
-	// following holds every running follower, keyed by URI. It is touched
-	// only from this goroutine — the refresh loop below runs here rather than
-	// beside it — so it needs no lock of its own.
-	var wg sync.WaitGroup
-	following := make(map[string]*follower, len(c.URIs))
-	follow := func(uri string) {
-		fctx, cancel := context.WithCancel(ctx)
-		f := &follower{cancel: cancel, done: make(chan struct{})}
-		following[uri] = f
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			defer close(f.done)
+	set := &followSet{
+		uris:      c.URIs,
+		positions: c.Positions,
+		discover:  c.Discover,
+		refresh:   c.RefreshInterval,
+		kind:      "ct log",
+		log:       c.Log,
+		follow: func(fctx context.Context, uri string) {
 			c.followForever(fctx, uri, out)
-		}()
+		},
 	}
-	for _, uri := range c.URIs {
-		if _, dup := following[uri]; !dup {
-			follow(uri)
-		}
-	}
-
-	if c.Discover != nil {
-		c.refreshForever(ctx, following, follow)
-	}
-	wg.Wait()
-	return ctx.Err()
-}
-
-// refreshForever re-reads the log list on a timer and reconciles the running
-// followers against it. It returns when ctx is cancelled.
-//
-// A refresh that fails changes nothing. The list comes over the network, and a
-// monitor that stopped following every log because one fetch timed out would
-// be worse off than one running on a list a day old.
-func (c *CTLog) refreshForever(ctx context.Context, following map[string]*follower, follow func(string)) {
-	t := time.NewTicker(c.refreshEvery())
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-		}
-		uris, err := c.Discover(ctx)
-		if ctx.Err() != nil {
-			return
-		}
-		switch {
-		case err != nil:
-			c.Log.Warn("ct log list refresh failed; keeping the current logs",
-				"err", err, "logs", len(following))
-		case len(uris) == 0:
-			// Every log at once is a broken list, not a rollover.
-			c.Log.Warn("ct log list refresh returned no logs; keeping the current logs",
-				"logs", len(following))
-		default:
-			c.reconcile(uris, following, follow)
-		}
-	}
-}
-
-// reconcile starts and stops followers until the running set is uris. Both
-// sides are logged at info: a monitor that swaps out its own inputs without
-// saying so is hard to trust when its counters later move differently.
-//
-// The stored position of a log that dropped out is left where it is. A shard
-// can return, Positions is keyed by URI, and forgetting the position would
-// resume it at the tip and lose whatever it logged in between. It is logged on
-// the way out, because a log that was behind when it left — a degraded one, or
-// one --max-lag has been letting slip — leaves entries after it that nothing
-// will read unless the list brings it back.
-func (c *CTLog) reconcile(uris []string, following map[string]*follower, follow func(string)) {
-	want := make(map[string]bool, len(uris))
-	for _, uri := range uris {
-		want[uri] = true
-	}
-	for uri, f := range following {
-		if !want[uri] {
-			f.stop()
-			// Read the position after the follower has gone, not while it is
-			// still moving it, so the number logged is the one it left.
-			pos, _, _ := c.Positions.LogPos(uri)
-			c.Log.Info("ct log left the log list; stopped", "log", uri, "position", pos)
-			delete(following, uri)
-		}
-	}
-	for _, uri := range uris {
-		if _, running := following[uri]; !running {
-			c.Log.Info("ct log joined the log list; following", "log", uri)
-			follow(uri)
-		}
-	}
-}
-
-// follower is one running follow loop and the handle to stop it.
-type follower struct {
-	cancel context.CancelFunc
-	done   chan struct{}
-}
-
-// stop cancels the follower and waits for it to leave.
-//
-// The waiting is the point. Cancelling and returning would let the next
-// refresh start a second follower for a URI the first has not finished
-// leaving yet — a list served stale or half-written by a CDN is enough to ask
-// for that — and two loops on one log read the same ranges and write the same
-// position, which can walk it backwards. Every wait in the loop watches the
-// context, so this returns as fast as the follower can notice.
-func (f *follower) stop() {
-	f.cancel()
-	<-f.done
-}
-
-// refreshEvery is how often the log list is re-read.
-func (c *CTLog) refreshEvery() time.Duration {
-	if c.RefreshInterval <= 0 {
-		return 24 * time.Hour
-	}
-	return c.RefreshInterval
+	return set.run(ctx)
 }
 
 // followForever restarts follow after any failure, backing off between tries.
@@ -512,23 +447,30 @@ func (c *CTLog) parseEntry(uri string, index int64, leaf *ct.LeafEntry) (Cert, b
 	case entry.Precert != nil:
 		x = entry.Precert.TBSCertificate
 	}
+	return certFrom(x, uri, index)
+}
+
+// certFrom reduces a parsed certificate to the fields the monitor needs, and
+// reports whether it named anything worth keeping. Both readers end here: what
+// differs between RFC 6962 and the Static CT API is how the certificate is
+// found, not what is taken from it.
+func certFrom(x *x509.Certificate, uri string, index int64) (Cert, bool) {
 	if x == nil {
 		return Cert{}, false
 	}
 	if x.Subject.CommonName == "" && len(x.DNSNames) == 0 {
 		return Cert{}, false
 	}
-	cert := Cert{
+	return Cert{
 		CN:        x.Subject.CommonName,
 		SANs:      x.DNSNames,
 		Issuer:    issuerName(x.Issuer.CommonName, x.Issuer.Organization),
 		NotBefore: x.NotBefore.UTC(),
 		NotAfter:  x.NotAfter.UTC(),
-	}
-	cert.SeenAt = time.Now().UTC()
-	cert.Source = uri
-	cert.Index = index
-	return cert, true
+		SeenAt:    time.Now().UTC(),
+		Source:    uri,
+		Index:     index,
+	}, true
 }
 
 func issuerName(cn string, org []string) string {
@@ -541,12 +483,19 @@ func issuerName(cn string, org []string) string {
 	return ""
 }
 
-// httpClient builds the client used to talk to a log, honouring DialContext.
-func (c *CTLog) httpClient() *http.Client {
+// httpClient builds the client used to talk to a log.
+func (c *CTLog) httpClient() *http.Client { return logHTTPClient(c.DialContext) }
+
+// logHTTPClient builds a client for talking to a log, honouring dial.
+//
+// The dialer is the point: left to the system resolver, a run probing hard
+// enough to saturate DNS starves its own source of certificates, which fails
+// as "server misbehaving" and stops the feed entirely.
+func logHTTPClient(dial func(ctx context.Context, network, addr string) (net.Conn, error)) *http.Client {
 	hc := &http.Client{Timeout: 60 * time.Second}
-	if c.DialContext != nil {
+	if dial != nil {
 		hc.Transport = &http.Transport{
-			DialContext:         c.DialContext,
+			DialContext:         dial,
 			ForceAttemptHTTP2:   true,
 			MaxIdleConnsPerHost: 2,
 		}

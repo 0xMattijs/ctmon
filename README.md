@@ -9,7 +9,7 @@ serves over HTTPS.
 
 ```console
 $ ctmon run --db ct.db
-INFO discovered ct logs count=9
+INFO discovered ct logs rfc6962=17 tiled=11 lookahead=4800h0m0s
 INFO certstream connected url=wss://certstream.calidog.io/
 certs=26470 names=47845 skipped_cn=1204 too_deep=9331 from_san=21285 ...
 ```
@@ -219,7 +219,8 @@ Go 1.24 or later. The database is a single file; point `--db` anywhere.
 
 ## Feeds
 
-Two sources feed the same pipeline, and both run by default (`--source both`):
+Three sources feed the same pipeline. Two of them run by default
+(`--source both`):
 
 - **`certstream`** connects to an aggregated CT firehose over a websocket. It
   starts instantly and costs one connection, but it depends on a third party
@@ -227,14 +228,90 @@ Two sources feed the same pipeline, and both run by default (`--source both`):
 - **`ctlog`** polls CT logs directly over RFC 6962 (`get-sth`, `get-entries`).
   It depends on nobody but the logs, and it records how far it has read each
   log, so a restart resumes exactly where it stopped. Logs are discovered from
-  Google's v3 log list — the usable RFC 6962 ones taking certificates now, not
-  the Static CT API ones it also lists; override with `--logs`.
+  Google's v3 log list; override with `--logs`.
+- **`tiled`** reads Static CT API logs: a signed checkpoint saying how big the
+  tree is, and the entries themselves downloaded as fixed-size tiles off static
+  storage. Same discovery, same positions, same guarantees; override with
+  `--tiled-logs`.
 
-Run just one with `--source certstream` or `--source ctlog`.
+Run one with `--source certstream`, or several with a comma-separated list.
+`--source all` is every one of them. `both` predates the tiled reader and still
+means what it meant then — `certstream,ctlog` — because widening it would
+double the request load of every existing run without anyone asking.
 
 By default a newly seen log starts at its current tree head, so you get new
 certificates rather than history. Pass `--from-start` to backfill a log from
 index 0 — that is millions of entries per log, so use it deliberately.
+
+### Two kinds of log
+
+Google's v3 list carries two kinds of log per operator, and they are two
+protocols rather than two spellings of one. An RFC 6962 log answers `get-sth`
+and `get-entries`. A Static CT API log answers neither:
+
+```console
+$ curl -s https://luoshu2027.trustasia.com/luoshu2027/checkpoint | head -3
+luoshu2027.trustasia.com/luoshu2027
+77756735
+rYbKBRn9UQA5cpgyjeBE4UtGU4VdBhxI9y2zQdrN7ds=
+$ curl -so /dev/null -w '%{http_code}\n' https://luoshu2027.trustasia.com/luoshu2027/ct/v1/get-sth
+404
+```
+
+So they get separate readers and separate flags. A monitoring prefix handed to
+`--logs` would fail every poll and back off forever, which is a slow way to
+learn the difference.
+
+The reason to read both is the direction of travel. Static CT is where new
+shards are being stood up, so the tiled half of the list grows on its own as
+operators move shards across, and a run watching only the RFC 6962 half goes on
+looking complete right up to the day there is nothing left on it. A run that is
+not following them says how many it is leaving:
+
+```console
+$ ctmon run --source ctlog
+INFO discovered ct logs rfc6962=17 tiled=11 lookahead=4800h0m0s
+WARN static ct logs on the list are not being followed count=11 follow_them_with="--source ...,tiled"
+```
+
+That number is not the same as certificates missed. Chrome's policy has every
+certificate logged to more than one log, so most of what lands in a tiled log
+is also in an RFC 6962 log this already reads. It is coverage, not volume: the
+question it answers is what happens the day that stops being true.
+
+### Reading a tiled log
+
+Entries come in tiles of 256, and a tile is either full or partial — different
+resources with different names, and the partial one stops existing the moment
+the tree grows past it. Positions are still leaf indexes, so a restart resumes
+inside a tile: the tile holding the position is fetched whole and read from the
+middle.
+
+Three answers from a tiled log are not failures, and are not treated as any:
+
+- **A tile the checkpoint promised and the storage has not got yet.** A log
+  counts an entry in its tree before every edge serving its tiles has the tile
+  holding it. Measured against `luoshu2027` the gap closed in under two
+  minutes. The reader waits it out rather than tearing down the follower, and
+  says so if it lasts.
+- **A partial tile that has just been replaced.** Same handling, and it is the
+  common case on a busy log: the tree grows between reading the checkpoint and
+  fetching the tile it described.
+- **`429 Too Many Requests`.** Tiles come off ordinary object storage and
+  several operators rate-limit it. Geomys answers with a `Retry-After` naming
+  the instant the bucket refills; the reader waits exactly that long, capped at
+  ten minutes, and keeps the follower alive. Backing the follower off instead
+  would wait without knowing what for, and double past it.
+
+Anything else — a broken tile, a tile that reframes entries already read, an
+unreadable checkpoint — fails the follower and earns the ordinary backoff.
+
+Nothing here verifies the checkpoint signature. That would mean carrying each
+log's public key from the list and implementing the RFC 6962 note signature
+scheme, and it would put this feed ahead of the RFC 6962 one, which asks for an
+STH without a public key and so does not verify either. Both trust HTTPS to the
+log's own name, for the same reason: this is looking for hostnames, and a log
+that lied about its tree could only make it look at more of them.
 
 ### The log list moves
 
@@ -247,7 +324,9 @@ sign is the `ctlog` share of the counters going quiet.
 
 So the list is re-read every `--log-refresh` (24h by default, `0` disables) and
 the followers are brought in line with it: a log the list has added gets one, a
-log it has dropped loses its. Both sides are logged. A refresh that fails, or
+log it has dropped loses its. Both sides are logged. Both readers work this
+way, and share the code that does it — the protocols differ, the bookkeeping
+around them does not. A refresh that fails, or
 that comes back empty, changes nothing — a list that would not load is no
 reason to stop following logs that are working.
 
@@ -257,8 +336,9 @@ while it was away. A log that was behind when it left — a degraded one, or one
 `--max-lag` has been letting slip — leaves entries after that position that
 nothing reads unless the list brings it back.
 
-`--logs` names a set explicitly and is never second-guessed: no discovery at
-startup, and no refresh after it.
+`--logs` and `--tiled-logs` name a set explicitly and are never second-guessed:
+no discovery at startup, and no refresh after it. One pass over the list serves
+both readers, so a run following both kinds fetches it once to start.
 
 ### Shards run ahead of the clock
 
@@ -275,10 +355,11 @@ just at the boundary, and worst in the months before a rollover.
 
 So the window is a lookahead, not a point. A shard is followed when it has not
 ended *and* it opens within `--log-lookahead` (200 days by default) of now.
-Against today's list that is 17 logs where the point rule gives 9, and each of
-the extra 8 is one certificates are genuinely being written to. Dropping the
-bound entirely would give 21, including shards that do not open until late
-2027 and answer every poll with nothing.
+Against today's list that is 17 RFC 6962 logs where the point rule gives 9, and
+each of the extra 8 is one certificates are genuinely being written to.
+Dropping the bound entirely would give 21, including shards that do not open
+until late 2027 and answer every poll with nothing. The same window judges
+tiled shards, which are sharded by the same calendar for the same reason.
 
 The default is deliberately the older, longer validity limit. Being late to
 shrink it costs a `get-sth` per poll against a few empty shards; being early to
@@ -871,7 +952,7 @@ records per second; raise it if you turn the filters off.
 
 ```
 cmd/ctmon            command line: run, list, get, stats
-internal/source      certificate feeds (certstream, RFC 6962 log poller)
+internal/source      certificate feeds (certstream, RFC 6962 poller, Static CT reader)
 internal/domain      CN and SAN → hostname expansion, validation, depth
 internal/resolve     caching DNS front end, shared by the probes and the feed
 internal/probe       HTTPS fetch and body hashing
@@ -893,6 +974,8 @@ The suite covers CN and SAN expansion, subdomain depth against the public
 suffix list, the suffix blocklist and parent cap, record round-trips through
 the packed codec, key reversal and range scans, migration from the old format,
 compaction, probe hashing (including the body cap and redirects), DNS caching
-and the resolver-health judgement, certstream message parsing, what the
-pipeline does when the store refuses a write, and the pipeline end to end
-against a local HTTPS server.
+and the resolver-health judgement, certstream message parsing, the Static CT
+wire format against two entries captured byte for byte off a real log, what a
+tiled reader does with a tile that is missing or a log that refuses to be read
+this fast, what the pipeline does when the store refuses a write, and the
+pipeline end to end against a local HTTPS server.
