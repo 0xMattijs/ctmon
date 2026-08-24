@@ -943,6 +943,24 @@ between the two halves is the wide one, so that is where an interruption
 lands; a second run that stopped on finding no records left to delete would
 never reach the entries the first one orphaned.
 
+Interned values go too. A dictionary entry is written the first time a record
+needs it and was never removed, which was invisible while the store only grew:
+delete the last record using a vocabulary and the entry stayed, with `stats`
+counting it forever. `--failed-since` shows it worst, since it deletes exactly
+the records carrying a probe error:
+
+```console
+$ ctmon prune --db ct.db --failed-since 1d --apply
+deleted 170355 of 3131473 records and 65982 queue entries in 8.6s
+forgot 7244 interned values no record still uses (607.3 KiB): 0 sources, 4 issuers, 7240 error shapes
+```
+
+That takes the `stats` line from `7250 error shapes` against 170,410 failing
+records to `10` against 55 — a number that means something again. Ids are not
+renumbered, which is what makes the sweep cheap: nothing indexes them densely,
+so an unreferenced entry simply goes and no record is re-encoded. It costs one
+extra walk of the records, and only runs when records were deleted.
+
 Deleting frees pages without shrinking the file, so `--compact` repacks in
 place afterwards:
 

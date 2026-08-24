@@ -611,6 +611,26 @@ func pruneCmd(args []string) error {
 
 	fmt.Printf("deleted %d of %d records and %d queue entries in %s\n",
 		res.Deleted, res.Scanned, res.Pending, took)
+
+	// The dictionaries are the third thing a deletion leaves behind, and they
+	// are swept on every applying prune rather than only one that deleted
+	// something — the same reasoning as the queue pass, and the same trap.
+	// Gating on res.Deleted would mean a prune interrupted before this point
+	// left entries that the re-run could never reach, because by then there
+	// are no records left for it to delete.
+	//
+	// A failure here does not fail the command. The records and the queue
+	// entries are already gone and correct; the dictionaries are bookkeeping
+	// on top of that, and losing the --compact an operator asked for over a
+	// bookkeeping error would be the worse trade.
+	switch sweep, err := db.SweepDicts(); {
+	case err != nil:
+		fmt.Fprintln(os.Stderr, "warning: could not sweep the dictionaries:", err)
+	case sweep.Total() > 0:
+		fmt.Printf("forgot %d interned values no record still uses (%s): %d sources, %d issuers, %d error shapes\n",
+			sweep.Total(), humanBytes(sweep.Bytes), sweep.Sources, sweep.Issuers, sweep.Errors)
+	}
+
 	// Queue entries count toward whether anything was freed. Re-running an
 	// interrupted prune is the case: the records went the first time, so this
 	// run deletes none of them and drops the entries the first one orphaned.
