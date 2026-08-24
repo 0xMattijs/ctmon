@@ -218,9 +218,13 @@ func requireLegacy(db *bolt.DB, path string) error {
 			return nil // predates the format stamp, so it is version 1
 		}
 		switch v := meta.Get(keyFormat); {
-		case v == nil, len(v) == 1 && v[0] < formatVersion:
+		case v == nil, len(v) == 1 && v[0] < formatOldest:
 			return nil
-		case len(v) == 1 && v[0] == formatVersion:
+		case len(v) == 1 && v[0] <= formatVersion:
+			// Packed already, at some version this build reads. Migration is
+			// for the JSON format and nothing else: a packed database that
+			// predates the current version needs no rewriting, because its
+			// records say which layout they are and are read as they stand.
 			return fmt.Errorf("%s is already in the packed format", path)
 		default:
 			return fmt.Errorf("%s uses unknown record format %v", path, v)

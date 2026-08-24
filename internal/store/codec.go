@@ -4,6 +4,8 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"net"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -11,8 +13,24 @@ import (
 	bolt "go.etcd.io/bbolt"
 )
 
-// formatVersion is the on-disk record format. Version 1 was JSON.
-const formatVersion = 2
+// formatVersion is the on-disk record format this build writes. Version 1 was
+// JSON; 2 was the packed record; 3 adds the probe-error argument list.
+//
+// formatOldest is the oldest layout it still reads. Every record carries its
+// own version byte, so the two versions coexist in one file: a database
+// written by an older build is read as it stands and its records are rewritten
+// as version 3 when something touches them. Nothing has to be migrated.
+//
+// The stamp in the meta bucket is not raised to match. It does not need to be
+// — a record's own version byte is what stops an older build misreading it,
+// and it does that loudly, per record, rather than by refusing the file. Not
+// raising it also keeps the upgrade from being one-way: a database this build
+// has opened is still one an older build will open, and the records it will
+// not understand are the ones it says so about.
+const (
+	formatVersion = 3
+	formatOldest  = 2
+)
 
 // Record layout, version 2. Every field that can be derived from the key is
 // derived, every value drawn from a small vocabulary is interned, and
@@ -55,6 +73,10 @@ const (
 	flagProbeErr   = 1 << 3
 	flagURLLit     = 1 << 4
 	flagURLAbsent  = 1 << 5
+	// flagErrArgs says the probe error carries an argument list after its
+	// dictionary id. Version 2 records never set it, which is what lets the
+	// two layouts share a decoder.
+	flagErrArgs = 1 << 6
 )
 
 // Cert-name shapes. Most records need no bytes at all for the certificate name
@@ -82,7 +104,68 @@ const (
 
 // hostMark stands in for the hostname inside an interned probe error, so the
 // thousands of "no such host" messages collapse to one dictionary entry.
-const hostMark = "\x01"
+//
+// argMark stands in for a value lifted out of the error and stored on the
+// record instead. The hostname is not the only thing that varies between two
+// otherwise identical errors — the address is, and it varies far more:
+//
+//	Get "https://<host>/": dial tcp 178.142.12.95:443: connect: connection refused
+//	Get "https://<host>/": dial tcp 46.29.238.201:443: connect: connection refused
+//
+// Interned whole, those are two entries, and the dictionary grows with the
+// number of addresses a prober has failed against rather than with the number
+// of things that can go wrong. Measured on a live store, 6,021 of 7,250 error
+// shapes carried a literal address, and masking them takes the vocabulary to
+// 2,401. The address itself is not thrown away: it goes on the record, packed,
+// and is put back on the way out — but only where putting it back reproduces
+// the text exactly, so an address the prober wrote in a form net.IP.String
+// does not produce keeps its own entry. See templatize.
+//
+// escMark is what keeps that reversible. The marks are ordinary bytes, and
+// nothing stops an error carrying one: an x509 failure quotes the names in the
+// certificate it rejected, and those come from the server being probed. Left
+// alone, a message holding a 0x02 gets an address spliced into the wrong place
+// and a "?" where the address belonged — a record silently wrong, from bytes
+// somebody else chose. So a mark in the message is escaped on the way in and
+// unescaped on the way out, and the round trip stays exact.
+const (
+	hostMark = "\x01"
+	argMark  = "\x02"
+	escMark  = "\x03"
+)
+
+// marks are the bytes a template gives a meaning to, and so the bytes a
+// message has to have escaped before it can become one.
+const marks = hostMark + argMark + escMark
+
+// escapeMarks puts an escMark in front of every byte in msg that a template
+// would otherwise read as a marker, so that a message carrying one comes back
+// as itself.
+//
+// Almost nothing takes the slow path. Go quotes control bytes in most of the
+// error text it produces, so the check is a scan that finds nothing.
+func escapeMarks(msg string) string {
+	if !strings.ContainsAny(msg, marks) {
+		return msg
+	}
+	var b strings.Builder
+	b.Grow(len(msg) + 8)
+	for i := 0; i < len(msg); i++ {
+		switch msg[i] {
+		case hostMark[0], argMark[0], escMark[0]:
+			b.WriteString(escMark)
+		}
+		b.WriteByte(msg[i])
+	}
+	return b.String()
+}
+
+// ipCandidate matches what an address looks like. It is deliberately loose —
+// net.ParseIP decides — because the cost of a false positive here is a
+// template that happens to hold a version number in a slot, which round-trips
+// exactly the same, and the cost of a false negative is a dictionary entry
+// that never collapses.
+var ipCandidate = regexp.MustCompile(`\[[0-9A-Fa-f:.]+\]|\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b`)
 
 // encode packs rec into its stored form. It interns strings through tx and
 // returns the dictionary ids that still need confirming once the write commits.
@@ -152,13 +235,19 @@ func (s *Store) encode(tx *bolt.Tx, rec *Record) ([]byte, []freshID, error) {
 	if !rec.ChangedAt.IsZero() {
 		flags2 |= flagChanged
 	}
+	var errArgs [][]byte
 	if rec.ProbeError != "" {
 		flags2 |= flagProbeErr
-		errID, f, err = s.errors.intern(tx, templatize(rec.Host, rec.ProbeError))
+		var tmpl string
+		tmpl, errArgs = templatize(rec.Host, rec.ProbeError)
+		errID, f, err = s.errors.intern(tx, tmpl)
 		if err != nil {
 			return nil, nil, err
 		}
 		fresh = appendFresh(fresh, s.errors, errID, f)
+		if len(errArgs) > 0 {
+			flags2 |= flagErrArgs
+		}
 	}
 	switch {
 	case rec.FinalURL == "":
@@ -192,19 +281,55 @@ func (s *Store) encode(tx *bolt.Tx, rec *Record) ([]byte, []freshID, error) {
 	if flags2&flagProbeErr != 0 {
 		out = binary.AppendUvarint(out, uint64(errID))
 	}
+	if flags2&flagErrArgs != 0 {
+		// The count is written even though the template's markers imply it.
+		// Deriving it from the template would make the rest of the record
+		// unreadable whenever the dictionary entry is missing, which is a
+		// failure the reader should not inherit from a different bucket.
+		out = binary.AppendUvarint(out, uint64(len(errArgs)))
+		for _, a := range errArgs {
+			out = binary.AppendUvarint(out, uint64(len(a)))
+			out = append(out, a...)
+		}
+	}
 	if flags2&flagURLLit != 0 {
 		out = appendString(out, rec.FinalURL)
 	}
 	return out, fresh, nil
 }
 
+// recordIDs are the dictionary ids a record was found to hold. Reading them
+// back out of the decoder is the only exact way to know which entries a record
+// keeps alive: the decoded strings cannot answer it, because a record written
+// under an older layout expands from a differently-shaped template and asking
+// which entry it "would" intern to today gives the wrong one.
+type recordIDs struct {
+	source uint32
+	issuer uint32
+	// errShape is meaningful only when hasErr is set. A record with no probe
+	// error holds no error entry, which is not the same as holding entry 0.
+	hasErr   bool
+	errShape uint32
+}
+
 // decode unpacks a stored record. host comes from the key, and everything
 // derived from it is rebuilt here.
 func (s *Store) decode(host string, raw []byte, rec *Record) error {
+	return s.decodeIDs(host, raw, rec, nil)
+}
+
+// decodeIDs is decode, additionally reporting the dictionary ids it read.
+//
+// It is one decoder rather than two so that the ids and the strings can never
+// disagree about what a record says. A second parser walking the same bytes to
+// pick out the ids is a parser that has to be kept in step with this one
+// forever, and the first time it fell behind it would quietly report the wrong
+// entries as unused.
+func (s *Store) decodeIDs(host string, raw []byte, rec *Record, ids *recordIDs) error {
 	r := reader{b: raw}
 	version := r.byte()
-	if version != formatVersion {
-		return fmt.Errorf("record format %d, want %d", version, formatVersion)
+	if version < formatOldest || version > formatVersion {
+		return fmt.Errorf("record format %d, want %d to %d", version, formatOldest, formatVersion)
 	}
 	flags1 := r.byte()
 
@@ -213,8 +338,12 @@ func (s *Store) decode(host string, raw []byte, rec *Record) error {
 	rec.Origin = originName(int(flags1>>originShift) & originMask)
 	rec.Probed = flags1&flagProbed != 0
 
-	rec.Source = s.sources.name(uint32(r.uvarint()))
-	rec.Issuer = s.issuers.name(uint32(r.uvarint()))
+	srcID, issID := uint32(r.uvarint()), uint32(r.uvarint())
+	rec.Source = s.sources.name(srcID)
+	rec.Issuer = s.issuers.name(issID)
+	if ids != nil {
+		ids.source, ids.issuer = srcID, issID
+	}
 	first := r.uint32()
 	rec.FirstSeen = fromUnix(first)
 	rec.LastSeen = fromUnix(first + uint32(r.uvarint()))
@@ -246,7 +375,28 @@ func (s *Store) decode(host string, raw []byte, rec *Record) error {
 		rec.ChangedAt = fromUnix(first + uint32(r.uvarint()))
 	}
 	if flags2&flagProbeErr != 0 {
-		rec.ProbeError = expand(host, s.errors.name(uint32(r.uvarint())))
+		errID := uint32(r.uvarint())
+		if ids != nil {
+			ids.hasErr, ids.errShape = true, errID
+		}
+		tmpl := s.errors.name(errID)
+		var args [][]byte
+		if flags2&flagErrArgs != 0 {
+			// Compared as a uint64 before it is narrowed, and against the
+			// bytes left rather than a fixed cap: every argument costs at
+			// least its own length byte, so a count past what remains is
+			// corrupt whatever the arguments turn out to be. See string().
+			n := r.uvarint()
+			if n > uint64(len(r.b)-r.i) {
+				r.fail()
+				return r.err
+			}
+			args = make([][]byte, 0, n)
+			for range n {
+				args = append(args, r.bytes())
+			}
+		}
+		rec.ProbeError = expand(host, tmpl, args)
 	}
 	switch {
 	case flags2&flagURLLit != 0:
@@ -322,17 +472,102 @@ func originName(code int) string {
 
 func derivedURL(host string) string { return "https://" + host + "/" }
 
-// templatize replaces the hostname inside a probe error with a marker, so
-// errors that differ only by host share one dictionary entry.
-func templatize(host, msg string) string {
-	if host == "" {
-		return msg
+// templatize splits a probe error into the shape that gets interned and the
+// values that go on the record.
+//
+// The host is masked first, so a certificate issued for a literal address
+// leaves through hostMark rather than being mistaken for one of the addresses
+// this then lifts out.
+func templatize(host, msg string) (string, [][]byte) {
+	// Before anything else, so that a mark the message brought with it cannot
+	// be confused with one this puts there. A hostname holds no control
+	// bytes, so escaping never disturbs the occurrences masked next.
+	msg = escapeMarks(msg)
+	if host != "" {
+		msg = strings.ReplaceAll(msg, host, hostMark)
 	}
-	return strings.ReplaceAll(msg, host, hostMark)
+	if !strings.ContainsAny(msg, "0123456789") {
+		// No digits, so no address. Most errors take this path.
+		return msg, nil
+	}
+	var args [][]byte
+	tmpl := ipCandidate.ReplaceAllStringFunc(msg, func(m string) string {
+		bracketed := strings.HasPrefix(m, "[")
+		text := strings.Trim(m, "[]")
+		ip := net.ParseIP(text)
+		if ip == nil {
+			return m
+		}
+		packed := ip.To4()
+		if packed == nil {
+			packed = ip.To16()
+		}
+		// Lift it only if it renders back exactly as it was written.
+		//
+		// The bytes are what get stored, and expand renders them with
+		// net.IP.String, which produces one canonical spelling of an address
+		// that has several. An IPv6 address written out in full comes back
+		// compressed, one written in capitals comes back lowercase, and
+		// ::ffff:1.2.3.4 comes back as 1.2.3.4 — that one is not even the
+		// same notation. None of that is a wrong address, but all of it is
+		// text the prober never produced, which is not what "the error is
+		// stored losslessly" should mean.
+		//
+		// Go's own errors carry addresses it formatted itself, so they are
+		// canonical already and take this path. What does not is an address
+		// quoted from somewhere else — a redirect target, a name in a
+		// certificate — and those keep their own dictionary entry, which is
+		// what happened to every address before any of this existed.
+		if net.IP(packed).String() != text {
+			return m
+		}
+		args = append(args, packed)
+		if bracketed {
+			return "[" + argMark + "]"
+		}
+		return argMark
+	})
+	return tmpl, args
 }
 
-func expand(host, tmpl string) string {
-	return strings.ReplaceAll(tmpl, hostMark, host)
+// expand rebuilds a probe error from its template, the host it belongs to, and
+// the values that were lifted out of it.
+//
+// A record whose arguments do not match its template gets a question mark
+// rather than a panic or a silent splice. Now that templatize escapes the
+// marks a message brought with it, that can only happen to a record written by
+// something other than encode, and saying so in the text is more use than
+// failing the whole read of a record whose other fields are fine.
+func expand(host, tmpl string, args [][]byte) string {
+	if !strings.ContainsAny(tmpl, marks) {
+		return tmpl
+	}
+	var b strings.Builder
+	b.Grow(len(tmpl) + len(host))
+	next := 0
+	for i := 0; i < len(tmpl); i++ {
+		switch tmpl[i] {
+		case escMark[0]:
+			// The escaped byte is whatever follows, taken literally. A
+			// trailing escape has nothing to escape and is dropped; only a
+			// template this package did not write can end that way.
+			if i++; i < len(tmpl) {
+				b.WriteByte(tmpl[i])
+			}
+		case hostMark[0]:
+			b.WriteString(host)
+		case argMark[0]:
+			if next >= len(args) {
+				b.WriteString("?")
+				continue
+			}
+			b.WriteString(net.IP(args[next]).String())
+			next++
+		default:
+			b.WriteByte(tmpl[i])
+		}
+	}
+	return b.String()
 }
 
 // unixSec clamps a time to the uint32 unix range. Zero times stay zero.
@@ -446,18 +681,26 @@ func (r *reader) take(n int) []byte {
 	return b
 }
 
-// string reads a length-prefixed string. The length is compared as a uint64
+// bytes reads a length-prefixed field. The length is compared as a uint64
 // before it is narrowed: int is 32 bits on a 32-bit build, where converting
-// first would truncate a corrupt 0x1_0000_0005 to a plausible 5 and hand back
-// a wrong record instead of the error take would have raised.
-func (r *reader) string() string {
+// first would truncate a corrupt 0x1_0000_0005 to a plausible 5, and take
+// would then succeed on five bytes and leave the decoder walking a record it
+// has lost its place in — with no error to say so.
+//
+// take makes the same comparison and cannot make this one, because by the time
+// it sees the length the narrowing has already happened. So every
+// length-prefixed field goes through here rather than through take directly.
+func (r *reader) bytes() []byte {
 	n := r.uvarint()
 	if n > uint64(len(r.b)-r.i) {
 		r.fail()
-		return ""
+		return nil
 	}
-	return string(r.take(int(n)))
+	return r.take(int(n))
 }
+
+// string reads a length-prefixed string.
+func (r *reader) string() string { return string(r.bytes()) }
 
 // hex reads n raw bytes and renders them as a lowercase hex digest.
 func (r *reader) hex(n int) string {
