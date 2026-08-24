@@ -306,12 +306,71 @@ Three answers from a tiled log are not failures, and are not treated as any:
 Anything else — a broken tile, a tile that reframes entries already read, an
 unreadable checkpoint — fails the follower and earns the ordinary backoff.
 
-Nothing here verifies the checkpoint signature. That would mean carrying each
-log's public key from the list and implementing the RFC 6962 note signature
-scheme, and it would put this feed ahead of the RFC 6962 one, which asks for an
-STH without a public key and so does not verify either. Both trust HTTPS to the
-log's own name, for the same reason: this is looking for hostnames, and a log
-that lied about its tree could only make it look at more of them.
+### What a log is taken at its word for
+
+Both feeds check the head a log serves before acting on it. The log list
+publishes each log's public key beside its URL, so the key travels with the URL
+through discovery, through every refresh, and into the follower.
+
+For an RFC 6962 log that is the `get-sth` signature, over the tree size, the
+root hash and the timestamp. For a Static CT log it is the checkpoint's
+`RFC6962NoteSignature`, over the same three, with two details worth writing
+down because getting either wrong fails silently:
+
+- **The log's line is picked by key id, never by position or by the name in
+  front of it.** A checkpoint carries as many signatures as anyone cared to
+  add. Sunlight logs are cosigned by witnesses; both Sunlight and Sycamore
+  deliberately sign one line as `grease.invalid` with bytes no client can
+  parse, so that a client assuming there is exactly one signature breaks in
+  testing rather than in production. Across the 22 tiled logs on Google's list,
+  checkpoints carry one to four lines, and three of those logs sign more than
+  once under their own name.
+- **The key id is derived from the log's *submission* prefix**, as
+  `SHA-256(origin || 0x0A || 0x05 || log_id)`, and that prefix is not the
+  monitoring URL the tiles were read from. For most operators they are
+  different hosts — Let's Encrypt reads from `mon.sycamore` and submits to
+  `log.sycamore`, Geomys reads from `skylight` and submits to `sunlight` — so
+  the origin has to come from the list too.
+
+A signature that does not verify is not treated as a bad minute. Everything
+else a follower hits — a timeout, a 500, a tile that has not landed yet — gets
+the ordinary backoff, because it gets better on its own. A signature that does
+not check out is either the wrong key or a log serving what it did not sign,
+and asking a fourth time changes nothing:
+
+```console
+ERROR static ct log signature did not verify; no longer following it log=https://mon.example/2026h2 err="checkpoint: signature did not verify: no signature from key id aee62413"
+```
+
+Logs named with `--logs` or `--tiled-logs` come with a URL and nothing else.
+There is nowhere to get a key from — the log's own `get-sth` or `/checkpoint`
+would be the log vouching for itself — so they are followed on the strength of
+HTTPS to their own name, and the run says which ones:
+
+```console
+WARN logs named on the command line come with no key; their signatures are not checked flag=--logs logs=1
+```
+
+#### What this does not cover
+
+Verifying the head is the floor the rest of CT monitoring is built on, and on
+its own it is a thin floor. Three things it does not do:
+
+- **It does not tie the entries to the signature.** No tile is checked against
+  the root hash that was just verified. That means reading the level-0 tiles
+  and recomputing the hashes up to the root. A log that signs an honest
+  checkpoint and serves fabricated tiles beside it passes everything here.
+- **It does not catch omission.** A log can under-report its size, or serve one
+  view to this monitor and another to everyone else, and sign both honestly.
+  Catching that needs consistency proofs between successive heads and gossip
+  with other monitors.
+- **The failure mode is mild either way.** `ctmon` is looking for hostnames. A
+  log that lies can make it look at hostnames that were never certified, or
+  hide ones that were — which it can equally do by simply not serving them.
+
+So the case for it is not that the state before it was unsafe. It is that
+"we read CT logs and check nothing they tell us" was a claim this file had to
+make.
 
 ### The log list moves
 
@@ -324,7 +383,10 @@ sign is the `ctlog` share of the counters going quiet.
 
 So the list is re-read every `--log-refresh` (24h by default, `0` disables) and
 the followers are brought in line with it: a log the list has added gets one, a
-log it has dropped loses its. Both sides are logged. Both readers work this
+log it has dropped loses its, and one it has republished under a new key is
+stopped and started again on the new one — a follower holds its key for the
+life of its run, and one left going would keep checking a log that is behaving
+against a key that has been retired. Every side is logged. Both readers work this
 way, and share the code that does it — the protocols differ, the bookkeeping
 around them does not. A refresh that fails, or
 that comes back empty, changes nothing — a list that would not load is no
@@ -1092,7 +1154,7 @@ records per second; raise it if you turn the filters off.
 
 ```
 cmd/ctmon            command line: run, list, get, stats, prune
-internal/source      certificate feeds (certstream, RFC 6962 poller, Static CT reader)
+internal/source      certificate feeds (certstream, RFC 6962 poller, Static CT reader, signature checks)
 internal/domain      CN and SAN → hostname expansion, validation, depth
 internal/resolve     caching DNS front end, shared by the probes and the feed
 internal/probe       HTTPS fetch and body hashing
@@ -1117,5 +1179,8 @@ compaction, probe hashing (including the body cap and redirects), DNS caching
 and the resolver-health judgement, certstream message parsing, the Static CT
 wire format against two entries captured byte for byte off a real log, what a
 tiled reader does with a tile that is missing or a log that refuses to be read
-this fast, what the pipeline does when the store refuses a write, and the
-pipeline end to end against a local HTTPS server.
+this fast, tree head and checkpoint signature verification — including the note
+key id pinned against a live log's published key, a checkpoint carrying grease
+and witness lines around the log's own, and a follower stopping rather than
+retrying when one does not verify — what the pipeline does when the store
+refuses a write, and the pipeline end to end against a local HTTPS server.

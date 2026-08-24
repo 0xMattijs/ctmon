@@ -13,6 +13,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/google/certificate-transparency-go/tls"
 )
 
 // discardLog is a logger for tests that only care about behavior.
@@ -29,6 +31,10 @@ type fakeLog struct {
 	maxServed int   // 0 means serve whatever is asked
 	asked     []int // entry counts requested, in order
 	heads     int   // get-sth calls, which is how a follower shows it is alive
+	// signer signs the tree head. Left nil the log serves the unsigned
+	// placeholder these tests used before signatures were checked, which is
+	// what a log that cannot be believed looks like from the follower.
+	signer *testLog
 }
 
 func (f *fakeLog) serve(t *testing.T) string {
@@ -38,11 +44,21 @@ func (f *fakeLog) serve(t *testing.T) string {
 		f.mu.Lock()
 		defer f.mu.Unlock()
 		f.heads++
+		sig := make([]byte, 4)
+		root := make([]byte, 32)
+		if f.signer != nil {
+			sth := f.signer.sth(f.treeSize, testRoot)
+			marshalled, err := tls.Marshal(tls.DigitallySigned(sth.TreeHeadSignature))
+			if err != nil {
+				panic(err) // see testLog: this runs on the serving goroutine
+			}
+			sig, root = marshalled, testRoot[:]
+		}
 		json.NewEncoder(w).Encode(map[string]any{
 			"tree_size":           f.treeSize,
-			"timestamp":           int64(1787000000000),
-			"sha256_root_hash":    base64.StdEncoding.EncodeToString(make([]byte, 32)),
-			"tree_head_signature": base64.StdEncoding.EncodeToString(make([]byte, 4)),
+			"timestamp":           int64(testTimestamp),
+			"sha256_root_hash":    base64.StdEncoding.EncodeToString(root),
+			"tree_head_signature": base64.StdEncoding.EncodeToString(sig),
 		})
 	})
 	mux.HandleFunc("/ct/v1/get-entries", func(w http.ResponseWriter, r *http.Request) {
@@ -120,7 +136,7 @@ func TestBatchShrinksUntilTheLogCanAnswer(t *testing.T) {
 	pos := newPositions()
 	pos.SetLogPos(uri, 0)
 	c := &CTLog{
-		URIs: []string{uri}, Positions: pos, BatchSize: 256,
+		Logs: unkeyed(uri), Positions: pos, BatchSize: 256,
 		PollInterval: time.Millisecond, RequestsPerSecond: 1000, Log: discardLog(),
 	}
 
@@ -136,7 +152,7 @@ func TestBatchShrinksUntilTheLogCanAnswer(t *testing.T) {
 		}
 	}()
 	for i := 0; i < 6 && pos.get(uri) == 0; i++ {
-		c.follow(ctx, uri, out, st)
+		c.follow(ctx, Log{URI: uri}, out, st)
 	}
 
 	if pos.get(uri) == 0 {
@@ -184,7 +200,7 @@ func TestMaxLagSkipsToTheTip(t *testing.T) {
 	pos := newPositions()
 	pos.SetLogPos(uri, 1000) // known log, hopelessly behind
 	c := &CTLog{
-		URIs: []string{uri}, Positions: pos, MaxLag: 10000,
+		Logs: unkeyed(uri), Positions: pos, MaxLag: 10000,
 		PollInterval: time.Hour, RequestsPerSecond: 1000, Log: discardLog(),
 	}
 
@@ -195,7 +211,7 @@ func TestMaxLagSkipsToTheTip(t *testing.T) {
 	go func() {
 		defer close(done)
 		st := &logState{batch: c.batchCeiling(), max: c.batchCeiling()}
-		c.follow(ctx, uri, out, st)
+		c.follow(ctx, Log{URI: uri}, out, st)
 	}()
 
 	deadline := time.After(5 * time.Second)
@@ -220,7 +236,7 @@ func TestMaxLagLeavesFirstSightAlone(t *testing.T) {
 
 	pos := newPositions() // no stored position: this is first sight
 	c := &CTLog{
-		URIs: []string{uri}, Positions: pos, MaxLag: 10000, FromStart: true,
+		Logs: unkeyed(uri), Positions: pos, MaxLag: 10000, FromStart: true,
 		BatchSize: 16, PollInterval: time.Hour, RequestsPerSecond: 1000, Log: discardLog(),
 	}
 
@@ -233,7 +249,7 @@ func TestMaxLagLeavesFirstSightAlone(t *testing.T) {
 	}()
 	go func() {
 		st := &logState{batch: c.batchCeiling(), max: c.batchCeiling()}
-		c.follow(ctx, uri, out, st)
+		c.follow(ctx, Log{URI: uri}, out, st)
 	}()
 
 	// --from-start asked for the whole log, so the gap must be read, not
@@ -321,10 +337,22 @@ func (l *listOf) set(uris ...string) {
 	l.uris = uris
 }
 
-func (l *listOf) discover(context.Context) ([]string, error) {
+func (l *listOf) discover(context.Context) ([]Log, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return append([]string(nil), l.uris...), l.err
+	return unkeyed(l.uris...), l.err
+}
+
+// unkeyed is a log set with no public keys, which is what a set named on the
+// command line is: followed, and nothing it says checked. Tests that are about
+// the follow loop rather than about verification use it so they can serve an
+// ordinary fake log without signing for it.
+func unkeyed(uris ...string) []Log {
+	logs := make([]Log, len(uris))
+	for i, uri := range uris {
+		logs[i] = Log{URI: uri}
+	}
+	return logs
 }
 
 // runFeed starts c and stops it when the test ends.
@@ -351,7 +379,7 @@ func runFeed(t *testing.T, c *CTLog) {
 // refreshing is a CTLog wired to list, polling fast enough for a test to watch.
 func refreshing(uris []string, pos Positions, list *listOf) *CTLog {
 	return &CTLog{
-		URIs:              uris,
+		Logs:              unkeyed(uris...),
 		Positions:         pos,
 		PollInterval:      5 * time.Millisecond,
 		RequestsPerSecond: 1000,
@@ -501,11 +529,11 @@ type flapping struct {
 	n    int
 }
 
-func (f *flapping) discover(context.Context) ([]string, error) {
+func (f *flapping) discover(context.Context) ([]Log, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.n++
-	return []string{f.uris[f.n%len(f.uris)]}, nil
+	return unkeyed(f.uris[f.n%len(f.uris)]), nil
 }
 
 func TestRefreshRunsOneFollowerPerLog(t *testing.T) {
@@ -536,4 +564,101 @@ func TestRefreshRunsOneFollowerPerLog(t *testing.T) {
 			t.Errorf("%d followers ran on one log at once, want 1", n)
 		}
 	}
+}
+
+// TestCTLogFollowsALogThatSignsItsTreeHead is the RFC 6962 path with the check
+// switched on: a key from the list, a tree head signed with it, and the
+// follower getting on with reading entries.
+func TestCTLogFollowsALogThatSignsItsTreeHead(t *testing.T) {
+	signer := newTestLog(t, "")
+	log := &fakeLog{treeSize: 500, signer: signer}
+	uri := log.serve(t)
+
+	pos := newPositions()
+	c := &CTLog{
+		Logs: []Log{signer.entry(uri)}, Positions: pos, FromStart: true, BatchSize: 64,
+		PollInterval: 5 * time.Millisecond, RequestsPerSecond: 1000, Log: discardLog(),
+	}
+	runFeed(t, c)
+
+	waitFor(t, "the log to be read to its tip", func() bool { return pos.get(uri) == 500 })
+}
+
+// TestCTLogStopsFollowingALogThatDoesNotVerify is the RFC 6962 half of the
+// reaction: a get-sth whose signature does not check out is not retried, and
+// the log stops being asked at all.
+func TestCTLogStopsFollowingALogThatDoesNotVerify(t *testing.T) {
+	// No signer, so the head carries the four placeholder bytes that were
+	// good enough when nothing checked them.
+	log := &fakeLog{treeSize: 500}
+	uri := log.serve(t)
+
+	pos := newPositions()
+	c := &CTLog{
+		Logs: []Log{newTestLog(t, "").entry(uri)}, Positions: pos,
+		PollInterval: 5 * time.Millisecond, RequestsPerSecond: 1000, Log: discardLog(),
+	}
+	runFeed(t, c)
+
+	waitFor(t, "the head to be read once", func() bool { return log.sths() > 0 })
+	asked := log.sths()
+	time.Sleep(100 * time.Millisecond)
+	if now := log.sths(); now != asked {
+		t.Errorf("get-sth called %d more times after the signature failed; the follower is still running", now-asked)
+	}
+	if p, seen, _ := pos.LogPos(uri); seen {
+		t.Errorf("stored a position of %d for a log that never verified", p)
+	}
+}
+
+// TestRefreshRestartsALogWhoseKeyChanged is the case a set of URLs could not
+// express. A follower holds the key it started with for the life of its run,
+// so a log the list republishes under a new key has to be stopped and started
+// again — otherwise a monitor goes on checking a log that is behaving against
+// a key that has been retired, and reports it as a log that cannot be
+// believed.
+func TestRefreshRestartsALogWhoseKeyChanged(t *testing.T) {
+	before, after := newTestLog(t, ""), newTestLog(t, "")
+	log := &fakeLog{treeSize: 100, signer: after}
+	uri := log.serve(t)
+
+	list := &keyedList{logs: []Log{before.entry(uri)}}
+	pos := newPositions()
+	c := &CTLog{
+		Logs: []Log{before.entry(uri)}, Positions: pos,
+		PollInterval:      5 * time.Millisecond,
+		RefreshInterval:   5 * time.Millisecond,
+		Discover:          list.discover,
+		RequestsPerSecond: 1000, Log: discardLog(),
+	}
+	runFeed(t, c)
+
+	// The log signs with the key the list has not published yet, so the
+	// follower running on the old one refuses it and stops.
+	waitFor(t, "the head to be read once", func() bool { return log.sths() > 0 })
+	if pos.seen(uri) {
+		t.Fatal("stored a position while the key did not match")
+	}
+
+	list.set(after.entry(uri))
+	waitFor(t, "the log to be followed again on its new key", func() bool { return pos.seen(uri) })
+}
+
+// keyedList is a log list a test can rewrite while the feed is running,
+// carrying keys as the real one does.
+type keyedList struct {
+	mu   sync.Mutex
+	logs []Log
+}
+
+func (l *keyedList) set(logs ...Log) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.logs = logs
+}
+
+func (l *keyedList) discover(context.Context) ([]Log, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]Log(nil), l.logs...), nil
 }

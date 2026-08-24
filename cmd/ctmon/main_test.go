@@ -195,8 +195,8 @@ func TestBuildSourcesExplicitLogsSkipDiscovery(t *testing.T) {
 		t.Fatalf("feed is %T, want *source.CTLog", feeds[0])
 	}
 	want := []string{"https://a.example/log", "https://b.example/log"}
-	if strings.Join(ct.URIs, ",") != strings.Join(want, ",") {
-		t.Errorf("URIs = %q, want %q", ct.URIs, want)
+	if strings.Join(source.LogURIs(ct.Logs), ",") != strings.Join(want, ",") {
+		t.Errorf("URIs = %q, want %q", source.LogURIs(ct.Logs), want)
 	}
 	if ct.Discover != nil {
 		t.Error("an explicit --logs set still installed a discoverer")
@@ -229,16 +229,16 @@ func TestBuildSourcesKeepsTheTwoLogSetsApart(t *testing.T) {
 	if !ok {
 		t.Fatalf("feed 0 is %T, want *source.CTLog", feeds[0])
 	}
-	if strings.Join(rfc.URIs, ",") != "https://a.example/log" {
-		t.Errorf("CTLog URIs = %q", rfc.URIs)
+	if strings.Join(source.LogURIs(rfc.Logs), ",") != "https://a.example/log" {
+		t.Errorf("CTLog URIs = %q", source.LogURIs(rfc.Logs))
 	}
 	tiled, ok := feeds[1].(*source.TiledLog)
 	if !ok {
 		t.Fatalf("feed 1 is %T, want *source.TiledLog", feeds[1])
 	}
 	want := []string{"https://mon.b.example/2026h2/", "https://mon.c.example/2026h2/"}
-	if strings.Join(tiled.URIs, ",") != strings.Join(want, ",") {
-		t.Errorf("TiledLog URIs = %q, want %q", tiled.URIs, want)
+	if strings.Join(source.LogURIs(tiled.Logs), ",") != strings.Join(want, ",") {
+		t.Errorf("TiledLog URIs = %q, want %q", source.LogURIs(tiled.Logs), want)
 	}
 	if tiled.Discover != nil {
 		t.Error("an explicit --tiled-logs set still installed a discoverer")
@@ -336,5 +336,43 @@ func TestWaited(t *testing.T) {
 	}
 	if got := waited(time.Now().Add(-90 * time.Second)); got != "1m30s" {
 		t.Errorf("waited(90s ago) = %q, want %q", got, "1m30s")
+	}
+}
+
+// TestBuildSourcesFollowsNamedLogsWithoutAKey is what --logs and --tiled-logs
+// promise now that everything else is checked. A log named on the command line
+// has no list entry to take a key from, and the only other place a key could
+// come from is the log itself, which would be the log vouching for itself. So
+// it is followed unchecked rather than refused, and the run says so.
+func TestBuildSourcesFollowsNamedLogsWithoutAKey(t *testing.T) {
+	var lines strings.Builder
+	log := slog.New(slog.NewTextHandler(&lines, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	cfg := feedConfig{
+		sources:   "ctlog,tiled",
+		logURIs:   "https://a.example/log",
+		tiledURIs: "https://mon.b.example/2026h2/",
+	}
+	feeds, err := buildSources(cfg, "ua", nil, log, nil)
+	if err != nil {
+		t.Fatalf("buildSources: %v", err)
+	}
+	if len(feeds) != 2 {
+		t.Fatalf("buildSources returned %d feeds, want 2", len(feeds))
+	}
+	rfc := feeds[0].(*source.CTLog)
+	if len(rfc.Logs) != 1 || rfc.Logs[0].Key != nil {
+		t.Errorf("CTLog logs = %+v, want one log with no key", rfc.Logs)
+	}
+	tiled := feeds[1].(*source.TiledLog)
+	if len(tiled.Logs) != 1 || tiled.Logs[0].Key != nil {
+		t.Errorf("TiledLog logs = %+v, want one log with no key", tiled.Logs)
+	}
+	// Unchecked and unmentioned is the combination worth failing on: an
+	// operator has no other way to learn which of their logs is taken on
+	// trust.
+	for _, flag := range []string{"--logs", "--tiled-logs"} {
+		if !strings.Contains(lines.String(), flag) {
+			t.Errorf("nothing warned that %s logs are not checked; logged:\n%s", flag, lines.String())
+		}
 	}
 }

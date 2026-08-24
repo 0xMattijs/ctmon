@@ -288,15 +288,15 @@ func buildSources(cfg feedConfig, userAgent string, db *store.Store, log *slog.L
 		})
 	}
 	if want["ctlog"] {
-		uris, refresh := splitList(cfg.logURIs), (func(context.Context) ([]string, error))(nil)
-		if len(uris) == 0 {
-			if uris = found.RFC6962; len(uris) == 0 {
+		logs, refresh := namedLogs(splitList(cfg.logURIs), "--logs", log), (func(context.Context) ([]source.Log, error))(nil)
+		if len(logs) == 0 {
+			if logs = found.RFC6962; len(logs) == 0 {
 				return nil, errors.New("the log list has no usable RFC 6962 logs accepting certificates now")
 			}
-			refresh = eachRefresh(discover, func(s source.LogSet) []string { return s.RFC6962 })
+			refresh = eachRefresh(discover, func(s source.LogSet) []source.Log { return s.RFC6962 })
 		}
 		feeds = append(feeds, &source.CTLog{
-			URIs:              uris,
+			Logs:              logs,
 			Positions:         db,
 			FromStart:         cfg.fromStart,
 			BatchSize:         cfg.batch,
@@ -311,15 +311,15 @@ func buildSources(cfg feedConfig, userAgent string, db *store.Store, log *slog.L
 		})
 	}
 	if want["tiled"] {
-		uris, refresh := splitList(cfg.tiledURIs), (func(context.Context) ([]string, error))(nil)
-		if len(uris) == 0 {
-			if uris = found.Tiled; len(uris) == 0 {
+		logs, refresh := namedLogs(splitList(cfg.tiledURIs), "--tiled-logs", log), (func(context.Context) ([]source.Log, error))(nil)
+		if len(logs) == 0 {
+			if logs = found.Tiled; len(logs) == 0 {
 				return nil, errors.New("the log list has no usable Static CT API logs accepting certificates now")
 			}
-			refresh = eachRefresh(discover, func(s source.LogSet) []string { return s.Tiled })
+			refresh = eachRefresh(discover, func(s source.LogSet) []source.Log { return s.Tiled })
 		}
 		feeds = append(feeds, &source.TiledLog{
-			URIs:              uris,
+			Logs:              logs,
 			Positions:         db,
 			FromStart:         cfg.fromStart,
 			MaxLag:            cfg.maxLag,
@@ -342,17 +342,41 @@ func buildSources(cfg feedConfig, userAgent string, db *store.Store, log *slog.L
 // static JSON file, which is not worth a shared cache and the staleness
 // question that would come with one.
 func eachRefresh(discover func(context.Context) (source.LogSet, error),
-	of func(source.LogSet) []string) func(context.Context) ([]string, error) {
+	of func(source.LogSet) []source.Log) func(context.Context) ([]source.Log, error) {
 	if discover == nil {
 		return nil
 	}
-	return func(ctx context.Context) ([]string, error) {
+	return func(ctx context.Context) ([]source.Log, error) {
 		set, err := discover(ctx)
 		if err != nil {
 			return nil, err
 		}
 		return of(set), nil
 	}
+}
+
+// namedLogs turns the URIs of an explicitly named log set into logs, and says
+// once that nothing they sign will be checked.
+//
+// A log on Chrome's list arrives with the key it signs with, and every head it
+// serves is verified against that key. A log named on the command line arrives
+// with a URL and nothing else, and there is nowhere to get a key from — the
+// log's own /ct/v1/get-sth or /checkpoint would be the log vouching for
+// itself. Refusing to follow it would take these flags away from anyone
+// pointing this at a log that is not on the list, which is what they are for,
+// so it is followed on the strength of HTTPS to its own name and the run says
+// so at startup rather than leaving it to be inferred from a missing line.
+func namedLogs(uris []string, flag string, log *slog.Logger) []source.Log {
+	if len(uris) == 0 {
+		return nil
+	}
+	logs := make([]source.Log, len(uris))
+	for i, uri := range uris {
+		logs[i] = source.Log{URI: uri}
+	}
+	log.Warn("logs named on the command line come with no key; their signatures are not checked",
+		"flag", flag, "logs", len(logs))
+	return logs
 }
 
 // logDiscoverer returns a function that reads the CT log list, over the same

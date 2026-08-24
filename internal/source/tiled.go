@@ -27,11 +27,12 @@ import (
 // are fetched, because there is nothing to share: one asks a JSON API for a
 // range and the other downloads a file.
 type TiledLog struct {
-	// URIs are the monitoring prefixes to follow, e.g.
-	// "https://mon.sycamore.ct.letsencrypt.org/2026h2/". A trailing slash is
-	// optional and not stored: positions are keyed by URI, so the key has to
-	// mean the same thing however the list spelled it that day.
-	URIs []string
+	// Logs are the logs to follow, each a monitoring prefix, the key it signs
+	// with, and the origin its checkpoint names itself by. A trailing slash on
+	// the prefix is optional and not stored: positions are keyed by URI, so
+	// the key has to mean the same thing however the list spelled it that day.
+	// A log with no key is followed and not checked; see verifierFor.
+	Logs []Log
 	// Positions stores per-log read positions. Required.
 	//
 	// A tiled log's position is a leaf index, exactly as it is for an RFC 6962
@@ -57,9 +58,9 @@ type TiledLog struct {
 	// can share the run's own resolver. See logHTTPClient.
 	DialContext func(ctx context.Context, network, addr string) (net.Conn, error)
 	// Discover re-reads the set of tiled logs worth following. Set it and Run
-	// reconsiders the set every RefreshInterval; leave it nil and URIs is the
+	// reconsiders the set every RefreshInterval; leave it nil and Logs is the
 	// set for the life of the run.
-	Discover func(ctx context.Context) ([]string, error)
+	Discover func(ctx context.Context) ([]Log, error)
 	// RefreshInterval is how often Discover is called (default 24h).
 	RefreshInterval time.Duration
 	Log             *slog.Logger
@@ -115,25 +116,25 @@ func (t *TiledLog) Run(ctx context.Context, out chan<- Cert) error {
 	if t.Positions == nil {
 		return fmt.Errorf("tiled: Positions is required")
 	}
-	if len(t.URIs) == 0 {
+	if len(t.Logs) == 0 {
 		return fmt.Errorf("tiled: no log URIs configured")
 	}
 	discover := t.Discover
 	if discover != nil {
-		discover = func(ctx context.Context) ([]string, error) {
-			uris, err := t.Discover(ctx)
-			return tiledPrefixes(uris), err
+		discover = func(ctx context.Context) ([]Log, error) {
+			logs, err := t.Discover(ctx)
+			return tiledPrefixes(logs), err
 		}
 	}
 	set := &followSet{
-		uris:      tiledPrefixes(t.URIs),
+		logs:      tiledPrefixes(t.Logs),
 		positions: t.Positions,
 		discover:  discover,
 		refresh:   t.RefreshInterval,
 		kind:      "static ct log",
 		log:       t.Log,
-		follow: func(fctx context.Context, uri string) {
-			t.followForever(fctx, uri, out)
+		follow: func(fctx context.Context, lg Log) {
+			t.followForever(fctx, lg, out)
 		},
 	}
 	return set.run(ctx)
@@ -147,10 +148,11 @@ func (t *TiledLog) Run(ctx context.Context, out chan<- Cert) error {
 // is running and looks positions up by the same string, so a normalisation
 // that only reached as far as the fetch would have it stop and restart the
 // same follower on every refresh, at a position it never wrote.
-func tiledPrefixes(uris []string) []string {
-	out := make([]string, 0, len(uris))
-	for _, u := range uris {
-		out = append(out, strings.TrimRight(u, "/"))
+func tiledPrefixes(logs []Log) []Log {
+	out := make([]Log, 0, len(logs))
+	for _, lg := range logs {
+		lg.URI = strings.TrimRight(lg.URI, "/")
+		out = append(out, lg)
 	}
 	return out
 }
@@ -158,17 +160,24 @@ func tiledPrefixes(uris []string) []string {
 // followForever restarts follow after any failure, backing off between tries.
 // The backoff counter resets after a run that lasted, so an occasional failure
 // on a healthy log costs one short pause rather than a permanently long one.
-func (t *TiledLog) followForever(ctx context.Context, uri string, out chan<- Cert) {
+func (t *TiledLog) followForever(ctx context.Context, lg Log, out chan<- Cert) {
 	rt := retry{base: 5 * time.Second, max: 10 * time.Minute}
 	for ctx.Err() == nil {
 		start := time.Now()
-		err := t.follow(ctx, uri, out)
+		err := t.follow(ctx, lg, out)
 		if ctx.Err() != nil {
+			return
+		}
+		if errors.Is(err, errUntrusted) {
+			// Not a bad minute. See errUntrusted: this is the wrong key or a
+			// log serving what it did not sign, and neither is waited out.
+			t.Log.Error("static ct log signature did not verify; no longer following it",
+				"log", lg.URI, "err", err)
 			return
 		}
 		ran := time.Since(start)
 		d := rt.after(ran)
-		t.Log.Warn("static ct log follow failed", "log", uri, "err", err,
+		t.Log.Warn("static ct log follow failed", "log", lg.URI, "err", err,
 			"ran", ran.Round(time.Second), "retry_in", d)
 		if sleep(ctx, d) != nil {
 			return
@@ -184,7 +193,8 @@ func (t *TiledLog) followForever(ctx context.Context, uri string, out chan<- Cer
 // because the API says so, and a log too slow to serve one inside the timeout
 // cannot be asked for less — the smaller request does not exist. What CTLog
 // spends on finding a size the log can manage, this spends on not having to.
-func (t *TiledLog) follow(ctx context.Context, uri string, out chan<- Cert) error {
+func (t *TiledLog) follow(ctx context.Context, lg Log, out chan<- Cert) error {
+	uri := lg.URI
 	poll := t.pollEvery()
 	rps := t.RequestsPerSecond
 	if rps <= 0 {
@@ -192,6 +202,11 @@ func (t *TiledLog) follow(ctx context.Context, uri string, out chan<- Cert) erro
 	}
 	limiter := rate.NewLimiter(rate.Limit(rps), 1)
 	hc := logHTTPClient(t.DialContext)
+
+	v, err := verifierFor(lg.Key)
+	if err != nil {
+		return err
+	}
 
 	pos, ok, err := t.Positions.LogPos(uri)
 	if err != nil {
@@ -228,6 +243,9 @@ func (t *TiledLog) follow(ctx context.Context, uri string, out chan<- Cert) erro
 		}
 		if err != nil {
 			return err
+		}
+		if err := verifyCheckpoint(v, cp, lg.Origin, lg.Key); err != nil {
+			return fmt.Errorf("checkpoint: %w", err)
 		}
 
 		firstSight := !ok
