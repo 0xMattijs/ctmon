@@ -856,8 +856,16 @@ few days, of which 5,873 were used by exactly one record.
 
 So an address is lifted out of the template and stored on the record, packed —
 four bytes for IPv4, sixteen for IPv6 — and put back on read. Nothing is lost:
-`ctmon get` still tells you which address a probe failed against. Measured over
-all 170,410 error records on that store:
+`ctmon get` still tells you which address a probe failed against, in the words
+the prober used. That last part is a condition rather than a claim — an address
+is only lifted when rendering the packed bytes back reproduces the text
+character for character. Go formats the addresses in its own errors
+canonically, so those are lifted; an address quoted from somewhere else and
+written another way — `[2606:4700:4700:0:0:0:0:1111]` rather than
+`[2606:4700:4700::1111]`, or `[::ffff:1.2.3.4]`, which is not even the same
+notation — is left in the template and keeps its own entry, exactly as every
+address did before this. Measured over all 170,410 error records on that
+store:
 
 | | shapes | bytes |
 |---|---|---|

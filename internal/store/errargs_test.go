@@ -69,6 +69,28 @@ func TestProbeErrorRoundTrips(t *testing.T) {
 			err:  `Get "https://www.example.com/": ünexpected — 10.0.0.9:443 · EOF`,
 			args: 1,
 		},
+		// An address is only lifted when net.IP.String renders it back
+		// exactly as it was written. These four are all valid addresses that
+		// it would re-spell, so they stay in the template: a record has to
+		// come back as the text the prober produced, not as the same address
+		// written another way. Every one of them is reachable from an address
+		// quoted out of a redirect target or a certificate rather than
+		// formatted by Go.
+		{
+			name: "ipv6 written out in full",
+			host: "www.example.com",
+			err:  `Get "https://www.example.com/": dial tcp [2606:4700:4700:0:0:0:0:1111]:443: i/o timeout`,
+		},
+		{
+			name: "ipv6 in capitals",
+			host: "www.example.com",
+			err:  `Get "https://www.example.com/": dial tcp [2606:4700:4700::AAAA]:443: i/o timeout`,
+		},
+		{
+			name: "ipv4-mapped ipv6, which is not even the same notation",
+			host: "www.example.com",
+			err:  `Get "https://www.example.com/": dial tcp [::ffff:1.2.3.4]:443: i/o timeout`,
+		},
 	}
 
 	for _, c := range cases {
@@ -252,4 +274,40 @@ func buildV2Record(errID uint32, now time.Time) []byte {
 	out = binary.AppendUvarint(out, 1) // probe count
 	out = binary.AppendUvarint(out, 0) // body size
 	return binary.AppendUvarint(out, uint64(errID))
+}
+
+// An argument length that only looks sane once narrowed to a 32-bit int must
+// be refused, the same as any other length-prefixed field.
+//
+// On a 64-bit build take catches this on its own. On GOARCH=386 or arm the
+// conversion happens first, take succeeds on the five bytes the truncated
+// length asks for, and the decoder walks on through a record it has lost its
+// place in — returning a wrong FinalURL with no error to say so. The uint64
+// comparison in bytes is what catches it there.
+func TestDecodeRejectsAnArgumentLengthThatTruncates(t *testing.T) {
+	s := open(t)
+	now := time.Now().UTC().Truncate(time.Second)
+	first := unixSec(now)
+
+	raw := []byte{formatVersion, flagProbed | flagProbeBlock}
+	raw = binary.AppendUvarint(raw, 0) // source
+	raw = binary.AppendUvarint(raw, 0) // issuer
+	raw = binary.BigEndian.AppendUint32(raw, first)
+	raw = binary.AppendUvarint(raw, 0) // last seen delta
+	raw = binary.AppendUvarint(raw, 1) // seen count
+	raw = append(raw, flagProbeErr|flagErrArgs|flagURLAbsent)
+	raw = binary.AppendUvarint(raw, 0)       // probed at delta
+	raw = binary.AppendUvarint(raw, 0)       // status
+	raw = binary.AppendUvarint(raw, 1)       // probe count
+	raw = binary.AppendUvarint(raw, 0)       // body size
+	raw = binary.AppendUvarint(raw, 0)       // error shape id
+	raw = binary.AppendUvarint(raw, 1)       // one argument
+	raw = binary.AppendUvarint(raw, 1<<32|5) // narrows to 5 on a 32-bit int
+	raw = append(raw, "hello"...)
+
+	var rec Record
+	if err := s.decode("example.com", raw, &rec); err == nil {
+		t.Errorf("decode accepted an argument length of %d, reading %q",
+			uint64(1<<32|5), rec.ProbeError)
+	}
 }

@@ -117,7 +117,9 @@ const (
 // of things that can go wrong. Measured on a live store, 6,021 of 7,250 error
 // shapes carried a literal address, and masking them takes the vocabulary to
 // 2,401. The address itself is not thrown away: it goes on the record, packed,
-// and is put back on the way out.
+// and is put back on the way out — but only where putting it back reproduces
+// the text exactly, so an address the prober wrote in a form net.IP.String
+// does not produce keeps its own entry. See templatize.
 const (
 	hostMark = "\x01"
 	argMark  = "\x02"
@@ -356,7 +358,7 @@ func (s *Store) decodeIDs(host string, raw []byte, rec *Record, ids *recordIDs) 
 			}
 			args = make([][]byte, 0, n)
 			for range n {
-				args = append(args, r.take(int(r.uvarint())))
+				args = append(args, r.bytes())
 			}
 		}
 		rec.ProbeError = expand(host, tmpl, args)
@@ -452,15 +454,35 @@ func templatize(host, msg string) (string, [][]byte) {
 	var args [][]byte
 	tmpl := ipCandidate.ReplaceAllStringFunc(msg, func(m string) string {
 		bracketed := strings.HasPrefix(m, "[")
-		ip := net.ParseIP(strings.Trim(m, "[]"))
+		text := strings.Trim(m, "[]")
+		ip := net.ParseIP(text)
 		if ip == nil {
 			return m
 		}
-		if v4 := ip.To4(); v4 != nil {
-			args = append(args, v4)
-		} else {
-			args = append(args, ip.To16())
+		packed := ip.To4()
+		if packed == nil {
+			packed = ip.To16()
 		}
+		// Lift it only if it renders back exactly as it was written.
+		//
+		// The bytes are what get stored, and expand renders them with
+		// net.IP.String, which produces one canonical spelling of an address
+		// that has several. An IPv6 address written out in full comes back
+		// compressed, one written in capitals comes back lowercase, and
+		// ::ffff:1.2.3.4 comes back as 1.2.3.4 — that one is not even the
+		// same notation. None of that is a wrong address, but all of it is
+		// text the prober never produced, which is not what "the error is
+		// stored losslessly" should mean.
+		//
+		// Go's own errors carry addresses it formatted itself, so they are
+		// canonical already and take this path. What does not is an address
+		// quoted from somewhere else — a redirect target, a name in a
+		// certificate — and those keep their own dictionary entry, which is
+		// what happened to every address before any of this existed.
+		if net.IP(packed).String() != text {
+			return m
+		}
+		args = append(args, packed)
 		if bracketed {
 			return "[" + argMark + "]"
 		}
@@ -612,18 +634,26 @@ func (r *reader) take(n int) []byte {
 	return b
 }
 
-// string reads a length-prefixed string. The length is compared as a uint64
+// bytes reads a length-prefixed field. The length is compared as a uint64
 // before it is narrowed: int is 32 bits on a 32-bit build, where converting
-// first would truncate a corrupt 0x1_0000_0005 to a plausible 5 and hand back
-// a wrong record instead of the error take would have raised.
-func (r *reader) string() string {
+// first would truncate a corrupt 0x1_0000_0005 to a plausible 5, and take
+// would then succeed on five bytes and leave the decoder walking a record it
+// has lost its place in — with no error to say so.
+//
+// take makes the same comparison and cannot make this one, because by the time
+// it sees the length the narrowing has already happened. So every
+// length-prefixed field goes through here rather than through take directly.
+func (r *reader) bytes() []byte {
 	n := r.uvarint()
 	if n > uint64(len(r.b)-r.i) {
 		r.fail()
-		return ""
+		return nil
 	}
-	return string(r.take(int(n)))
+	return r.take(int(n))
 }
+
+// string reads a length-prefixed string.
+func (r *reader) string() string { return string(r.bytes()) }
 
 // hex reads n raw bytes and renders them as a lowercase hex digest.
 func (r *reader) hex(n int) string {
