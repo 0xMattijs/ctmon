@@ -16,8 +16,12 @@ const defaultWidth = 80
 // record erases the status line, prints, and leaves it redrawn underneath:
 // without that the two would overwrite each other.
 type statusLine struct {
-	mu      sync.Mutex
-	f       *os.File
+	mu sync.Mutex
+	w  io.Writer
+	// widthOf is asked again on every Set, which is how a resize is noticed.
+	// It is a field rather than a call to terminalWidth so that a test can
+	// drive the line over a buffer.
+	widthOf func() (int, bool)
 	width   int
 	text    string
 	shown   bool
@@ -26,11 +30,17 @@ type statusLine struct {
 
 // newStatusLine returns a status line on f, or nil if f is not a terminal.
 func newStatusLine(f *os.File) *statusLine {
-	width, ok := terminalWidth(f)
+	return newStatusLineOn(f, func() (int, bool) { return terminalWidth(f) })
+}
+
+// newStatusLineOn returns a status line on w, sized by widthOf, or nil if
+// widthOf reports that w is not a terminal.
+func newStatusLineOn(w io.Writer, widthOf func() (int, bool)) *statusLine {
+	width, ok := widthOf()
 	if !ok {
 		return nil
 	}
-	return &statusLine{f: f, width: width}
+	return &statusLine{w: w, widthOf: widthOf, width: width}
 }
 
 // Set replaces the line's contents.
@@ -42,7 +52,7 @@ func (s *statusLine) Set(text string) {
 	}
 	s.text = text
 	// Cheap enough once a second, and it is how a resize is noticed.
-	if width, ok := terminalWidth(s.f); ok {
+	if width, ok := s.widthOf(); ok {
 		s.width = width
 	}
 	s.draw()
@@ -53,7 +63,7 @@ func (s *statusLine) Write(p []byte) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.clear()
-	n, err := s.f.Write(p)
+	n, err := s.w.Write(p)
 	s.draw()
 	return n, err
 }
@@ -73,7 +83,7 @@ func (s *statusLine) Stop() {
 // every log record ends with one.
 func (s *statusLine) clear() {
 	if s.shown {
-		io.WriteString(s.f, "\r\x1b[K")
+		io.WriteString(s.w, "\r\x1b[K")
 		s.shown = false
 	}
 }
@@ -88,7 +98,7 @@ func (s *statusLine) draw() {
 	if max := s.width - 1; max > 0 && len(text) > max {
 		text = text[:max]
 	}
-	io.WriteString(s.f, "\r\x1b[K"+text)
+	io.WriteString(s.w, "\r\x1b[K"+text)
 	s.shown = true
 }
 
