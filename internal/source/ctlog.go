@@ -105,10 +105,31 @@ func (s *logState) grow() {
 // Name implements Source.
 func (c *CTLog) Name() string { return "ctlog" }
 
+// DefaultShardLookahead is how far ahead of now a shard may open and still be
+// followed. It tracks the maximum certificate validity period the CA/Browser
+// Forum allows: 200 days from March 2026, 100 from March 2027, 47 from March
+// 2029.
+//
+// A shard's temporal interval bounds the certificate's NotAfter, not when it
+// was submitted, so the shard new certificates land in runs ahead of the clock
+// by up to that period. Set this shorter than the real limit and the newest
+// shard is missed for the months before its interval opens — which is exactly
+// when issuance is moving into it. Set it longer and the extra shards are
+// merely empty: they cost a get-sth per poll and return nothing.
+//
+// So it is deliberately the *old*, longer limit rather than the current one.
+// Being late to shrink it wastes a few requests; being early to shrink it
+// loses certificates.
+const DefaultShardLookahead = 200 * 24 * time.Hour
+
 // DiscoverLogs returns the URIs of the logs in Google's v3 log list that are
-// usable now: approved for Chrome, and accepting certificates that expire
-// today. Those are the logs where new certificates actually land.
-func DiscoverLogs(ctx context.Context, hc *http.Client, listURL string) ([]string, error) {
+// worth following now: approved for Chrome, and able to be accepting
+// certificates today. Those are the logs where new certificates actually land.
+//
+// lookahead is how far ahead of now a shard may open and still be followed;
+// zero means DefaultShardLookahead. See that constant for why the window is
+// not simply "the interval contains now".
+func DiscoverLogs(ctx context.Context, hc *http.Client, listURL string, lookahead time.Duration) ([]string, error) {
 	if listURL == "" {
 		listURL = loglist3.LogListURL
 	}
@@ -133,23 +154,42 @@ func DiscoverLogs(ctx context.Context, hc *http.Client, listURL string) ([]strin
 		return nil, fmt.Errorf("parse log list: %w", err)
 	}
 
-	now := time.Now()
+	uris := selectLogs(ll, time.Now(), lookahead)
+	if len(uris) == 0 {
+		return nil, fmt.Errorf("log list %s contained no logs accepting certificates now", listURL)
+	}
+	return uris, nil
+}
+
+// selectLogs picks the usable logs that could be accepting certificates at
+// now, given the lookahead. It is separate from DiscoverLogs so the rule can
+// be tested against a clock rather than against the calendar.
+//
+// A log with no temporal interval is not sharded and is always kept.
+func selectLogs(ll *loglist3.LogList, now time.Time, lookahead time.Duration) []string {
+	if lookahead <= 0 {
+		lookahead = DefaultShardLookahead
+	}
+	opensBy := now.Add(lookahead)
 	usable := ll.SelectByStatus([]loglist3.LogStatus{loglist3.UsableLogStatus})
 	var uris []string
 	for _, op := range usable.Operators {
 		for _, lg := range op.Logs {
 			if ti := lg.TemporalInterval; ti != nil {
-				if now.Before(ti.StartInclusive) || !now.Before(ti.EndExclusive) {
+				// Ended: it takes nothing now, whatever it took before.
+				if !now.Before(ti.EndExclusive) {
+					continue
+				}
+				// Too far out: nothing issued today expires that late, so
+				// nothing is being written to it yet.
+				if ti.StartInclusive.After(opensBy) {
 					continue
 				}
 			}
 			uris = append(uris, lg.URL)
 		}
 	}
-	if len(uris) == 0 {
-		return nil, fmt.Errorf("log list %s contained no usable current logs", listURL)
-	}
-	return uris, nil
+	return uris
 }
 
 // Run follows every configured log until ctx is cancelled. A log that keeps
