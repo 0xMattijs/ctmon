@@ -15,6 +15,7 @@ import (
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -627,4 +628,72 @@ func (l *lockedBuffer) String() string {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.b.String()
+}
+
+// TestTiledKeepsWhatA429Said is the difference between a wait and a wait for a
+// reason. Geomys refuses a tile request whose User-Agent names no contact, and
+// says so in the body; the header says only how long. Reading the body is what
+// separates "this log is busy" from "this log will refuse this run forever",
+// which are the same line with the body thrown away.
+func TestTiledKeepsWhatA429Said(t *testing.T) {
+	const said = "Please add an email address to your User-Agent."
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "30")
+		http.Error(w, said, http.StatusTooManyRequests)
+	}))
+	defer srv.Close()
+
+	feed := tiledOf(srv.URL, newPositions())
+	_, err := feed.get(context.Background(), logHTTPClient(nil), srv.URL+"/checkpoint")
+	sentAway, ok := askedToWait(err)
+	if !ok {
+		t.Fatalf("got %v, want a log asking to be left alone", err)
+	}
+	if sentAway.wait != 30*time.Second {
+		t.Errorf("waiting %v, after being asked for 30s", sentAway.wait)
+	}
+	if sentAway.reason != said {
+		t.Errorf("kept %q, want %q", sentAway.reason, said)
+	}
+	if !strings.Contains(err.Error(), said) {
+		t.Errorf("the error reads %q, which does not say why", err)
+	}
+}
+
+// TestThrottleReasonFitsOneLogLine keeps a 429 body to something a log field
+// can hold. A body is a sentence for a human and nothing stops it being a page
+// of HTML, so it is capped and flattened; an empty one leaves the reason
+// empty, and a refusal with nothing to say is still a refusal.
+func TestThrottleReasonFitsOneLogLine(t *testing.T) {
+	for _, tc := range []struct{ name, body, want string }{
+		{"one line", "slow down\n", "slow down"},
+		{"several lines", "  slow down\n\nand come back\t later\n", "slow down and come back later"},
+		{"empty", "", ""},
+		{"whitespace only", "\n\n \t", ""},
+		{"a page", strings.Repeat("a", 4096), strings.Repeat("a", maxThrottleReasonBytes)},
+		// 256 bytes falls inside the 86th of these, and two thirds of a rune
+		// is not text. 85 of them is what fits whole.
+		{"cut through a rune", strings.Repeat("\u65e5", 4096), strings.Repeat("\u65e5", 85)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := throttleReason(strings.NewReader(tc.body)); got != tc.want {
+				t.Errorf("kept %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestThrottleAttrsLeaveOutWhatWasNotSaid keeps the ordinary rate limit — the
+// common case, and the one that says nothing beyond how long — reading as it
+// did before there was a reason to print. An empty field is worse than no
+// field: it invites the reader to wonder what was lost.
+func TestThrottleAttrsLeaveOutWhatWasNotSaid(t *testing.T) {
+	silent := (&throttled{wait: 30 * time.Second}).attrs()
+	if want := []any{"wait", 30 * time.Second}; !reflect.DeepEqual(silent, want) {
+		t.Errorf("a log that said nothing logs %v, want %v", silent, want)
+	}
+	spoke := (&throttled{wait: time.Second, reason: "no"}).attrs()
+	if want := []any{"wait", time.Second, "reason", "no"}; !reflect.DeepEqual(spoke, want) {
+		t.Errorf("a log that said something logs %v, want %v", spoke, want)
+	}
 }
