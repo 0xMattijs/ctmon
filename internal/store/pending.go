@@ -203,7 +203,7 @@ var seedChunk = 20000
 // due decides, per record, whether a probe is wanted and when it is due.
 // progress, if given, is called after each chunk so a long seed can say so.
 func (s *Store) SeedPending(generation string, due func(*Record) (time.Time, bool), progress func(scanned, queued int)) (queued int, ran bool, err error) {
-	after, wanted, err := s.seedState(generation)
+	after, forced, wanted, err := s.seedState(generation)
 	if err != nil || !wanted {
 		return 0, false, err
 	}
@@ -241,7 +241,7 @@ func (s *Store) SeedPending(generation string, due func(*Record) (time.Time, boo
 			if n == 0 {
 				return nil
 			}
-			return tx.Bucket(bucketMeta).Put(keySeedAt, seedProgress(generation, after))
+			return tx.Bucket(bucketMeta).Put(keySeedAt, seedProgress(seedStamp(generation, forced), after))
 		})
 		if err != nil {
 			return queued, true, fmt.Errorf("seed pending: %w", err)
@@ -257,31 +257,47 @@ func (s *Store) SeedPending(generation string, due func(*Record) (time.Time, boo
 	return queued, true, s.finishSeed(generation)
 }
 
-// seedState reports where a seed for generation should start, and whether one
-// is needed at all.
-func (s *Store) seedState(generation string) (after []byte, wanted bool, err error) {
+// seedState reports where a seed for generation should start, whether it is
+// making up for a run that queued nothing, and whether it is needed at all.
+func (s *Store) seedState(generation string) (after []byte, forced, wanted bool, err error) {
 	err = s.view(func(tx *bolt.Tx) error {
 		meta := tx.Bucket(bucketMeta)
-		if meta.Get(keyUnqueued) == nil && string(meta.Get(keySeeded)) == generation {
+		forced = meta.Get(keyUnqueued) != nil
+		if !forced && string(meta.Get(keySeeded)) == generation {
 			return nil
 		}
 		wanted = true
-		// A cursor from an interrupted seed is only good for the generation
-		// that wrote it.
+		// A cursor is only good for a walk asking the same question, which is
+		// what the stamp on it names. A walk made up of records an unqueued
+		// run left behind cannot pick up a cursor from an ordinary one: those
+		// records were written after that walk had passed their place in the
+		// keyspace, so resuming would step over the very hosts the marker is
+		// there to rescue and then clear the marker on the way out.
 		if at := meta.Get(keySeedAt); at != nil {
-			if gen, cursor, ok := bytes.Cut(at, []byte{0}); ok && string(gen) == generation {
+			if stamp, cursor, ok := bytes.Cut(at, []byte{0}); ok && string(stamp) == seedStamp(generation, forced) {
 				after = append([]byte{}, cursor...)
 			}
 		}
 		return nil
 	})
-	return after, wanted, err
+	return after, forced, wanted, err
 }
 
-// seedProgress encodes an in-flight seed's generation and cursor.
-func seedProgress(generation string, after []byte) []byte {
-	out := make([]byte, 0, len(generation)+1+len(after))
-	out = append(out, generation...)
+// seedStamp names what a cursor is good for: the policy being seeded, and
+// whether the walk that wrote it started from the top to collect what an
+// unqueued run had left behind. A forced walk resumes its own cursor, so
+// interrupting one still costs only the part it had not reached.
+func seedStamp(generation string, forced bool) string {
+	if forced {
+		return generation + " unqueued"
+	}
+	return generation
+}
+
+// seedProgress encodes an in-flight seed's stamp and cursor.
+func seedProgress(stamp string, after []byte) []byte {
+	out := make([]byte, 0, len(stamp)+1+len(after))
+	out = append(out, stamp...)
 	out = append(out, 0)
 	return append(out, after...)
 }

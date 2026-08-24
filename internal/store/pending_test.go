@@ -426,3 +426,105 @@ func TestSeedRunsAgainAfterAnUnqueuedRun(t *testing.T) {
 		t.Errorf("seed ran again with nothing asking for it (err %v)", err)
 	}
 }
+
+// seedTestHosts writes n unprobed records that sort in the order they are
+// numbered, and returns the due function a seed of them wants.
+func seedTestHosts(t *testing.T, db *Store, n int, seen time.Time) func(*Record) (time.Time, bool) {
+	t.Helper()
+	for i := 0; i < n; i++ {
+		host := fmt.Sprintf("h%03d.example", i)
+		err := db.Update(host, func(r *Record, _ bool) bool {
+			r.FirstSeen = seen
+			return true
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Due at FirstSeen, so queueing the same host twice writes the same key
+	// and a second walk over a record cannot duplicate its entry.
+	return func(r *Record) (time.Time, bool) { return r.FirstSeen, true }
+}
+
+// interruptSeed runs a seed that dies after the given number of chunks, the
+// way a killed process does: the chunks already committed stay, and so does
+// the cursor.
+func interruptSeed(db *Store, generation string, due func(*Record) (time.Time, bool), chunks int) {
+	defer func() { _ = recover() }()
+	n := 0
+	db.SeedPending(generation, due, func(int, int) {
+		if n++; n >= chunks {
+			panic(errors.New("killed"))
+		}
+	})
+}
+
+// A walk that makes up for an unqueued run has to start from the top. The
+// records it is looking for were written after an interrupted ordinary seed
+// had passed their place in the keyspace, so resuming that seed's cursor would
+// step over them — and the seed clears the marker on its way out, so they
+// would never be looked for again.
+func TestSeedForUnqueuedRunIgnoresAnOlderCursor(t *testing.T) {
+	db := openTemp(t)
+	defer func(orig int) { seedChunk = orig }(seedChunk)
+	seedChunk = 10
+
+	seen := time.Now().UTC().Add(-time.Hour)
+	due := seedTestHosts(t, db, 30, seen)
+	interruptSeed(db, "gen1", due, 2)
+
+	// The run with the sweep off: a record the interrupted walk is already
+	// past, and no queue entry for it.
+	err := db.Update("aaa.example", func(r *Record, _ bool) bool {
+		r.FirstSeen = seen
+		return true
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkUnqueued(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, ran, err := db.SeedPending("gen1", due, nil); err != nil || !ran {
+		t.Fatalf("seed did not run (ran=%v, err %v)", ran, err)
+	}
+	got, err := db.PendingLease(time.Now().UTC(), 100, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	queued := make(map[string]bool, len(got))
+	for _, p := range got {
+		queued[p.Host] = true
+	}
+	if !queued["aaa.example"] {
+		t.Errorf("queued %d hosts, none of them aaa.example: the walk resumed instead of restarting", len(got))
+	}
+	if len(queued) != 31 {
+		t.Errorf("queue holds %d hosts, want all 31 with no duplicates", len(queued))
+	}
+}
+
+// Restarting is only owed to a cursor from a different walk. A forced walk
+// interrupted part way through resumes its own, so a store that takes half a
+// minute to seed does not pay it again from the top.
+func TestSeedForUnqueuedRunResumesItsOwnWalk(t *testing.T) {
+	db := openTemp(t)
+	defer func(orig int) { seedChunk = orig }(seedChunk)
+	seedChunk = 10
+
+	due := seedTestHosts(t, db, 30, time.Now().UTC().Add(-time.Hour))
+	if err := db.MarkUnqueued(); err != nil {
+		t.Fatal(err)
+	}
+	interruptSeed(db, "gen1", due, 2)
+
+	scanned := 0
+	_, ran, err := db.SeedPending("gen1", due, func(s, _ int) { scanned = s })
+	if err != nil || !ran {
+		t.Fatalf("seed did not run (ran=%v, err %v)", ran, err)
+	}
+	if scanned > 10 {
+		t.Errorf("resumed seed scanned %d records, want only the 10 the first attempt had not reached", scanned)
+	}
+}
