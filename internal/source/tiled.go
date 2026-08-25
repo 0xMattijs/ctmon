@@ -88,6 +88,14 @@ var errTileMissing = errors.New("not published")
 // nothing else would report.
 const missesBeforeWarning = 5
 
+// waitsBeforeWarning is how many refusals in a row a log may send before the
+// waiting is worth saying out loud. It is missesBeforeWarning's argument
+// applied to the other quiet answer: below it the wait is the rate limit
+// working, above it the run is being turned away for a reason no amount of
+// waiting clears — a User-Agent the operator will not accept, a bucket this
+// run is too large for — and nothing else would report it.
+const waitsBeforeWarning = 5
+
 // throttled is a log asking to be left alone for a while, which is not the
 // same as a log that has failed and is worth telling apart from one.
 //
@@ -277,14 +285,24 @@ func (t *TiledLog) follow(ctx context.Context, lg Log, out chan<- Cert) error {
 	// behind and a log that is broken.
 	misses := 0
 
+	// waits counts refusals in a row. One 429 is the rate limit working; a run
+	// of them with nothing read in between is a log this run is not getting
+	// into, and waiting exactly as long as asked will not change that.
+	//
+	// What clears it is reading something, not being answered. Geomys answers
+	// checkpoints and turns tiles away, so a count cleared by a checkpoint
+	// would reset on every pass and never reach the warning while every tile
+	// the checkpoint described went unread.
+	waits := 0
+
 	for ctx.Err() == nil {
 		if err := limiter.Wait(ctx); err != nil {
 			return err
 		}
 		cp, err := t.checkpoint(ctx, hc, uri)
 		if refusal, sentAway := askedToWait(err); sentAway {
-			t.Log.Info("static ct log rate limited; waiting",
-				append([]any{"log", uri}, refusal.attrs()...)...)
+			waits++
+			t.turnedAway(waits, refusal, "log", uri)
 			if err := sleep(ctx, refusal.wait); err != nil {
 				return err
 			}
@@ -353,8 +371,8 @@ func (t *TiledLog) follow(ctx context.Context, lg Log, out chan<- Cert) error {
 				"position", pos, "tree_size", cp.Size)
 			body, err := t.fetchTile(ctx, hc, uri, path)
 			if refusal, sentAway := askedToWait(err); sentAway {
-				t.Log.Info("static ct log rate limited; waiting",
-					append([]any{"log", uri, "tile", path}, refusal.attrs()...)...)
+				waits++
+				t.turnedAway(waits, refusal, "log", uri, "tile", path)
 				if err := sleep(ctx, refusal.wait); err != nil {
 					return err
 				}
@@ -374,6 +392,7 @@ func (t *TiledLog) follow(ctx context.Context, lg Log, out chan<- Cert) error {
 				return fmt.Errorf("tile %s: %w", path, err)
 			}
 			misses = 0
+			waits = 0
 			entries, err := parseDataTile(body)
 			if err != nil {
 				return fmt.Errorf("tile %s: %w", path, err)
@@ -416,8 +435,11 @@ func (t *TiledLog) follow(ctx context.Context, lg Log, out chan<- Cert) error {
 		case stopped == caughtUp:
 			// Caught up, so whatever was missing has been served. Leaving the
 			// count standing would spend the next genuine race's fast re-check
-			// on a miss that is long over.
+			// on a miss that is long over. A log with nothing left to serve is
+			// not keeping anything from this run either, whatever it said on
+			// the way here, so the refusals stop counting too.
 			misses = 0
+			waits = 0
 		case stopped == wasThrottled:
 			// Already waited exactly as long as the log asked to be left for.
 			continue
@@ -430,6 +452,23 @@ func (t *TiledLog) follow(ctx context.Context, lg Log, out chan<- Cert) error {
 		}
 	}
 	return ctx.Err()
+}
+
+// turnedAway logs one refusal, and says so above INFO once a log has sent
+// waitsBeforeWarning of them in a row. what names the request that was turned
+// away, so the two callers need not agree on how a tile is spelled.
+//
+// The INFO line stays whatever the count is. A single wait is worth seeing —
+// it is the one place a log says why it refused — and a run that has been
+// waiting for minutes should not have to have been watched from the start for
+// the operator to know it.
+func (t *TiledLog) turnedAway(waits int, refusal *throttled, what ...any) {
+	line := append(what, refusal.attrs()...)
+	t.Log.Info("static ct log rate limited; waiting", line...)
+	if waits == waitsBeforeWarning {
+		t.Log.Warn("static ct log has refused every request since it last served one",
+			append(line[:len(line):len(line)], "waits", waits)...)
+	}
 }
 
 // stopReason is why the inner loop stopped, where that changes what happens

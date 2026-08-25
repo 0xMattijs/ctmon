@@ -697,3 +697,68 @@ func TestThrottleAttrsLeaveOutWhatWasNotSaid(t *testing.T) {
 		t.Errorf("a log that said something logs %v, want %v", spoke, want)
 	}
 }
+
+// TestTurnedAwayEscalatesARefusalThatNeverEnds is the throttled path catching
+// up with the missing-tile path beside it. missesBeforeWarning says a wait
+// that keeps repeating has stopped being the protocol working, and the
+// argument does not change when the answer is a 429 instead of a 404: the
+// counters read zero either way, and a run that has been turned away for
+// minutes is not something the operator should have to have been watching
+// from the start to know about.
+//
+// Once, not once per refusal. The line that repeats is the INFO one, which
+// carries what the log said and is the only place it says it.
+func TestTurnedAwayEscalatesARefusalThatNeverEnds(t *testing.T) {
+	var lines lockedBuffer
+	feed := &TiledLog{
+		Log: slog.New(slog.NewTextHandler(&lines, &slog.HandlerOptions{Level: slog.LevelInfo})),
+	}
+	refusal := &throttled{
+		wait:   30 * time.Second,
+		reason: "Please add an email address to your User-Agent.",
+	}
+	const refusals = waitsBeforeWarning + 3
+	for waits := 1; waits <= refusals; waits++ {
+		feed.turnedAway(waits, refusal, "log", "https://log.example", "tile", "tile/data/000")
+	}
+
+	got := lines.String()
+	if n := strings.Count(got, "rate limited; waiting"); n != refusals {
+		t.Errorf("logged %d waits over %d refusals, want one each:\n%s", n, refusals, got)
+	}
+	if n := strings.Count(got, "refused every request"); n != 1 {
+		t.Errorf("warned %d times over %d refusals, want once:\n%s", n, refusals, got)
+	}
+	for _, want := range []string{
+		"log=https://log.example", "tile=tile/data/000", "wait=30s", "email address",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("the lines never say %q:\n%s", want, got)
+		}
+	}
+}
+
+// TestTiledWarnsWhenEveryTileIsRefused is the same escalation reached the way
+// a run reaches it, which is the part a unit test cannot show. A log that
+// answers checkpoints and turns tiles away — which is exactly what Geomys does
+// to a User-Agent naming no contact — puts a successful request between every
+// pair of refusals. A count cleared by being answered would reset on each one
+// and never reach the warning, while every tile the checkpoint described went
+// unread.
+func TestTiledWarnsWhenEveryTileIsRefused(t *testing.T) {
+	log := &fakeTiled{leaves: tileOf(t, 100), throttle: 1 << 30}
+	uri := log.serve(t)
+
+	var lines lockedBuffer
+	feed := tiledOf(uri, newPositions())
+	feed.FromStart = true
+	feed.Log = slog.New(slog.NewTextHandler(&lines, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	runTiled(t, feed)
+
+	// Five refusals, and retryAfter floors every wait at a second however
+	// short the log asks for, so this cannot be hurried below about four
+	// seconds. The budget is the wait it needs and not the wait it takes.
+	waitUpTo(t, 30*time.Second, "a log that refuses every tile to be reported", func() bool {
+		return strings.Contains(lines.String(), "refused every request")
+	})
+}

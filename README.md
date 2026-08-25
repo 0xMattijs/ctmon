@@ -244,6 +244,50 @@ By default a newly seen log starts at its current tree head, so you get new
 certificates rather than history. Pass `--from-start` to backfill a log from
 index 0 — that is millions of entries per log, so use it deliberately.
 
+### When the firehose stops
+
+A websocket that is up is not the same as a feed that is delivering, and the
+public Calidog firehose has been measured doing the first and not the second:
+connected, answering pings, and sending no frames of any kind — not
+certificates, not heartbeats — for a whole run.
+
+The read deadline is meant to catch that, and it could not. It was reset by the
+pong handler, and the run pings every half of it, so the monitor's own liveness
+check held a silent connection open for as long as the far end kept answering.
+Only what the feed sends moves the deadline now, and it is armed before each
+read rather than after the last one — so it times how long the feed has kept
+the run waiting, and not how long the run spent on what the feed last sent.
+Those come apart whenever the store falls behind, and a feed must not be
+dropped for the store's backlog.
+
+A minute with nothing on the socket ends the connection, and the run says which
+of the two silences it was and whether anything was ever carried:
+
+```console
+WARN msg="certstream disconnected" err="connected and sent nothing for 1m0s" certs=0 ran=1m0s retry_in=1s
+WARN msg="certstream disconnected" err="went quiet for 1m0s" certs=412903 ran=3h14m0s retry_in=1s
+```
+
+A connection that carried nothing also does not count as a healthy run, so the
+reconnection delay climbs against an endpoint that will never deliver instead
+of resting at a second. That used to work out on its own, because the idle
+timeout and the threshold for a healthy run were both a minute; it should not
+depend on two unrelated constants staying equal.
+
+The line is drawn on what the feed sends as data, not on certificates. A
+firehose sending heartbeats and nothing else is a service that is up with
+nothing to report, and dropping it every minute would reconnect its way to the
+same silence. Two consequences worth knowing:
+
+- A server that kept a connection alive with websocket pings alone would be
+  dropped here every timeout, because a control frame is answered inside the
+  read without ending it. The firehose sends its heartbeats as JSON, so that is
+  a contract to check if it ever changes.
+- Telling a heartbeating feed that carries nothing from one that is simply
+  quiet needs a count of certificates per feed, and this run does not keep one:
+  `certs` is counted for the pipeline, so on `--source both` a single dead feed
+  still leaves a healthy total.
+
 ### Two kinds of log
 
 Google's v3 list carries two kinds of log per operator, and they are two
@@ -308,6 +352,20 @@ Three answers from a tiled log are not failures, and are not treated as any:
   ```
   INFO msg="static ct log rate limited; waiting" log=https://tuscolo2026h2.skylight.geomys.org
        tile=tile/data/x001/x849/572 wait=30s reason="Please add an email address to your User-Agent."
+  ```
+
+  A refusal that keeps coming back has stopped being a rate limit, so they are
+  counted the way missing tiles are: five in a row with nothing read in
+  between, and the run says so above INFO. The count is cleared by reading
+  something rather than by being answered — a log that serves checkpoints and
+  turns tiles away puts a successful request between every pair of refusals,
+  and a count those cleared would never reach the warning while the whole tree
+  went unread.
+
+  ```
+  WARN msg="static ct log has refused every request since it last served one"
+       log=https://tuscolo2026h2.skylight.geomys.org tile=tile/data/x001/x849/572
+       wait=30s reason="Please add an email address to your User-Agent." waits=5
   ```
 
 Anything else — a broken tile, a tile that reframes entries already read, an
@@ -1270,10 +1328,13 @@ The suite covers CN and SAN expansion, subdomain depth against the public
 suffix list, the suffix blocklist and parent cap, record round-trips through
 the packed codec, key reversal and range scans, migration from the old format,
 compaction, probe hashing (including the body cap and redirects), DNS caching
-and the resolver-health judgement, certstream message parsing, the Static CT
-wire format against two entries captured byte for byte off a real log, what a
-tiled reader does with a tile that is missing or a log that refuses to be read
-this fast, tree head and checkpoint signature verification — including the note
+and the resolver-health judgement, certstream message parsing, a firehose that
+connects and says nothing against one that is still sending heartbeats and one
+whose reader is blocked on a full pipeline,
+the Static CT wire format against two entries captured byte for byte off a real
+log, what a tiled reader does with a tile that is missing or a log that refuses
+to be read this fast — once, and for as long as the run lasts — tree head and
+checkpoint signature verification — including the note
 key id pinned against a live log's published key, a checkpoint carrying grease
 and witness lines around the log's own, and a follower stopping rather than
 retrying when one does not verify — what the pipeline does when the store
