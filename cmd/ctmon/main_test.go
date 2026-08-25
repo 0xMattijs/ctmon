@@ -165,6 +165,42 @@ func TestCountersWithoutFeedsIsJustThePipeline(t *testing.T) {
 	}
 }
 
+// TestStalledNeedsAStuckPipelineAndNotJustAFullChannel is the false negative
+// a live run found. The feeds outrun the pipeline on an ordinary busy minute,
+// so the channel between them sits full for most of it — and a watcher that
+// took that alone for a blocked run would never report anything.
+func TestStalledNeedsAStuckPipelineAndNotJustAFullChannel(t *testing.T) {
+	certs := make(chan source.Cert, 2)
+	stats := &pipeline.Stats{}
+	blocked := stalled(certs, stats)
+
+	certs <- source.Cert{}
+	certs <- source.Cert{} // full
+	stats.Certs.Add(100)
+	if blocked() {
+		t.Fatal("the first check reported a stall before it had anything to compare against")
+	}
+
+	// Full, and the pipeline read a further 500: feeds are taking turns.
+	stats.Certs.Add(500)
+	if blocked() {
+		t.Error("a full channel that the pipeline is draining was reported as a stall")
+	}
+
+	// Full, and the pipeline read nothing at all since the last check.
+	if !blocked() {
+		t.Error("a full channel the pipeline has stopped reading was not reported as a stall")
+	}
+
+	// Drained, and still not reading — nothing is parked in a send, so a feed
+	// with no movement has only itself to answer for.
+	<-certs
+	<-certs
+	if blocked() {
+		t.Error("an empty channel was reported as a stall")
+	}
+}
+
 func sourceNames(feeds []source.Source) []string {
 	names := make([]string, len(feeds))
 	for i, f := range feeds {

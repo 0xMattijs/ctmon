@@ -336,13 +336,29 @@ WARN msg="feed has gone quiet" source=ctlog certs=412903 quiet_for=3m0s
 
 Carrying again rearms it, so a feed that stops twice is reported twice, and a
 feed that is down for an afternoon still costs one line. Three checks is
-`missesBeforeWarning`'s argument in minutes: below it the quiet is certificate
-transparency having a slow minute, above it the feed has stopped.
+`missesBeforeWarning`'s argument in checks rather than requests: below it the
+quiet is certificate transparency having a slow minute, above it the feed has
+stopped. `quiet_for` is measured between the checks that saw it, not counted in
+intervals, so three checks across a machine that went to sleep report the hour
+they took.
 
-The check keeps a minute of its own rather than following `--report`. Which
-counter line you watch is a display preference, and a run watched on a
-terminal, or one with reporting turned off entirely, loses coverage the same
-way as one logging a line a minute.
+The check keeps a schedule of its own rather than following `--report`: which
+counter line you watch is a display preference, and a run watched on a terminal
+loses coverage the same way as one logging a line a minute. It is a minute, or
+two `--poll`s if that is longer. A follower that has caught up delivers a burst
+once per poll and nothing in between, so a check that outran the poll would
+find a healthy feed sitting at the same count, report it, be rearmed by the
+next burst, and report it again — once per poll for the life of the run, which
+is the opposite of saying it once.
+
+Two things it will not say. A run whose pipeline has stopped reading — a slow
+store, a full channel — blocks every feed inside a send at once, and the frozen
+counts that leaves are the pipeline's and not the feeds'. `ctmon` checks
+whether the channel between them is full before it believes any of them has
+gone quiet, which is the same care the idle timeout takes: a feed must not be
+blamed for the store's backlog. And a feed with nothing to deliver because the
+logs it follows are genuinely quiet reads no differently from a broken one —
+what is being reported is that coverage stopped, not why.
 
 ### Two kinds of log
 
@@ -1388,7 +1404,8 @@ and the resolver-health judgement, certstream message parsing, a firehose that
 connects and says nothing against one that is still sending heartbeats and one
 whose reader is blocked on a full pipeline, what each feed reports having
 carried against what arrived, a feed with nothing to show for three checks
-reported once and rearmed by carrying again,
+reported once and rearmed by carrying again, a check interval that outlasts
+`--poll`, and a blocked pipeline blamed on no feed at all,
 the Static CT wire format against two entries captured byte for byte off a real
 log, what a tiled reader does with a tile that is missing or a log that refuses
 to be read this fast — once, and for as long as the run lasts — tree head and

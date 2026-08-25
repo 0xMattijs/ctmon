@@ -194,7 +194,9 @@ func runCmd(args []string) error {
 	case cfg.output.report > 0:
 		go reportLoop(ctx, cfg.output.report, pipe, feeds, log)
 	}
-	go source.WatchFeeds(ctx, source.DefaultQuietCheck, log, feeds)
+	// A feed that has stopped carrying is watched for on its own schedule.
+	go source.WatchFeeds(ctx, source.QuietCheck(cfg.feed.poll), log, feeds,
+		stalled(certs, pipe.Stats()))
 
 	pipe.Run(ctx, certs)
 	if line != nil {
@@ -497,6 +499,27 @@ func reportLoop(ctx context.Context, every time.Duration, p *pipeline.Pipeline, 
 
 func logStats(p *pipeline.Pipeline, feeds []source.Source, log *slog.Logger, msg string) {
 	log.Info(msg, counters(p, feeds)...)
+}
+
+// stalled reports whether the run has stopped reading what its feeds hand it,
+// answering once per check and remembering the last answer.
+//
+// A full channel is not the test on its own, and measuring said so: the feeds
+// outrun the pipeline on an ordinary busy run, so the buffer sits full for
+// most of it and vetoing on that alone reports nothing, ever. What a blocked
+// run looks like is the buffer full *and* the pipeline reading none of it
+// between two checks — then every feed is parked inside a send, none of their
+// counts can move, and their silence is the store's and not theirs. While the
+// pipeline drains, a full buffer just means feeds are taking turns, and one
+// whose count never comes up is one that has stopped.
+func stalled(certs chan source.Cert, stats *pipeline.Stats) func() bool {
+	last := int64(-1)
+	return func() bool {
+		n := stats.Certs.Load()
+		stuck := len(certs) == cap(certs) && n == last
+		last = n
+		return stuck
+	}
 }
 
 // counters is what the pipeline has done, followed by what each feed has

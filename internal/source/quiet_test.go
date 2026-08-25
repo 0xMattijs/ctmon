@@ -30,13 +30,21 @@ func (f *scriptedFeed) Delivered() int64 {
 
 func (f *scriptedFeed) Run(context.Context, chan<- Cert) error { return nil }
 
-// ticks is n checks, already due. Closing the channel is what ends the loop,
-// so the watcher runs in the test's own goroutine and has finished with every
-// tick by the time it returns: no sleeping, and nothing to race with.
+// checkEvery is the interval the tests tick at, and testStart is when their
+// ticker is pretending to have started. The ticks carry real times because the
+// warning measures with them.
+const checkEvery = time.Minute
+
+var testStart = time.Date(2026, 8, 25, 8, 46, 0, 0, time.UTC)
+
+// ticks is n checks, already due, a checkEvery apart. Closing the channel is
+// what ends the loop, so the watcher runs in the test's own goroutine and has
+// finished with every tick by the time it returns: no sleeping, and nothing to
+// race with.
 func ticks(n int) <-chan time.Time {
 	c := make(chan time.Time, n)
-	for i := 0; i < n; i++ {
-		c <- time.Time{}
+	for i := 1; i <= n; i++ {
+		c <- testStart.Add(time.Duration(i) * checkEvery)
 	}
 	close(c)
 	return c
@@ -44,9 +52,14 @@ func ticks(n int) <-chan time.Time {
 
 // watched runs the watcher over n checks and returns what it said above INFO.
 func watched(n int, feeds ...Source) string {
+	return watchedWhile(n, nil, feeds...)
+}
+
+// watchedWhile is the same with a run that may not be reading.
+func watchedWhile(n int, blocked func() bool, feeds ...Source) string {
 	var lines bytes.Buffer
 	log := slog.New(slog.NewTextHandler(&lines, &slog.HandlerOptions{Level: slog.LevelWarn}))
-	watchFeeds(context.Background(), ticks(n), time.Minute, log, feeds)
+	watchFeeds(context.Background(), ticks(n), checkEvery, log, feeds, blocked)
 	return lines.String()
 }
 
@@ -139,11 +152,89 @@ func TestWatchFeedsStopsWithTheRun(t *testing.T) {
 		defer close(done)
 		WatchFeeds(ctx, time.Millisecond, slog.Default(), []Source{
 			&scriptedFeed{name: "certstream", counts: []int64{0}},
-		})
+		}, nil)
 	}()
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("the watcher outlived the run")
+	}
+}
+
+// TestWatchFeedsBlamesNoFeedForABlockedRun is the confusion certstream's idle
+// timeout already refuses to make. Every feed blocks in a send once the
+// channel between them and the pipeline fills, so a run held up by a slow
+// store freezes all of their counts at once — and reporting that as three
+// separate feeds failing would point at everything except the problem.
+func TestWatchFeedsBlamesNoFeedForABlockedRun(t *testing.T) {
+	feeds := []Source{
+		&scriptedFeed{name: "certstream", counts: []int64{5000}},
+		&scriptedFeed{name: "ctlog", counts: []int64{9000}},
+	}
+	full := func() bool { return true }
+	if out := watchedWhile(4*quietBeforeWarning, full, feeds...); out != "" {
+		t.Errorf("a pipeline that stopped reading was reported as the feeds failing: %q", out)
+	}
+}
+
+// TestWatchFeedsResumesWhenTheRunReadsAgain keeps the exemption from
+// swallowing the thing it is exempting. A feed that is quiet with an empty
+// channel is quiet on its own account, and the checks that found the run
+// blocked must not have counted against it either way.
+func TestWatchFeedsResumesWhenTheRunReadsAgain(t *testing.T) {
+	dead := &scriptedFeed{name: "certstream", counts: []int64{0}}
+	blocked := 0
+	// Full for the first two checks, drained for every one after them.
+	full := func() bool { blocked++; return blocked <= 2 }
+
+	out := watchedWhile(2+quietBeforeWarning, full, dead)
+	if !strings.Contains(out, "carried nothing") {
+		t.Errorf("a dead feed went unreported after the run caught up: %q", out)
+	}
+}
+
+// TestWatchFeedsMeasuresTheSilenceItSaw pins the elapsed figure to the ticks
+// rather than to the interval it was configured with. A ticker drops ticks
+// when the machine is busy or asleep, and three checks are worth however long
+// they actually took.
+func TestWatchFeedsMeasuresTheSilenceItSaw(t *testing.T) {
+	dead := &scriptedFeed{name: "certstream", counts: []int64{0}}
+
+	var lines bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&lines, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	// Three checks, but the machine was asleep across the last gap.
+	c := make(chan time.Time, 3)
+	c <- testStart.Add(checkEvery)
+	c <- testStart.Add(2 * checkEvery)
+	c <- testStart.Add(time.Hour)
+	close(c)
+	watchFeeds(context.Background(), c, checkEvery, log, []Source{dead}, nil)
+
+	if out := lines.String(); !strings.Contains(out, "quiet_for=1h0m0s") {
+		t.Errorf("the warning reports the interval it was configured with, not the silence it saw: %q", out)
+	}
+}
+
+// TestQuietCheckOutlastsThePoll is the false positive --poll used to cause. A
+// follower that has caught up delivers a burst per poll and nothing between
+// them, so a check that outruns the poll finds a healthy feed at the same
+// count and reports it, once per poll, forever.
+func TestQuietCheckOutlastsThePoll(t *testing.T) {
+	cases := []struct {
+		poll time.Duration
+		want time.Duration
+	}{
+		{30 * time.Second, DefaultQuietCheck}, // the default, unchanged
+		{0, DefaultQuietCheck},                // a feed with no poll at all
+		{time.Minute, 2 * time.Minute},
+		{5 * time.Minute, 10 * time.Minute},
+	}
+	for _, c := range cases {
+		if got := QuietCheck(c.poll); got != c.want {
+			t.Errorf("QuietCheck(%v) = %v, want %v", c.poll, got, c.want)
+		}
+		if c.poll > 0 && QuietCheck(c.poll) <= c.poll {
+			t.Errorf("QuietCheck(%v) does not outlast the poll it is watching", c.poll)
+		}
 	}
 }
