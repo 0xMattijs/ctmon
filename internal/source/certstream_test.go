@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -267,8 +268,125 @@ func TestCertstreamDropsAFeedThatSaysNothing(t *testing.T) {
 	waitFor(t, "a silent firehose to be dropped and dialled again", func() bool {
 		return conns() >= 2
 	})
-	if got := lines.String(); !strings.Contains(got, "sent nothing") {
+	if got := lines.String(); !strings.Contains(got, "connected and sent nothing") {
 		t.Errorf("the run reports a dropped socket rather than a quiet feed:\n%s", got)
+	}
+}
+
+// TestSilentConnectionsClimbTheBackoffLadder is the ladder not resting on a
+// coincidence. retry.after puts the delay back to base after a run that lasted
+// healthyRun — a minute — and a connection ended by the default idle timeout
+// has been up for exactly that, so every such failure scored as a healthy run
+// and an endpoint that will never say anything was redialled at the base delay
+// forever. Nothing pins the two constants to each other, and IdleTimeout is a
+// field: at 30s the ladder is climbed and at 90s it is not, for no reason
+// visible at either line.
+//
+// This cannot be reached through a socket at test speed — it needs a
+// connection that stays up for longer than healthyRun, which is a minute — so
+// it is pinned on the decision itself.
+func TestSilentConnectionsClimbTheBackoffLadder(t *testing.T) {
+	// Longer than healthyRun, which is what makes this the interesting case.
+	const upFor = 90 * time.Second
+
+	silent := retry{base: time.Second, max: 2 * time.Minute}
+	var got []time.Duration
+	for i := 0; i < 3; i++ {
+		got = append(got, silent.after(scoreRun(upFor, 0)))
+	}
+	want := []time.Duration{time.Second, 2 * time.Second, 4 * time.Second}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("a feed that has never delivered is redialled after %v, want %v", got, want)
+	}
+
+	// The other half: a connection that carried something and stayed up is
+	// the healthy run this is careful not to punish.
+	carrying := retry{base: time.Second, max: 2 * time.Minute}
+	for i := 0; i < 3; i++ {
+		if d := carrying.after(scoreRun(upFor, 1)); d != time.Second {
+			t.Errorf("a feed that delivered for %v waits %v before reconnecting, want the base delay", upFor, d)
+		}
+	}
+}
+
+// TestCertstreamKeepsAFeedThroughABlockedPipeline pins the deadline to what it
+// is for. It bounds how long the feed may keep this run waiting, not how long
+// this run takes over what the feed last sent, and those come apart whenever
+// the store falls behind: send() parks until the pipeline takes the
+// certificate, and a feed must not be dropped for the store's backlog.
+//
+// It passed before the deadline was moved ahead of the read, and the reason is
+// worth knowing rather than trusting: a chatty feed fills the socket buffer
+// while the reader is parked, so the reads that follow are served locally and
+// re-arm the deadline before one of them ever reaches the network. What that
+// leaves is narrow — a stall past the timeout with nothing buffered behind it,
+// costing one instant redial — and it is not what this pins. This pins the
+// property, which is now true by construction instead of true by buffering.
+func TestCertstreamKeepsAFeedThroughABlockedPipeline(t *testing.T) {
+	url, dialled := chattyWSServer(t)
+
+	cs := &Certstream{
+		URL:         url,
+		IdleTimeout: 150 * time.Millisecond,
+		Log:         slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError})),
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	// An unbuffered channel nobody reads is the store at its worst: the first
+	// certificate parks the feed for as long as the test cares to hold it.
+	out := make(chan Cert)
+	go cs.Run(ctx, out)
+
+	select {
+	case <-out:
+	case <-ctx.Done():
+		t.Fatal("no certificate arrived")
+	}
+	// Several idle timeouts spent blocked on the pipeline, not on the feed.
+	time.Sleep(750 * time.Millisecond)
+	select {
+	case <-out:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the feed did not resume after the pipeline unblocked")
+	}
+	cancel()
+
+	if n := dialled(); n != 1 {
+		t.Errorf("dialled %d times while the pipeline was blocked, want once", n)
+	}
+}
+
+// chattyWSServer sends certificate updates as fast as the client reads them,
+// which is what a firehose does and what a blocked reader stops it doing.
+func chattyWSServer(t *testing.T) (url string, dialled func() int) {
+	t.Helper()
+	var (
+		mu sync.Mutex
+		n  int
+	)
+	up := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := up.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		mu.Lock()
+		n++
+		mu.Unlock()
+		for {
+			if err := conn.WriteMessage(websocket.TextMessage, []byte(sampleUpdate)); err != nil {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return "ws" + strings.TrimPrefix(srv.URL, "http"), func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return n
 	}
 }
 

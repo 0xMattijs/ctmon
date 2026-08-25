@@ -755,7 +755,10 @@ func TestTiledWarnsWhenEveryTileIsRefused(t *testing.T) {
 	feed.Log = slog.New(slog.NewTextHandler(&lines, &slog.HandlerOptions{Level: slog.LevelWarn}))
 	runTiled(t, feed)
 
-	waitFor(t, "a log that refuses every tile to be reported", func() bool {
+	// Five refusals, and retryAfter floors every wait at a second however
+	// short the log asks for, so this cannot be hurried below about four
+	// seconds. The budget is the wait it needs and not the wait it takes.
+	waitUpTo(t, 30*time.Second, "a log that refuses every tile to be reported", func() bool {
 		return strings.Contains(lines.String(), "refused every request")
 	})
 }

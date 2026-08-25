@@ -308,7 +308,17 @@ func TestRetryCapsTheDelay(t *testing.T) {
 // waitFor polls cond until it holds, and fails the test if it never does.
 func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Helper()
-	deadline := time.After(10 * time.Second)
+	waitUpTo(t, 10*time.Second, what, cond)
+}
+
+// waitUpTo is waitFor with the budget spelled out, for the few conditions that
+// cannot be reached inside the default one. A test whose subject waits out
+// several real refusals is not slow because anything is wrong with it, and
+// giving it the default budget makes it fail on a loaded machine for the one
+// reason that says nothing.
+func waitUpTo(t *testing.T, budget time.Duration, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.After(budget)
 	for !cond() {
 		select {
 		case <-deadline:
