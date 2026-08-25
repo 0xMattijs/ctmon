@@ -1,0 +1,12 @@
+# Built binaries, not paths: a bare "ctmon" also matches cmd/ctmon/.
+/ctmon
+/ctmon.exe
+/main
+
+# Databases, including the scratch copies the compact and migrate commands write.
+*.db
+*.db.packed
+*.db.compact
+*.db.compacting
+*.db.snap
+*.db.snap.writing

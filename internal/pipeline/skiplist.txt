@@ -1,0 +1,34 @@
+# Parent domains to drop, one per line. Use with:
+#   ctmon run --skip-suffix-file skip-suffixes.example.txt
+#
+# These are hosting platforms that mint tenant hostnames in bulk. Every name
+# under them is depth 1 and structurally identical to a real discovery, so
+# --max-depth cannot tell them apart. Observed in a one-minute live sample;
+# tune to taste.
+#
+# An entry drops the parent itself as well as everything under it, so the
+# vendors' own sites go with their tenants. That is the intent here: none of
+# these are what you are hunting for.
+
+# Application hosting
+workers.dev
+pages.dev
+vercel.app
+netlify.app
+herokuapp.com
+azurewebsites.net
+cloudfront.net
+r2.cloudflarestorage.com
+
+# Site builders and SaaS tenants
+chatgpt.site
+zendesk.com
+myshopify.com
+squarespace.com
+wixsite.com
+
+# Device and remote-access vendors
+quickconnect.to
+plex.direct
+devices.meraki.direct
+mcas.ms
