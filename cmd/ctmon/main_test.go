@@ -3,14 +3,19 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"flag"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/google/certificate-transparency-go/loglist3"
 
 	"github.com/mvo/ct/internal/pipeline"
 	"github.com/mvo/ct/internal/source"
@@ -485,4 +490,80 @@ func TestBuildSourcesFollowsNamedLogsWithoutAKey(t *testing.T) {
 			t.Errorf("nothing warned that %s logs are not checked; logged:\n%s", flag, lines.String())
 		}
 	}
+}
+
+// halfAList serves a log list carrying only one of the two kinds of log, the
+// way a mirror, a filtered list, or the end of the RFC 6962 era would.
+func halfAList(t *testing.T, rfc6962, tiled bool) string {
+	t.Helper()
+	now := time.Now()
+	start, end := now.Add(-60*24*time.Hour), now.Add(130*24*time.Hour)
+	op := &loglist3.Operator{Name: "Half"}
+	if rfc6962 {
+		op.Logs = []*loglist3.Log{{
+			URL:              "https://ct.example/half/",
+			State:            &loglist3.LogStates{Usable: &loglist3.LogState{}},
+			TemporalInterval: &loglist3.TemporalInterval{StartInclusive: start, EndExclusive: end},
+		}}
+	}
+	if tiled {
+		op.TiledLogs = []*loglist3.TiledLog{{
+			MonitoringURL:    "https://mon.ct.example/half/",
+			SubmissionURL:    "https://submit.ct.example/half/",
+			State:            &loglist3.LogStates{Usable: &loglist3.LogState{}},
+			TemporalInterval: &loglist3.TemporalInterval{StartInclusive: start, EndExclusive: end},
+		}}
+	}
+	body, err := json.Marshal(&loglist3.LogList{Operators: []*loglist3.Operator{op}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(body)
+	}))
+	t.Cleanup(srv.Close)
+	return srv.URL
+}
+
+// The default names both halves of the list, so a list carrying only one kind
+// must not become a startup error: a run that can read half the logs should
+// read that half rather than none. The half that is missing is warned about,
+// not fatal -- but a run whose only selected reader has nothing to read still
+// fails, because then there is no feed at all.
+func TestBuildSourcesToleratesAnEmptyHalfOfTheList(t *testing.T) {
+	cases := []struct {
+		name           string
+		sources        string
+		rfc6962, tiled bool
+		want           []string
+	}{
+		{"default on a tiled-only list", defaultSources, false, true, []string{"tiled"}},
+		{"default on an rfc6962-only list", defaultSources, true, false, []string{"ctlog"}},
+		{"default on a whole list", defaultSources, true, true, []string{"ctlog", "tiled"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			cfg := feedConfig{sources: c.sources, listURL: halfAList(t, c.rfc6962, c.tiled)}
+			feeds, err := buildSources(cfg, "ua", nil, discardLogger(), nil)
+			if err != nil {
+				t.Fatalf("buildSources: %v", err)
+			}
+			if got := sourceNames(feeds); strings.Join(got, ",") != strings.Join(c.want, ",") {
+				t.Errorf("feeds = %q, want %q", got, c.want)
+			}
+		})
+	}
+
+	// Asking for one reader by name and giving it nothing to read is still an
+	// error: there is no other half to fall back to.
+	t.Run("tiled alone on an rfc6962-only list", func(t *testing.T) {
+		cfg := feedConfig{sources: "tiled", listURL: halfAList(t, true, false)}
+		feeds, err := buildSources(cfg, "ua", nil, discardLogger(), nil)
+		if err == nil {
+			t.Fatalf("buildSources = %q, want an error", sourceNames(feeds))
+		}
+		if !strings.Contains(err.Error(), "Static CT API") {
+			t.Errorf("error %q does not name the half that was empty", err)
+		}
+	})
 }

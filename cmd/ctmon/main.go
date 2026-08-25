@@ -295,50 +295,74 @@ func buildSources(cfg feedConfig, userAgent string, db *store.Store, log *slog.L
 			URL: cfg.certURL, UserAgent: userAgent, Dial: dial, Log: log,
 		})
 	}
+	// A half of the list with nothing usable on it is not by itself a reason to
+	// refuse to start. DiscoverLogs already takes that view -- an empty side is
+	// not an error there -- and the default now names both halves, so a list
+	// carrying only one kind would otherwise turn a run that can read half the
+	// logs into a run that reads none. That is not hypothetical in either
+	// direction: a mirrored or filtered list may carry no Static CT logs, and
+	// the RFC 6962 half is the one this file expects to empty out first. So an
+	// empty half is said out loud and its reader is left out, and a run that
+	// ends up with no feed at all still fails, naming the halves that were
+	// empty.
+	var empty []string
+
 	if want["ctlog"] {
 		logs, refresh := namedLogs(splitList(cfg.logURIs), "--logs", log), (func(context.Context) ([]source.Log, error))(nil)
 		if len(logs) == 0 {
-			if logs = found.RFC6962; len(logs) == 0 {
-				return nil, errors.New("the log list has no usable RFC 6962 logs accepting certificates now")
-			}
+			logs = found.RFC6962
 			refresh = eachRefresh(discover, func(s source.LogSet) []source.Log { return s.RFC6962 })
 		}
-		feeds = append(feeds, &source.CTLog{
-			Logs:              logs,
-			Positions:         db,
-			FromStart:         cfg.fromStart,
-			BatchSize:         cfg.batch,
-			MaxLag:            cfg.maxLag,
-			PollInterval:      cfg.poll,
-			RequestsPerSecond: cfg.rps,
-			UserAgent:         userAgent,
-			DialContext:       dial,
-			Discover:          refresh,
-			RefreshInterval:   cfg.logRefresh,
-			Log:               log,
-		})
+		if len(logs) == 0 {
+			log.Warn("the log list has no usable RFC 6962 logs accepting certificates now",
+				"source", "ctlog")
+			empty = append(empty, "RFC 6962")
+		} else {
+			feeds = append(feeds, &source.CTLog{
+				Logs:              logs,
+				Positions:         db,
+				FromStart:         cfg.fromStart,
+				BatchSize:         cfg.batch,
+				MaxLag:            cfg.maxLag,
+				PollInterval:      cfg.poll,
+				RequestsPerSecond: cfg.rps,
+				UserAgent:         userAgent,
+				DialContext:       dial,
+				Discover:          refresh,
+				RefreshInterval:   cfg.logRefresh,
+				Log:               log,
+			})
+		}
 	}
 	if want["tiled"] {
 		logs, refresh := namedLogs(splitList(cfg.tiledURIs), "--tiled-logs", log), (func(context.Context) ([]source.Log, error))(nil)
 		if len(logs) == 0 {
-			if logs = found.Tiled; len(logs) == 0 {
-				return nil, errors.New("the log list has no usable Static CT API logs accepting certificates now")
-			}
+			logs = found.Tiled
 			refresh = eachRefresh(discover, func(s source.LogSet) []source.Log { return s.Tiled })
 		}
-		feeds = append(feeds, &source.TiledLog{
-			Logs:              logs,
-			Positions:         db,
-			FromStart:         cfg.fromStart,
-			MaxLag:            cfg.maxLag,
-			PollInterval:      cfg.poll,
-			RequestsPerSecond: cfg.rps,
-			UserAgent:         userAgent,
-			DialContext:       dial,
-			Discover:          refresh,
-			RefreshInterval:   cfg.logRefresh,
-			Log:               log,
-		})
+		if len(logs) == 0 {
+			log.Warn("the log list has no usable Static CT API logs accepting certificates now",
+				"source", "tiled")
+			empty = append(empty, "Static CT API")
+		} else {
+			feeds = append(feeds, &source.TiledLog{
+				Logs:              logs,
+				Positions:         db,
+				FromStart:         cfg.fromStart,
+				MaxLag:            cfg.maxLag,
+				PollInterval:      cfg.poll,
+				RequestsPerSecond: cfg.rps,
+				UserAgent:         userAgent,
+				DialContext:       dial,
+				Discover:          refresh,
+				RefreshInterval:   cfg.logRefresh,
+				Log:               log,
+			})
+		}
+	}
+	if len(feeds) == 0 {
+		return nil, fmt.Errorf("the log list has no usable %s logs accepting certificates now",
+			strings.Join(empty, " or "))
 	}
 	return feeds, nil
 }

@@ -257,6 +257,18 @@ So the default now reads both halves of the list and spends no connection on
 the firehose. Add it back with `--source all` — it costs one connection, and
 if it is carrying again you will see `from_certstream` say so.
 
+That is more requests than the old default made, and it is fair to say so
+plainly: `--log-rps` is per log, so a default run goes from the 17 RFC 6962
+logs above to those plus 11 tiled ones, in exchange for a websocket that was
+costing one connection and delivering nothing. A run that wants the old
+request load and not the old silence is `--source ctlog`. One that pins
+`--logs` should know the other half is still discovered — pin `--tiled-logs`
+too, or narrow `--source`, if a run is meant to touch only the logs it names.
+
+A list carrying only one kind of log is not an error. The half that is empty is
+warned about and its reader is left out, and only a run left with no feed at
+all fails.
+
 By default a newly seen log starts at its current tree head, so you get new
 certificates rather than history. Pass `--from-start` to backfill a log from
 index 0 — that is millions of entries per log, so use it deliberately.
@@ -567,19 +579,22 @@ Logs are sharded by time, and most operators roll over every half year. A run
 that discovered its logs at startup and never looked again outlives them: at a
 boundary the whole set stops accepting certificates at once, and the monitor
 keeps politely polling shards nobody writes to while missing the ones that
-replaced them. The sign is `from_ctlog` going quiet while nothing else in the
-output changes, and a feed that has carried nothing for three checks says so.
+replaced them. The sign is the per-feed counters going quiet — both of them on
+the default, since both halves cross the boundary together — and a feed that
+has carried nothing for three checks says so.
 
-A second feed reading the same certificates by another route covers part of the
-gap in the meantime, and on today's default that second feed is `tiled`. The
-two halves of the list are different logs run by different operators, so they
-do not roll over together, and Chrome's policy has every certificate in more
-than one log — so a rollover on one half leaves the other half still carrying
-much of what the stalled half stopped delivering. That is a likelihood, not a
-guarantee, and it is not a reason to lengthen `--log-refresh`. It used to be
-the argument for `--source both`, and there it no longer holds at all: the
-firehose that pairs with `ctlog` there has been measured delivering nothing
-(below), so a rollover on `both` takes the whole run quiet.
+No feed covers another through a rollover, and the default's two do not cover
+each other. Both halves of the list are sharded on the same calendar —
+`argon2027h1` and `tuscolo2027h1` open on the same day, RFC 6962 and tiled
+alike — so a boundary reaches both readers at the same instant. The one feed
+that never picked shards is the firehose, and it is delivering nothing (below).
+That used to be the argument for `--source both`, and it has not held for a
+while.
+
+What actually carries a run across a boundary is the lookahead, not a second
+feed: at the default window the successor shard is followed for months before
+the old one closes, so the run is already reading it when the rollover comes.
+Re-reading the list is what catches the shards stood up after the run began.
 
 So the list is re-read every `--log-refresh` (24h by default, `0` disables) and
 the followers are brought in line with it: a log the list has added gets one, a
@@ -758,15 +773,16 @@ quiet hour otherwise. Anything but zero there means discoveries are being
 dropped.
 
 The feeds also repeat themselves — Chrome's policy has every certificate in
-more than one log, so the default's two readers hand over the same certificate
-twice, and packed certificates re-list the same names — so a set of the last
-`--recent-hosts` hostnames (default 50,000) squashes repeats before they cost a
-store read. This is why the two repetition
-counters read the way they do: a name the set still remembers counts as `dup`
-and stops there, and only a name it has forgotten reaches the store and counts
-as `repeat`. On a short run the set swallows nearly everything, so `repeat`
-sits at zero until the set has cycled — at live rates, a few minutes in. Lower
-`--recent-hosts` to trade memory for store reads.
+logs run by two different operators, so the same certificate arrives more than
+once whether one reader finds both copies or the two split them, and packed
+certificates re-list the same names — so a set of the last `--recent-hosts`
+hostnames (default 50,000) squashes repeats before they cost a store read. This
+is why the two repetition counters read the way they do: a name the set still
+remembers counts as `dup` and stops there, and only a name it has forgotten
+reaches the store and counts as `repeat`. On a short run the set swallows
+nearly everything, so `repeat` sits at zero until the set has cycled — at live
+rates, a few minutes in. Lower `--recent-hosts` to trade memory for store
+reads.
 
 ## Probing behavior
 
@@ -876,9 +892,9 @@ stopping altogether while the probers carry on. That shared resolver is
 `internal/resolve`, built once at startup and handed to both, so neither owns
 the thing they depend on equally.
 
-Both feeds go through it — the log poller and the certstream websocket, which
-re-resolves the firehose on every reconnect and is therefore exactly the wrong
-thing to leave on a starved resolver.
+Every feed goes through it — both log readers, and the certstream websocket,
+which re-resolves the firehose on every reconnect and is therefore exactly the
+wrong thing to leave on a starved resolver.
 
 The feeds and the probes dial it differently. A probe may only reach a public
 address, because anyone can have a certificate issued for a name pointing at

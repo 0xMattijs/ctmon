@@ -62,11 +62,16 @@ var defaultUserAgent = "ctmon/1.0 (+https://github.com/0xMattijs/ctmon)"
 // 2026-08-25 -- while the tiled half of the log list carries about as many
 // certificates as the RFC 6962 half and went unread unless asked for by name.
 //
-// Neither half of that is permanent. A firehose that is down today may carry
-// again, and the argument for putting it back in the default is that it costs
-// one connection; the argument against widening this further is the one that
-// kept "both" narrow, that a default should not double anyone's request load
-// without being asked. Both are worth re-measuring, not assuming.
+// This is not free, and the argument that kept "both" narrow -- that a default
+// should not enlarge anyone's request load unasked -- applies to it too. It
+// costs the tiled half's logs, roughly eleven more against today's list, since
+// --log-rps is per log; what it stops paying is a websocket connection that
+// was delivering nothing. A run wanting the old load without the old silence
+// is --source ctlog.
+//
+// Neither half of the measurement is permanent. A firehose that is down today
+// may carry again, and putting it back in the default costs one connection.
+// Both are worth re-measuring, not assuming.
 const defaultSources = "ctlog,tiled"
 
 // feedConfig selects and paces the certificate sources.
