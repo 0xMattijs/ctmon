@@ -240,6 +240,12 @@ Run one with `--source certstream`, or several with a comma-separated list.
 means what it meant then — `certstream,ctlog` — because widening it would
 double the request load of every existing run without anyone asking.
 
+That leaves the default worth a word of warning: the firehose half of it has
+been carrying nothing since at least 2026-08-24 (below), so `--source both` is
+in practice `--source ctlog`, and the 11 tiled logs on today's list go unread
+unless you ask for them by name. A run that wants the coverage the default
+reads as offering wants `--source ctlog,tiled`, or `all` for the firehose too.
+
 By default a newly seen log starts at its current tree head, so you get new
 certificates rather than history. Pass `--from-start` to backfill a log from
 index 0 — that is millions of entries per log, so use it deliberately.
@@ -249,7 +255,11 @@ index 0 — that is millions of entries per log, so use it deliberately.
 A websocket that is up is not the same as a feed that is delivering, and the
 public Calidog firehose has been measured doing the first and not the second:
 connected, answering pings, and sending no frames of any kind — not
-certificates, not heartbeats — for a whole run.
+certificates, not heartbeats — for a whole run. Measured on 2026-08-24 and
+again on 2026-08-25, both times against a plain `websockets` client as well, so
+it is the endpoint and not this reader: 45 seconds, zero frames, both days.
+Nothing here assumes that lasts — a firehose that is down today may be up next
+week — but nothing in this file assumes it is carrying either.
 
 The read deadline is meant to catch that, and it could not. It was reset by the
 pong handler, and the run pings every half of it, so the monitor's own liveness
@@ -546,8 +556,14 @@ Logs are sharded by time, and most operators roll over every half year. A run
 that discovered its logs at startup and never looked again outlives them: at a
 boundary the whole set stops accepting certificates at once, and the monitor
 keeps politely polling shards nobody writes to while missing the ones that
-replaced them. With `--source both` the firehose covers for it, so the only
-sign is the `ctlog` share of the counters going quiet.
+replaced them. The sign is `from_ctlog` going quiet while nothing else in the
+output changes, and a feed that has carried nothing for three checks says so.
+
+A second feed reading the same certificates by another route would cover the
+gap in the meantime, and that used to be the argument for `--source both`. It
+is not one now: the firehose the default pairs with `ctlog` has been measured
+delivering nothing (below), so a rollover on the default takes the whole run
+quiet until the list is re-read, not half of it.
 
 So the list is re-read every `--log-refresh` (24h by default, `0` disables) and
 the followers are brought in line with it: a log the list has added gets one, a
@@ -598,9 +614,13 @@ shrink it loses certificates.
 The real cost is that it roughly doubles the request load of `--source ctlog`,
 which is what the flag is there for. `--log-lookahead 0` asks for no lookahead
 and follows only the shards open now — the old behaviour, at half the requests.
-That is a reasonable trade on `--source both`, where the firehose still carries
-what the successor shard is being sent, and a bad one on `--source ctlog`
-alone, where nothing else is watching it.
+It is a trade worth making only where something else is reading the successor
+shard, and on today's feeds nothing is. The same window judges tiled shards, so
+`--source ctlog,tiled` stops watching that shard on both readers at once, and
+the one feed that never chose shards to begin with is the firehose that is
+currently delivering nothing. Until it carries again, `--log-lookahead 0` loses
+the certificates being written to the shard ahead of the clock on every
+`--source` there is.
 
 ### When a log goes bad
 

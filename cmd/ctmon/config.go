@@ -73,8 +73,12 @@ type feedConfig struct {
 	// expiry — up to a maximum validity period ahead of the clock.
 	//
 	// Zero follows only the shards open now, which is what the feed used to do
-	// and roughly halves its requests. It is a real choice for a run on
-	// --source both, where the firehose covers the shard this stops watching.
+	// and roughly halves its requests. It costs the shard certificates are
+	// actually landing in unless something else is reading it, and the only
+	// feed that does not pick shards is the firehose -- the same window judges
+	// tiled shards, so --source ctlog,tiled stops watching that shard twice
+	// over. With the public firehose delivering nothing, zero loses
+	// certificates on every --source there is.
 	logLookahead time.Duration
 	fromStart    bool
 	batch        int
