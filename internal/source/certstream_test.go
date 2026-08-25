@@ -207,3 +207,115 @@ func TestCertstreamDialsThroughTheSuppliedDialer(t *testing.T) {
 		t.Error("certstream connected without using the dialer it was given")
 	}
 }
+
+// silentWSServer accepts websocket connections, answers pings, and never says
+// anything of its own. It is the public firehose as measured in August 2026: a
+// handshake that succeeds and then no frames at all.
+func silentWSServer(t *testing.T) (url string, conns func() int) {
+	t.Helper()
+	var (
+		mu sync.Mutex
+		n  int
+	)
+	up := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := up.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		mu.Lock()
+		n++
+		mu.Unlock()
+		// Reading is what sends the pongs: gorilla answers a ping from
+		// inside ReadMessage, so a server that never reads is silent in a
+		// second way this test is not about.
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return "ws" + strings.TrimPrefix(srv.URL, "http"), func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return n
+	}
+}
+
+// TestCertstreamDropsAFeedThatSaysNothing is the failure the run could not
+// see. The firehose held a connection open for an entire measured run while
+// sending no frames of any kind, and the deadline meant to catch that was
+// reset by the pong handler on every keepalive the run itself sent — so the
+// monitor's own liveness check kept a dead feed alive. Nothing is worth
+// staying connected to a feed that is delivering nothing for, and the only
+// place a socket that is technically fine can go is round again.
+func TestCertstreamDropsAFeedThatSaysNothing(t *testing.T) {
+	url, conns := silentWSServer(t)
+
+	var lines lockedBuffer
+	cs := &Certstream{
+		URL:         url,
+		IdleTimeout: 200 * time.Millisecond,
+		Log:         slog.New(slog.NewTextHandler(&lines, &slog.HandlerOptions{Level: slog.LevelWarn})),
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	go cs.Run(ctx, make(chan Cert, 1))
+
+	waitFor(t, "a silent firehose to be dropped and dialled again", func() bool {
+		return conns() >= 2
+	})
+	if got := lines.String(); !strings.Contains(got, "sent nothing") {
+		t.Errorf("the run reports a dropped socket rather than a quiet feed:\n%s", got)
+	}
+}
+
+// TestCertstreamKeepsAConnectionThatIsStillTalking draws the line the deadline
+// is actually on, which is frames and not certificates. A firehose sending
+// heartbeats is a service that is up and has nothing to report, and dropping
+// it every minute would reconnect its way to the same silence. Telling that
+// apart from a feed that has quietly stopped carrying needs a count of
+// certificates per feed, which the run does not keep yet.
+func TestCertstreamKeepsAConnectionThatIsStillTalking(t *testing.T) {
+	var (
+		mu sync.Mutex
+		n  int
+	)
+	up := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := up.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		mu.Lock()
+		n++
+		mu.Unlock()
+		for {
+			if err := conn.WriteMessage(websocket.TextMessage, []byte(sampleHeartbeat)); err != nil {
+				return
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	cs := &Certstream{
+		URL:         "ws" + strings.TrimPrefix(srv.URL, "http"),
+		IdleTimeout: 300 * time.Millisecond,
+		Log:         slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError})),
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	go cs.Run(ctx, make(chan Cert, 1))
+
+	time.Sleep(1500 * time.Millisecond)
+	cancel()
+	mu.Lock()
+	defer mu.Unlock()
+	if n != 1 {
+		t.Errorf("dialled %d times over five idle timeouts of heartbeats, want once", n)
+	}
+}

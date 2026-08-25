@@ -3,6 +3,7 @@ package source
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -15,6 +16,12 @@ import (
 // DefaultCertstreamURL is the public Calidog firehose.
 const DefaultCertstreamURL = "wss://certstream.calidog.io/"
 
+// DefaultCertstreamIdle is how long a connection may go without a frame
+// before it is treated as one that has stopped carrying. The feed aggregates
+// every log there is, and a whole second without a certificate on it is
+// already unusual, so a minute is generous by two orders of magnitude.
+const DefaultCertstreamIdle = 60 * time.Second
+
 // Certstream reads an aggregated CT firehose over a websocket. It is the
 // quickest feed to get running, at the cost of depending on a third party.
 type Certstream struct {
@@ -26,7 +33,18 @@ type Certstream struct {
 	// resolves the firehose again — through a system resolver that a run
 	// probing hard enough has already starved.
 	Dial func(ctx context.Context, network, addr string) (net.Conn, error)
-	Log  *slog.Logger
+	// IdleTimeout is how long a connection may go without a frame before it
+	// is dropped and made again. Zero means DefaultCertstreamIdle.
+	IdleTimeout time.Duration
+	Log         *slog.Logger
+}
+
+// idle is how long a connection may go without a frame.
+func (c *Certstream) idle() time.Duration {
+	if c.IdleTimeout <= 0 {
+		return DefaultCertstreamIdle
+	}
+	return c.IdleTimeout
 }
 
 // Name implements Source.
@@ -99,19 +117,29 @@ func (c *Certstream) stream(ctx context.Context, url string, out chan<- Cert) er
 	defer conn.Close()
 	c.Log.Info("certstream connected", "url", url)
 
-	// The firehose is chatty, so silence for a minute means a dead socket.
-	const idleTimeout = 60 * time.Second
+	// The firehose is chatty, so silence means a feed that has stopped
+	// carrying, and the read deadline is what says so.
+	//
+	// Pongs deliberately do not move it. They used to: the handler reset the
+	// deadline on every one, and the keepalive below pings every 30s, so the
+	// run's own liveness check held the connection open for as long as the far
+	// end kept answering. The public firehose did exactly that for a whole run
+	// while sending no frames at all. A socket that is well and a feed that is
+	// delivering are two different claims, and only the second is worth
+	// staying connected for, so only what the log sends moves the deadline.
+	idleTimeout := c.idle()
 	conn.SetReadLimit(4 << 20)
 	conn.SetReadDeadline(time.Now().Add(idleTimeout))
-	conn.SetPongHandler(func(string) error {
-		return conn.SetReadDeadline(time.Now().Add(idleTimeout))
-	})
 
-	// Close the socket on cancellation so the blocking read below returns.
+	// Close the socket on cancellation so the blocking read below returns,
+	// and ping while it is open so an idle middlebox does not take the
+	// connection for an abandoned one. The pings are paced off the same
+	// timeout they can no longer defend, which leaves the default run doing
+	// what it always did: one every 30 seconds.
 	done := make(chan struct{})
 	defer close(done)
 	go func() {
-		ticker := time.NewTicker(30 * time.Second)
+		ticker := time.NewTicker(idleTimeout / 2)
 		defer ticker.Stop()
 		for {
 			select {
@@ -129,6 +157,15 @@ func (c *Certstream) stream(ctx context.Context, url string, out chan<- Cert) er
 	for {
 		_, raw, err := conn.ReadMessage()
 		if err != nil {
+			// This deadline is only ever set from a frame that arrived, so it
+			// expires for one reason, and the reason is not the network. Say
+			// which it was: a firehose that connects and then says nothing is
+			// a thing to go and look at, and it should not scroll past
+			// wearing the words a dropped connection would have used.
+			var ne net.Error
+			if errors.As(err, &ne) && ne.Timeout() {
+				return fmt.Errorf("connected and then sent nothing for %v", idleTimeout)
+			}
 			return fmt.Errorf("read: %w", err)
 		}
 		conn.SetReadDeadline(time.Now().Add(idleTimeout))
