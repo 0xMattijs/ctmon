@@ -190,16 +190,19 @@ func runCmd(args []string) error {
 
 	switch {
 	case line != nil:
-		go statusLoop(ctx, statusInterval, pipe, line)
+		go statusLoop(ctx, statusInterval, pipe, feeds, line)
 	case cfg.output.report > 0:
-		go reportLoop(ctx, cfg.output.report, pipe, log)
+		go reportLoop(ctx, cfg.output.report, pipe, feeds, log)
 	}
+	// A feed that has stopped carrying is watched for on its own schedule.
+	go source.WatchFeeds(ctx, source.QuietCheck(cfg.feed.poll), log, feeds,
+		stalled(certs, pipe.Stats()))
 
 	pipe.Run(ctx, certs)
 	if line != nil {
 		line.Stop()
 	}
-	logStats(pipe, log, "final")
+	logStats(pipe, feeds, log, "final")
 	return nil
 }
 
@@ -467,21 +470,21 @@ func snapshotLoop(ctx context.Context, sig os.Signal, db *store.Store, path stri
 const statusInterval = time.Second
 
 // statusLoop keeps the in-place counter line current.
-func statusLoop(ctx context.Context, every time.Duration, p *pipeline.Pipeline, line *statusLine) {
+func statusLoop(ctx context.Context, every time.Duration, p *pipeline.Pipeline, feeds []source.Source, line *statusLine) {
 	t := time.NewTicker(every)
 	defer t.Stop()
-	line.Set(statusText(p.Stats().Fields()))
+	line.Set(statusText(counters(p, feeds)))
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			line.Set(statusText(p.Stats().Fields()))
+			line.Set(statusText(counters(p, feeds)))
 		}
 	}
 }
 
-func reportLoop(ctx context.Context, every time.Duration, p *pipeline.Pipeline, log *slog.Logger) {
+func reportLoop(ctx context.Context, every time.Duration, p *pipeline.Pipeline, feeds []source.Source, log *slog.Logger) {
 	t := time.NewTicker(every)
 	defer t.Stop()
 	for {
@@ -489,13 +492,50 @@ func reportLoop(ctx context.Context, every time.Duration, p *pipeline.Pipeline, 
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			logStats(p, log, "progress")
+			logStats(p, feeds, log, "progress")
 		}
 	}
 }
 
-func logStats(p *pipeline.Pipeline, log *slog.Logger, msg string) {
-	log.Info(msg, p.Stats().Fields()...)
+func logStats(p *pipeline.Pipeline, feeds []source.Source, log *slog.Logger, msg string) {
+	log.Info(msg, counters(p, feeds)...)
+}
+
+// stalled reports whether the run has stopped reading what its feeds hand it,
+// answering once per check and remembering the last answer.
+//
+// A full channel is not the test on its own, and measuring said so: the feeds
+// outrun the pipeline on an ordinary busy run, so the buffer sits full for
+// most of it and vetoing on that alone reports nothing, ever. What a blocked
+// run looks like is the buffer full *and* the pipeline reading none of it
+// between two checks — then every feed is parked inside a send, none of their
+// counts can move, and their silence is the store's and not theirs. While the
+// pipeline drains, a full buffer just means feeds are taking turns, and one
+// whose count never comes up is one that has stopped.
+func stalled(certs chan source.Cert, stats *pipeline.Stats) func() bool {
+	last := int64(-1)
+	return func() bool {
+		n := stats.Certs.Load()
+		stuck := len(certs) == cap(certs) && n == last
+		last = n
+		return stuck
+	}
+}
+
+// counters is what the pipeline has done, followed by what each feed has
+// carried towards it. The per-feed counts go last because they are the only
+// fields whose names depend on how the run was configured, and a line is
+// easier to read when the part that is always the same starts it.
+//
+// They are printed even when there is only one feed, where they say no more
+// than certs does. A run is not always watched by whoever started it, and
+// "which feed was this?" is not a question the rest of the line answers.
+func counters(p *pipeline.Pipeline, feeds []source.Source) []any {
+	fields := p.Stats().Fields()
+	for _, f := range feeds {
+		fields = append(fields, "from_"+f.Name(), f.Delivered())
+	}
+	return fields
 }
 
 func listCmd(args []string) error {
