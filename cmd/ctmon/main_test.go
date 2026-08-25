@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"log/slog"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mvo/ct/internal/pipeline"
 	"github.com/mvo/ct/internal/source"
 )
 
@@ -114,6 +116,52 @@ func TestLoadSkipSuffixesEmptyIsNil(t *testing.T) {
 	}
 	if set != nil {
 		t.Errorf("loadSkipSuffixes with nothing to skip = %v, want nil", set)
+	}
+}
+
+// countingFeed stands in for a feed that has carried a known amount.
+type countingFeed struct {
+	name string
+	n    int64
+}
+
+func (f *countingFeed) Name() string                                  { return f.name }
+func (f *countingFeed) Delivered() int64                              { return f.n }
+func (f *countingFeed) Run(context.Context, chan<- source.Cert) error { return nil }
+
+// TestCountersNameEveryFeed is what the progress line was missing: a run on
+// several feeds where the total is healthy and one of them is carrying none of
+// it. The pipeline's own counters cannot say that, because they are counted
+// once for the run.
+func TestCountersNameEveryFeed(t *testing.T) {
+	pipe := &pipeline.Pipeline{}
+	pipe.Stats().Certs.Add(1000)
+
+	fields := counters(pipe, []source.Source{
+		&countingFeed{name: "certstream"},
+		&countingFeed{name: "ctlog", n: 1000},
+	})
+
+	line := statusText(fields)
+	if !strings.Contains(line, "certs=1000") {
+		t.Errorf("the pipeline counters are missing from %q", line)
+	}
+	if !strings.Contains(line, "from_certstream=0") || !strings.Contains(line, "from_ctlog=1000") {
+		t.Errorf("the per-feed counts are missing from %q", line)
+	}
+	// The pipeline's fields come first, so the part of the line that does not
+	// depend on how the run was configured stays in one place.
+	if i, j := strings.Index(line, "from_certstream="), strings.Index(line, "store_errors="); i < j {
+		t.Errorf("the per-feed counts run ahead of the pipeline's in %q", line)
+	}
+}
+
+// TestCountersWithoutFeedsIsJustThePipeline guards the commands that have
+// counters and no feeds at all.
+func TestCountersWithoutFeedsIsJustThePipeline(t *testing.T) {
+	pipe := &pipeline.Pipeline{}
+	if got, want := len(counters(pipe, nil)), len(pipe.Stats().Fields()); got != want {
+		t.Errorf("counters with no feeds carries %d fields, want %d", got, want)
 	}
 }
 

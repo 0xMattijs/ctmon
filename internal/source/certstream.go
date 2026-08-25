@@ -25,6 +25,8 @@ const DefaultCertstreamIdle = 60 * time.Second
 // Certstream reads an aggregated CT firehose over a websocket. It is the
 // quickest feed to get running, at the cost of depending on a third party.
 type Certstream struct {
+	delivery
+
 	URL       string
 	UserAgent string
 	// Dial overrides how the websocket connection is made. Like CTLog's, it
@@ -218,7 +220,7 @@ func (c *Certstream) stream(ctx context.Context, url string, out chan<- Cert) (i
 			Source:    "certstream",
 			Index:     -1,
 		}
-		if err := send(ctx, out, cert); err != nil {
+		if err := c.send(ctx, out, cert); err != nil {
 			return carried, err
 		}
 		carried++

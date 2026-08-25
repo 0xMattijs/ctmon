@@ -27,6 +27,8 @@ import (
 // are fetched, because there is nothing to share: one asks a JSON API for a
 // range and the other downloads a file.
 type TiledLog struct {
+	delivery
+
 	// Logs are the logs to follow, each a monitoring prefix, the key it signs
 	// with, and the origin its checkpoint names itself by. A trailing slash on
 	// the prefix is optional and not stored: positions are keyed by URI, so
@@ -419,7 +421,7 @@ func (t *TiledLog) follow(ctx context.Context, lg Log, out chan<- Cert) error {
 				if !ok {
 					continue
 				}
-				if err := send(ctx, out, cert); err != nil {
+				if err := t.send(ctx, out, cert); err != nil {
 					return err
 				}
 			}

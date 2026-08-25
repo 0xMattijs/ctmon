@@ -284,9 +284,65 @@ same silence. Two consequences worth knowing:
   read without ending it. The firehose sends its heartbeats as JSON, so that is
   a contract to check if it ever changes.
 - Telling a heartbeating feed that carries nothing from one that is simply
-  quiet needs a count of certificates per feed, and this run does not keep one:
-  `certs` is counted for the pipeline, so on `--source both` a single dead feed
-  still leaves a healthy total.
+  quiet is a question about certificates rather than frames, and the socket
+  cannot answer it. The counters do, per feed, below.
+
+### When a feed stops carrying
+
+Every failure this program has is loud except the one where a feed reads
+nothing. A firehose can hold a connection open and be sent nothing. A follower
+can stay up retrying a request that will never succeed. Both read as a quiet
+afternoon in certificate transparency, and on more than one feed the run does
+not even get the quiet: `certs` is counted once for the pipeline, so a healthy
+total hides the feed contributing none of it.
+
+So every feed counts what it hands over, and the counter line ends with one
+field per feed. Half a minute of `--source all`, on the day the firehose was
+measured sending nothing:
+
+```console
+INFO msg=final certs=47235 names=88904 ... store_errors=0 from_certstream=0 from_ctlog=25702 from_tiled=22558
+```
+
+Two of the three feeds carried the run between them, and the total on its own
+says none of that. The fields are named after the feeds, so a run on one feed
+has one of them — which says no more than `certs` does, and is the only thing
+in the output that answers "which feed was this?" for somebody reading it
+afterwards. On a terminal the counter line is cut to the width of the window
+and these fields sit at the end of it, which is part of what the warning below
+is for: warnings print above the line, where nothing is truncated.
+
+They will not add up to `certs`, and the 1,025 missing here is the channel
+between them: a feed counts a certificate when the channel accepts it and the
+pipeline counts it when it reads it off, and the channel holds 1,024. A
+cancelled run drops whatever is still in there. What is being asked of these
+numbers is whether a feed is carrying, and a buffer's worth of disagreement
+answers that as well as an exact one would.
+
+A feed that has carried nothing for three checks a minute apart says so, once:
+
+```console
+WARN msg="feed has carried nothing since the run began" source=certstream certs=0 quiet_for=3m0s
+```
+
+A feed that never carried anything and a feed that has stopped are different
+problems — the first was never going to work, the second was — so the count it
+is holding at goes out with the warning, and the two do not borrow each other's
+words:
+
+```console
+WARN msg="feed has gone quiet" source=ctlog certs=412903 quiet_for=3m0s
+```
+
+Carrying again rearms it, so a feed that stops twice is reported twice, and a
+feed that is down for an afternoon still costs one line. Three checks is
+`missesBeforeWarning`'s argument in minutes: below it the quiet is certificate
+transparency having a slow minute, above it the feed has stopped.
+
+The check keeps a minute of its own rather than following `--report`. Which
+counter line you watch is a display preference, and a run watched on a
+terminal, or one with reporting turned off entirely, loses coverage the same
+way as one logging a line a minute.
 
 ### Two kinds of log
 
@@ -1330,7 +1386,9 @@ the packed codec, key reversal and range scans, migration from the old format,
 compaction, probe hashing (including the body cap and redirects), DNS caching
 and the resolver-health judgement, certstream message parsing, a firehose that
 connects and says nothing against one that is still sending heartbeats and one
-whose reader is blocked on a full pipeline,
+whose reader is blocked on a full pipeline, what each feed reports having
+carried against what arrived, a feed with nothing to show for three checks
+reported once and rearmed by carrying again,
 the Static CT wire format against two entries captured byte for byte off a real
 log, what a tiled reader does with a tile that is missing or a log that refuses
 to be read this fast — once, and for as long as the run lasts — tree head and

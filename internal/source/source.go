@@ -4,6 +4,7 @@ package source
 
 import (
 	"context"
+	"sync/atomic"
 	"time"
 )
 
@@ -39,13 +40,34 @@ type Cert struct {
 type Source interface {
 	// Name identifies the source in logs.
 	Name() string
+	// Delivered is how many certificates this feed has handed to the
+	// pipeline since the run began. Embed delivery and it is answered for
+	// you.
+	Delivered() int64
 	Run(ctx context.Context, out chan<- Cert) error
 }
 
-// send delivers c to out unless ctx is cancelled first.
-func send(ctx context.Context, out chan<- Cert, c Cert) error {
+// delivery counts what one feed has put on the channel. Every feed embeds it
+// and sends through it, because the run needs to tell them apart and the
+// pipeline cannot: it counts certificates for itself, so on --source both a
+// feed delivering nothing hides behind the one that is.
+//
+// The count is of certificates accepted by the channel rather than read off
+// it, which leaves the per-feed numbers a buffer ahead of the pipeline's
+// certs. What matters here is whether a feed is carrying, and a difference of
+// at most one buffer answers that as well as an exact agreement would.
+type delivery struct{ n atomic.Int64 }
+
+// Delivered implements Source.
+func (d *delivery) Delivered() int64 { return d.n.Load() }
+
+// send delivers c to out unless ctx is cancelled first, and counts it. A
+// certificate the context cancelled is not counted: it never reached the
+// pipeline.
+func (d *delivery) send(ctx context.Context, out chan<- Cert, c Cert) error {
 	select {
 	case out <- c:
+		d.n.Add(1)
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()

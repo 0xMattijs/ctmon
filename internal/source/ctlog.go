@@ -31,6 +31,8 @@ type Positions interface {
 // depends on nobody but the logs themselves and resumes cleanly after a
 // restart, at the cost of more requests than the firehose.
 type CTLog struct {
+	delivery
+
 	// Logs are the logs to follow, each a base URL and the key it signs with.
 	// A log with no key is followed and not checked; see verifierFor.
 	Logs []Log
@@ -489,7 +491,7 @@ func (c *CTLog) follow(ctx context.Context, lg Log, out chan<- Cert, st *logStat
 				if !ok {
 					continue
 				}
-				if err := send(ctx, out, cert); err != nil {
+				if err := c.send(ctx, out, cert); err != nil {
 					return err
 				}
 			}
