@@ -49,8 +49,8 @@ type Source interface {
 
 // delivery counts what one feed has put on the channel. Every feed embeds it
 // and sends through it, because the run needs to tell them apart and the
-// pipeline cannot: it counts certificates for itself, so on --source both a
-// feed delivering nothing hides behind the one that is.
+// pipeline cannot: it counts certificates for itself, so on a run with more than
+// one feed a feed delivering nothing hides behind the one that is.
 //
 // The count is of certificates accepted by the channel rather than read off
 // it, which leaves the per-feed numbers a buffer ahead of the pipeline's

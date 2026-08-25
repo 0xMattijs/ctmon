@@ -51,6 +51,24 @@ type runConfig struct {
 // or pass --user-agent, which overrides it either way.
 var defaultUserAgent = "ctmon/1.0 (+https://github.com/0xMattijs/ctmon)"
 
+// defaultSources is what --source reads when it is not given: the two feeds
+// that read the logs themselves, one protocol each.
+//
+// It is spelled out rather than written "both" because "both" is a fixed name
+// for a fixed pair, certstream,ctlog, and every run that types it should keep
+// getting that pair. The default is a judgement about which feeds are worth
+// reading today, and today the firehose is not one of them -- it holds a
+// connection open and sends nothing, measured on 2026-08-24 and again on
+// 2026-08-25 -- while the tiled half of the log list carries about as many
+// certificates as the RFC 6962 half and went unread unless asked for by name.
+//
+// Neither half of that is permanent. A firehose that is down today may carry
+// again, and the argument for putting it back in the default is that it costs
+// one connection; the argument against widening this further is the one that
+// kept "both" narrow, that a default should not double anyone's request load
+// without being asked. Both are worth re-measuring, not assuming.
+const defaultSources = "ctlog,tiled"
+
 // feedConfig selects and paces the certificate sources.
 type feedConfig struct {
 	sources string
@@ -157,7 +175,7 @@ func (c *runConfig) bind(fs *flag.FlagSet) {
 	fs.StringVar(&c.snapshot, "snapshot", "", "where SIGUSR1 writes a readable copy of the database (default: <db>.snap)")
 
 	f := &c.feed
-	fs.StringVar(&f.sources, "source", "both", "certificate feeds, comma-separated: certstream, ctlog, tiled; both = certstream,ctlog; all = every one")
+	fs.StringVar(&f.sources, "source", defaultSources, "certificate feeds, comma-separated: certstream, ctlog, tiled; both = certstream,ctlog; all = every one")
 	fs.StringVar(&f.certURL, "certstream-url", source.DefaultCertstreamURL, "certstream websocket URL")
 	fs.StringVar(&f.logURIs, "logs", "", "comma-separated RFC 6962 log URLs (default: discover usable logs)")
 	fs.StringVar(&f.tiledURIs, "tiled-logs", "", "comma-separated Static CT API monitoring URLs (default: discover usable logs)")

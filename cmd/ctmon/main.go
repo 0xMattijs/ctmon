@@ -232,6 +232,11 @@ func buildSources(cfg feedConfig, userAgent string, db *store.Store, log *slog.L
 	want := map[string]bool{}
 	for _, s := range strings.Split(cfg.sources, ",") {
 		switch s = strings.TrimSpace(s); s {
+		// "both" is a name for a fixed pair, and it keeps naming the pair it
+		// always named even though the default no longer spells itself that
+		// way. A run that types it gets what it got before; changing what a
+		// word means underneath the people already saying it is worse than
+		// leaving a word that no longer matches the default.
 		case "both":
 			want["certstream"], want["ctlog"] = true, true
 		case "all":

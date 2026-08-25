@@ -11,7 +11,8 @@ serves over HTTPS.
 ```console
 $ ctmon run --db ct.db
 INFO discovered ct logs rfc6962=17 tiled=11 lookahead=4800h0m0s
-INFO certstream connected url=wss://certstream.calidog.io/
+INFO source started source=ctlog
+INFO source started source=tiled
 certs=26470 names=47845 skipped_cn=1204 too_deep=9331 from_san=21285 ...
 ```
 
@@ -220,8 +221,8 @@ Go 1.24 or later. The database is a single file; point `--db` anywhere.
 
 ## Feeds
 
-Three sources feed the same pipeline. Two of them run by default
-(`--source both`):
+Three sources feed the same pipeline. The two that read the logs themselves run
+by default (`--source ctlog,tiled`):
 
 - **`certstream`** connects to an aggregated CT firehose over a websocket. It
   starts instantly and costs one connection, but it depends on a third party
@@ -236,15 +237,25 @@ Three sources feed the same pipeline. Two of them run by default
   `--tiled-logs`.
 
 Run one with `--source certstream`, or several with a comma-separated list.
-`--source all` is every one of them. `both` predates the tiled reader and still
-means what it meant then — `certstream,ctlog` — because widening it would
-double the request load of every existing run without anyone asking.
+`--source all` is every one of them, firehose included. `both` is the pair it
+has always named — `certstream,ctlog` — and still names it; it is no longer
+what a run gets for saying nothing, but a word that moves under the people
+already typing it is worse than a word that no longer matches the default.
 
-That leaves the default worth a word of warning: the firehose half of it has
-been carrying nothing since at least 2026-08-24 (below), so `--source both` is
-in practice `--source ctlog`, and the 11 tiled logs on today's list go unread
-unless you ask for them by name. A run that wants the coverage the default
-reads as offering wants `--source ctlog,tiled`, or `all` for the firehose too.
+The default used to be `both`, and the firehose is why it is not. It has been
+connecting and then carrying nothing since at least 2026-08-24 (below), which
+made the default one working feed and one silent one, while the tiled half of
+the log list — 11 usable logs on today's list, carrying about as much as the
+RFC 6962 half — went unread unless asked for by name:
+
+```console
+$ ctmon run --source ctlog,tiled          # 3m40s, 17 rfc6962 logs and 11 tiled
+INFO msg=final certs=155568 names=286972 ... from_ctlog=82580 from_tiled=74013
+```
+
+So the default now reads both halves of the list and spends no connection on
+the firehose. Add it back with `--source all` — it costs one connection, and
+if it is carrying again you will see `from_certstream` say so.
 
 By default a newly seen log starts at its current tree head, so you get new
 certificates rather than history. Pass `--from-start` to backfill a log from
@@ -559,11 +570,16 @@ keeps politely polling shards nobody writes to while missing the ones that
 replaced them. The sign is `from_ctlog` going quiet while nothing else in the
 output changes, and a feed that has carried nothing for three checks says so.
 
-A second feed reading the same certificates by another route would cover the
-gap in the meantime, and that used to be the argument for `--source both`. It
-is not one now: the firehose the default pairs with `ctlog` has been measured
-delivering nothing (below), so a rollover on the default takes the whole run
-quiet until the list is re-read, not half of it.
+A second feed reading the same certificates by another route covers part of the
+gap in the meantime, and on today's default that second feed is `tiled`. The
+two halves of the list are different logs run by different operators, so they
+do not roll over together, and Chrome's policy has every certificate in more
+than one log — so a rollover on one half leaves the other half still carrying
+much of what the stalled half stopped delivering. That is a likelihood, not a
+guarantee, and it is not a reason to lengthen `--log-refresh`. It used to be
+the argument for `--source both`, and there it no longer holds at all: the
+firehose that pairs with `ctlog` there has been measured delivering nothing
+(below), so a rollover on `both` takes the whole run quiet.
 
 So the list is re-read every `--log-refresh` (24h by default, `0` disables) and
 the followers are brought in line with it: a log the list has added gets one, a
@@ -616,10 +632,10 @@ which is what the flag is there for. `--log-lookahead 0` asks for no lookahead
 and follows only the shards open now — the old behaviour, at half the requests.
 It is a trade worth making only where something else is reading the successor
 shard, and on today's feeds nothing is. The same window judges tiled shards, so
-`--source ctlog,tiled` stops watching that shard on both readers at once, and
-the one feed that never chose shards to begin with is the firehose that is
-currently delivering nothing. Until it carries again, `--log-lookahead 0` loses
-the certificates being written to the shard ahead of the clock on every
+the default `--source ctlog,tiled` stops watching that shard on both readers at
+once; the one feed that never chose shards to begin with is the firehose, and
+it is currently delivering nothing. Until it carries again, `--log-lookahead 0`
+loses the certificates being written to the shard ahead of the clock on every
 `--source` there is.
 
 ### When a log goes bad
@@ -741,10 +757,11 @@ full disk: a run that has stopped being able to write looks exactly like a
 quiet hour otherwise. Anything but zero there means discoveries are being
 dropped.
 
-The feeds also repeat themselves — the same certificate arrives from certstream
-and from the log it was written to, and packed certificates re-list the same
-names — so a set of the last `--recent-hosts` hostnames (default 50,000)
-squashes repeats before they cost a store read. This is why the two repetition
+The feeds also repeat themselves — Chrome's policy has every certificate in
+more than one log, so the default's two readers hand over the same certificate
+twice, and packed certificates re-list the same names — so a set of the last
+`--recent-hosts` hostnames (default 50,000) squashes repeats before they cost a
+store read. This is why the two repetition
 counters read the way they do: a name the set still remembers counts as `dup`
 and stops there, and only a name it has forgotten reaches the store and counts
 as `repeat`. On a short run the set swallows nearly everything, so `repeat`

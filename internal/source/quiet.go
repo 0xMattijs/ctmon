@@ -15,8 +15,8 @@ const DefaultQuietCheck = time.Minute
 // argument applied to a whole feed rather than one tile: below it the quiet is
 // certificate transparency having a slow minute, above it the feed has stopped
 // carrying and nothing else in the run would report it — the counters read
-// zero either way, and on --source both a healthy total hides the feed that is
-// contributing none of it.
+// zero either way, and on any run with more than one feed a healthy total hides
+// the feed contributing none of it.
 //
 // Three is lower than the five a tile gets because the units are checks of a
 // whole feed and not requests to one log, and because a feed reading every log

@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"flag"
 	"io"
 	"log/slog"
 	"os"
@@ -217,11 +218,11 @@ func TestBuildSourcesSelection(t *testing.T) {
 		{"certstream", []string{"certstream"}},
 		{"ctlog", []string{"ctlog"}},
 		{"tiled", []string{"tiled"}},
+		// "both" predates the tiled reader and still means the two feeds it
+		// meant then, which is no longer what a run gets for saying nothing.
+		// The point of the name is that it does not move.
 		{"both", []string{"certstream", "ctlog"}},
 		{"certstream,ctlog", []string{"certstream", "ctlog"}},
-		// "both" predates the tiled reader and still means the two feeds it
-		// meant then. Widening it would double the request load of every
-		// existing run without anyone asking.
 		{"all", []string{"certstream", "ctlog", "tiled"}},
 		{"ctlog,tiled", []string{"ctlog", "tiled"}},
 		// Naming the same feed twice asks for it once.
@@ -245,6 +246,31 @@ func TestBuildSourcesSelection(t *testing.T) {
 		if strings.Join(got, ",") != strings.Join(c.want, ",") {
 			t.Errorf("buildSources(%q) = %q, want %q", c.sources, got, c.want)
 		}
+	}
+}
+
+// The default is the subject of the change, not a detail of it, so it is
+// tested through the flag rather than through the constant: a run given no
+// --source at all follows the two feeds that read the logs themselves, and
+// does not open a connection to the firehose.
+func TestDefaultSourcesFollowsTheLogsDirectly(t *testing.T) {
+	var cfg runConfig
+	fs := flag.NewFlagSet("run", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	cfg.bind(fs)
+	if err := fs.Parse(nil); err != nil {
+		t.Fatalf("parse no flags: %v", err)
+	}
+
+	// Explicit log sets keep discovery, and the network, out of this.
+	cfg.feed.logURIs = "https://ct.example/log"
+	cfg.feed.tiledURIs = "https://mon.ct.example/log/"
+	feeds, err := buildSources(cfg.feed, "ua", nil, discardLogger(), nil)
+	if err != nil {
+		t.Fatalf("buildSources(default): %v", err)
+	}
+	if got, want := strings.Join(sourceNames(feeds), ","), "ctlog,tiled"; got != want {
+		t.Errorf("default --source follows %q, want %q", got, want)
 	}
 }
 
